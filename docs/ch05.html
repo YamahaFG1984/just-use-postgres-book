@@ -1,0 +1,1262 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 5 章 · Postgres 与 JSON — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="5">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 5 章 · 第二部分：超越关系型</span>
+<h1>Postgres 与 JSON</h1>
+<p class="lede">
+  Postgres 早在 2012 年就开始支持 JSON，之后持续改进。如今它的 JSON 支持已经成熟全面，完全可以当作<strong>文档数据库</strong>来用。
+  这一章我们为一家在全国有几百家门店的披萨连锁店开发应用：把顾客订单以 JSON 存储，然后在出餐和分析口味偏好时查询、修改、索引这些数据。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>分清 <code>text</code>、<code>json</code>、<code>jsonb</code> 三种存法，知道默认选 <code>jsonb</code></li>
+    <li>知道什么时候该用 JSON、什么时候用关系列（混合模式）</li>
+    <li>熟练使用 <code>-&gt;</code>、<code>-&gt;&gt;</code>、<code>?</code>、<code>@&gt;</code> 和 JSON path 表达式查询 JSON</li>
+    <li>用 <code>jsonb_set</code> 和 <code>#-</code> 原地修改 JSON</li>
+    <li>用 B-tree 表达式索引和两种 GIN 索引加速 JSON 查询</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="storing">存储 JSON 数据</h2>
+
+<p>顾客在手机或网页上下单后，后端收到一份 JSON 格式的订单。比如一个中号玛格丽特披萨：</p>
+
+<div class="code" data-lang="json"><pre>
+{
+    "size": "medium",
+    "type": "margherita",
+    "crust": "regular",
+    "sauce": "marinara",
+    "toppings": {
+      "cheese": [
+         {"mozzarella": "regular"}
+      ],
+      "veggies": [
+         {"tomato": "light"}
+      ]
+    }
+}
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="一份披萨订单 JSON 的树形结构">
+  <rect class="bx-a" x="320" y="14" width="120" height="34" rx="8"/>
+  <text class="ttl on-a" x="380" y="36" text-anchor="middle">pizza { }</text>
+
+  <rect class="bx" x="20" y="90" width="110" height="46" rx="8"/><text class="mono" x="75" y="110" text-anchor="middle">"size"</text><text class="sm" x="75" y="127" text-anchor="middle">"medium"</text>
+  <rect class="bx" x="145" y="90" width="110" height="46" rx="8"/><text class="mono" x="200" y="110" text-anchor="middle">"type"</text><text class="sm" x="200" y="127" text-anchor="middle">"margherita"</text>
+  <rect class="bx" x="270" y="90" width="110" height="46" rx="8"/><text class="mono" x="325" y="110" text-anchor="middle">"crust"</text><text class="sm" x="325" y="127" text-anchor="middle">"regular"</text>
+  <rect class="bx" x="395" y="90" width="110" height="46" rx="8"/><text class="mono" x="450" y="110" text-anchor="middle">"sauce"</text><text class="sm" x="450" y="127" text-anchor="middle">"marinara"</text>
+  <rect class="bx-b" x="560" y="90" width="150" height="46" rx="8"/><text class="mono on-b" x="635" y="110" text-anchor="middle">"toppings"</text><text class="sm" x="635" y="127" text-anchor="middle">嵌套对象 { }</text>
+
+  <path class="ln" d="M330 50 L75 88"/><path class="ln" d="M350 50 L200 88"/><path class="ln" d="M370 50 L325 88"/><path class="ln" d="M390 50 L450 88"/><path class="ln" d="M420 50 L635 88"/>
+
+  <rect class="bx-g" x="470" y="170" width="130" height="40" rx="8"/><text class="mono on-g" x="535" y="188" text-anchor="middle">"cheese"</text><text class="sm" x="535" y="203" text-anchor="middle">数组 [ ]</text>
+  <rect class="bx-g" x="620" y="170" width="130" height="40" rx="8"/><text class="mono on-g" x="685" y="188" text-anchor="middle">"veggies"</text><text class="sm" x="685" y="203" text-anchor="middle">数组 [ ]</text>
+  <path class="ln" d="M610 138 L535 168"/><path class="ln" d="M660 138 L685 168"/>
+
+  <rect class="bx" x="455" y="226" width="160" height="30" rx="6"/><text class="sm" x="535" y="246" text-anchor="middle">{"mozzarella": "regular"}</text>
+  <rect class="bx" x="625" y="226" width="130" height="30" rx="6"/><text class="sm" x="690" y="246" text-anchor="middle">{"tomato": "light"}</text>
+  <path class="ln" d="M535 212 V224"/><path class="ln" d="M685 212 V224"/>
+
+  <text class="sm" x="20" y="180">配料按类别（cheese / veggies / meats）分组，</text>
+  <text class="sm" x="20" y="198">每个类别是一个<tspan class="b">数组</tspan>，因为一份配方可能有</text>
+  <text class="sm" x="20" y="216">好几种奶酪，比如“三重奶酪”披萨：</text>
+  <text class="mono" x="20" y="238">cheddar · mozzarella · parmesan</text>
+</svg>
+<figcaption>图 5-1　披萨订单 JSON 的树形结构：对象里套对象，对象里套数组</figcaption>
+</figure>
+
+<p>
+  我们打算把这些 JSON 原样存进数据库，由应用层决定 JSON 的结构：顾客在界面上挑选、定制披萨，应用把订单组装成 JSON，存进 Postgres。
+  问题是：用什么类型来存？
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="text、json、jsonb 三种存储方式对比">
+  <rect class="bx" x="20" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl" x="135" y="46" text-anchor="middle">text</text>
+  <text class="sm" x="135" y="66" text-anchor="middle">就是一段字符串</text>
+  <text class="sm on-g" x="36" y="100">✓ 只存只取，最简单</text>
+  <text class="sm on-r" x="36" y="124">✗ 数据库不认识它是 JSON</text>
+  <text class="sm on-r" x="36" y="146">✗ 不能按字段查询、修改</text>
+  <text class="sm" x="36" y="190">适合：只需原样保存、</text>
+  <text class="sm" x="36" y="208">取回给应用的场景</text>
+
+  <rect class="bx-b" x="265" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-b" x="380" y="46" text-anchor="middle">json</text>
+  <text class="sm" x="380" y="66" text-anchor="middle">以文本形式存储，保留原样</text>
+  <text class="sm on-g" x="281" y="100">✓ 写入快，不做转换</text>
+  <text class="sm on-g" x="281" y="124">✓ 保留空格、键顺序、重复键</text>
+  <text class="sm on-r" x="281" y="146">✗ 每次读字段都要重新解析</text>
+  <text class="sm on-r" x="281" y="168">✗ 支持的运算符较少</text>
+  <text class="sm" x="281" y="208">适合：必须保留键顺序时</text>
+
+  <rect class="bx-a" x="510" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-a" x="625" y="46" text-anchor="middle">jsonb ★ 推荐默认</text>
+  <text class="sm" x="625" y="66" text-anchor="middle">写入时解析成二进制格式</text>
+  <text class="sm on-r" x="526" y="100">✗ 写入稍慢（要转换）</text>
+  <text class="sm on-r" x="526" y="124">✗ 去掉空格、重复键，可能重排键</text>
+  <text class="sm on-g" x="526" y="146">✓ 查询快</text>
+  <text class="sm on-g" x="526" y="168">✓ 可用 GIN 索引</text>
+  <text class="sm on-g" x="526" y="190">✓ 函数、运算符更丰富</text>
+  <text class="sm" x="526" y="226">本章全部使用 jsonb</text>
+</svg>
+<figcaption>图 5-2　三种存 JSON 的方式：没有特殊理由，就用 jsonb</figcaption>
+</figure>
+
+<ul>
+  <li><strong>text</strong>：任何 JSON 都是一段文本，当然能存进 text 列。如果只需要存和取，这样就够了；但如果要在数据库里检查某个字段的值、或操作 JSON 结构，就不行了。</li>
+  <li><strong>json</strong>：以文本格式存储，保留原始结构，不做任何转换，所以写入快、原样返回。但每次访问字段都要重新解析，读得慢。</li>
+  <li><strong>jsonb</strong>：写入时解析成内部的<strong>二进制格式</strong>，去掉空白和重复键，可能为了查找效率重排键的顺序。写入稍慢，取回来的结构可能和原来不完全一样；但搜索快得多，还能用 <strong>GIN</strong>（通用倒排索引）加速，函数和运算符也更丰富。</li>
+</ul>
+
+<p>结论：<strong>除非你必须保留原始 JSON 的键顺序，否则 jsonb 就是默认选择。</strong>披萨应用不关心键顺序，所以用 jsonb。</p>
+
+<h2 id="dataset">加载披萨订单数据集</h2>
+
+<div class="code" data-lang="sql" data-file="data/pizzeria/pizzeria_ddl.sql"><pre>
+CREATE TABLE pizzeria.order_items (
+    order_id INT NOT NULL,          -- 订单号
+    order_item_id INT NOT NULL,     -- 订单里的第几个披萨
+    pizza JSONB NOT NULL,           -- 披萨详情（JSON）
+    price numeric(5,2) NOT NULL,    -- 这个披萨的价格
+    PRIMARY KEY (order_id, order_item_id)
+);
+</pre></div>
+
+<p>一个订单可以包含多个披萨，复合主键 <code>(order_id, order_item_id)</code> 保证每个披萨条目唯一。导入数据：</p>
+
+<div class="code" data-lang="bash"><pre>
+cd just-use-postgres-book/
+docker cp data/pizzeria/. postgres:/home/.
+
+docker exec -it postgres psql -U postgres -c "\i /home/pizzeria_ddl.sql"
+docker exec -it postgres psql -U postgres -c "\i /home/pizzeria_data.sql"
+</pre></div>
+
+<p>连上数据库确认一下：<code>\dt pizzeria.*</code> 能看到 order_items 表，<code>SELECT count(*) FROM pizzeria.order_items;</code> 返回 2938。看看其中一份订单：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT jsonb_pretty(pizza) FROM pizzeria.order_items
+WHERE order_id = 30 and order_item_id = 2;
+</pre></div>
+<div class="code out"><pre>
+             jsonb_pretty
+---------------------------------------
+ {                                    +
+     "size": "small",                 +
+     "type": "custom",                +
+     "crust": "regular",              +
+     "sauce": "marinara",             +
+     "toppings": {                    +
+         "meats": [                   +
+             {                        +
+                 "bacon": "extra"     +
+             }                        +
+         ],                           +
+         "cheese": [                  +
+             {                        +
+                 "cheddar": "extra"   +
+             }                        +
+         ],                           +
+         "veggies": [                 +
+             {                        +
+                 "mushroom": "regular"+
+             }                        +
+         ]                            +
+     }                                +
+ }
+(1 row)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; jsonb_pretty()</div>
+  <p><code>jsonb_pretty(jsonb)</code> 只是让 psql 里的输出更好读（行尾的 <code>+</code> 是 psql 表示换行的符号）。返回给应用时没必要用它，直接 <code>SELECT pizza</code> 得到的是紧凑的一行。</p>
+</div>
+
+<h2 id="balance">JSON 在 Postgres 里：把握平衡</h2>
+
+<p>
+  虽然 Postgres 的 JSON 支持很完整，但<strong>不要像纯文档数据库那样把所有数据都塞进 JSON</strong>。
+  Postgres 有丰富的类型，你应该在 JSON 的灵活性和经典关系类型（int、text、date…，数据库对它们有大量内置优化）的效率之间找平衡。
+</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#128193;</span><h4>数据静态或很少更新</h4><p>配置、元数据、顾客偏好、会话历史。</p></div>
+  <div class="card"><span class="ic">&#128371;</span><h4>数据稀疏</h4><p>大量零、空值、占位符，比如功能开关、几十个可选项的用户设置。</p></div>
+  <div class="card"><span class="ic">&#129520;</span><h4>需要灵活的结构</h4><p>难以规范化的数据：第三方 API 响应、遥测事件、半结构化文档。</p></div>
+</div>
+
+<p>
+  而如果涉及<strong>更新、连接、聚合、过滤</strong>的操作对性能要求很高，就该用关系类型和规范化模型，或者<strong>混合方式</strong>：JSON 和关系列并存。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="混合模式与完全规范化模式的对比">
+  <text class="ttl on-a" x="180" y="22" text-anchor="middle">混合模式 ✓ 本章采用</text>
+  <rect class="bx-a" x="20" y="34" width="320" height="170" rx="12"/>
+  <text class="ttl on-a" x="36" y="58">pizzeria.order_items</text>
+  <rect class="cell-b" x="36" y="70" width="288" height="26"/><text class="mono" x="46" y="88">order_id</text><text class="sm" x="200" y="88">关系列 · 主键</text>
+  <rect class="cell-b" x="36" y="96" width="288" height="26"/><text class="mono" x="46" y="114">order_item_id</text><text class="sm" x="200" y="114">关系列 · 主键</text>
+  <rect class="cell-g" x="36" y="122" width="288" height="40"/><text class="mono" x="46" y="140">pizza  jsonb</text><text class="sm" x="46" y="156">整份配方，下单后基本不改</text>
+  <rect class="cell-b" x="36" y="162" width="288" height="26"/><text class="mono" x="46" y="180">price</text><text class="sm" x="200" y="180">关系列 · NOT NULL</text>
+  <text class="sm" x="180" y="226" text-anchor="middle">常查的、要约束的 → 独立列</text>
+  <text class="sm" x="180" y="244" text-anchor="middle">灵活的、整体读写的 → JSON</text>
+
+  <text class="ttl" x="560" y="22" text-anchor="middle">完全规范化</text>
+  <rect class="bx" x="400" y="40" width="150" height="50" rx="8"/><text class="mono" x="475" y="62" text-anchor="middle">order_items</text><text class="sm" x="475" y="80" text-anchor="middle">pizza_id →</text>
+  <rect class="bx" x="590" y="40" width="150" height="50" rx="8"/><text class="mono" x="665" y="62" text-anchor="middle">pizzas</text><text class="sm" x="665" y="80" text-anchor="middle">type crust sauce size</text>
+  <rect class="bx" x="400" y="130" width="100" height="44" rx="8"/><text class="mono" x="450" y="157" text-anchor="middle">cheeses</text>
+  <rect class="bx" x="520" y="130" width="100" height="44" rx="8"/><text class="mono" x="570" y="157" text-anchor="middle">veggies</text>
+  <rect class="bx" x="640" y="130" width="100" height="44" rx="8"/><text class="mono" x="690" y="157" text-anchor="middle">meats</text>
+  <path class="ln" d="M552 65 H586" marker-end="url(#ar)"/>
+  <path class="ln" d="M665 92 L450 128" marker-end="url(#ar)"/>
+  <path class="ln" d="M665 92 L570 128" marker-end="url(#ar)"/>
+  <path class="ln" d="M665 92 L690 128" marker-end="url(#ar)"/>
+  <text class="sm on-r" x="400" y="204">✗ 写：一个披萨要在多张表里插入 7 行</text>
+  <text class="sm on-r" x="400" y="224">✗ 读：要 JOIN 多张表才能还原配方</text>
+  <text class="sm on-r" x="400" y="244">✗ 转换：前端用 JSON，来回转换</text>
+  <text class="sm" x="380" y="284" text-anchor="middle">没有对错，取决于数据怎么被读写。披萨配方是“整体读写、很少修改”的数据，JSON 更合适。</text>
+</svg>
+<figcaption>图 5-3　混合模式 vs 完全规范化</figcaption>
+</figure>
+
+<p>如果用传统的规范化模型，披萨的每个部分（类型、饼底、酱料、尺寸、配料）都要拆进独立的列甚至独立的表，大致是这样：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 披萨的核心属性
+CREATE TABLE pizzeria.pizzas (
+    id SERIAL PRIMARY KEY,
+    type TEXT NOT NULL,
+    crust TEXT NOT NULL,
+    sauce TEXT NOT NULL,
+    size TEXT NOT NULL
+);
+
+-- 把披萨关联到订单
+CREATE TABLE pizzeria.order_items (
+    order_id INT NOT NULL,
+    order_item_id INT NOT NULL,
+    pizza_id INT REFERENCES pizzeria.pizzas(id),
+    price NUMERIC(5,2) NOT NULL,
+    PRIMARY KEY (order_id, order_item_id)
+);
+
+-- 每种配料类别一张表
+CREATE TABLE pizzeria.pizza_cheeses (
+    pizza_id INT REFERENCES pizzeria.pizzas(id),
+    cheese TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    PRIMARY KEY (pizza_id, cheese)
+);
+-- pizza_veggies、pizza_meats 同理……
+</pre></div>
+
+<p>对我们这个场景，它至少有三个缺点：</p>
+
+<ul>
+  <li><strong>写入开销</strong>：加一个披萨要在事务里更新好几张表。两种肉、三种奶酪、两种蔬菜，就要插入 7 条配料记录。</li>
+  <li><strong>读取开销</strong>：给厨房或顾客展示配方前，要把好几张表 JOIN 起来还原。</li>
+  <li><strong>转换开销</strong>：前端本来就用 JSON 处理配方，每次读写都要在 JSON 和规范化模型之间来回转换。</li>
+</ul>
+
+<h2 id="query">查询 JSON 数据</h2>
+
+<p>给厨房或顾客展示订单时，最简单的做法就是把整个 JSON 取出来：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT pizza
+FROM pizzeria.order_items
+WHERE order_id = 100;
+</pre></div>
+<div class="code out"><pre>
+                                     pizza
+--------------------------------------------------------------------------
+ {"size": "small", "type": "margherita", "crust": "thin",
+  "sauce": "marinara", "toppings": {"cheese": [{"mozzarella": "regular"}],
+  "veggies": [{"tomato": "light"}]}}
+ {"size": "small", "type": "custom", "crust": "gluten_free",
+  "sauce": "pesto", "toppings": {"meats": [{"bacon": "light"}],
+  "cheese": [{"mozzarella": "regular"}], "veggies": [{"onion": "light"}]}}
+ {"size": "extra_large", "type": "pepperoni", "crust": "thin",
+  "sauce": "marinara", "toppings": {"meats": [{"salami": "regular"}],
+  "cheese": [{"mozzarella": "regular"}]}}
+(3 rows)
+</pre></div>
+
+<p>
+  但应用常常只需要某几个字段（比如饼底类型、配料清单），或者要按条件筛选（比如接下来五个需要马苏里拉奶酪的订单）。
+  这时就要用 Postgres 的 JSON 运算符和函数：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="JSON 运算符速览">
+  <rect class="bx-b" x="20" y="20" width="350" height="104" rx="10"/>
+  <text class="ttl on-b" x="36" y="44">取值</text>
+  <text class="mono" x="36" y="70">pizza -&gt; 'size'</text><text class="sm" x="220" y="70">→ "small"（jsonb）</text>
+  <text class="mono" x="36" y="92">pizza -&gt;&gt; 'size'</text><text class="sm" x="220" y="92">→ small（text）</text>
+  <text class="mono" x="36" y="114">-&gt; 'veggies' -&gt; 0</text><text class="sm" x="220" y="114">→ 数组第 1 个元素</text>
+
+  <rect class="bx-g" x="390" y="20" width="350" height="104" rx="10"/>
+  <text class="ttl on-g" x="406" y="44">判断（仅 jsonb）</text>
+  <text class="mono" x="406" y="70">pizza ? 'toppings'</text><text class="sm" x="590" y="70">有没有这个键</text>
+  <text class="mono" x="406" y="92">pizza @&gt; '{"crust":"thin"}'</text>
+  <text class="sm" x="406" y="114">左边的 JSON 是否“包含”右边的 JSON</text>
+
+  <rect class="bx-p" x="20" y="140" width="350" height="104" rx="10"/>
+  <text class="ttl on-p" x="36" y="164">JSON path（SQL/JSON 路径语言）</text>
+  <text class="mono" x="36" y="190">jsonb_path_query(pizza, '$.type')</text>
+  <text class="mono" x="36" y="212">jsonb_path_exists(pizza,</text>
+  <text class="mono" x="36" y="232">  '$.toppings.cheese[*] ? (…)')</text>
+
+  <rect class="bx-a" x="390" y="140" width="350" height="104" rx="10"/>
+  <text class="ttl on-a" x="406" y="164">修改</text>
+  <text class="mono" x="406" y="190">jsonb_set(pizza, '{crust}', '"thin"')</text>
+  <text class="sm" x="406" y="210">改某个路径上的值</text>
+  <text class="mono" x="406" y="232">pizza #- '{toppings,meats}'</text>
+</svg>
+<figcaption>图 5-4　本章用到的 JSON 运算符和函数一览（完整清单见 <a href="https://www.postgresql.org/docs/current/functions-json.html">官方文档</a>）</figcaption>
+</figure>
+
+<h3>用 -&gt; 和 -&gt;&gt; 取字段</h3>
+
+<p>两者都按键名取字段，区别在于返回类型：<strong><code>-&gt;</code> 返回 JSON，<code>-&gt;&gt;</code> 返回 text</strong>。键名要用单引号括起来。</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.1 · 提取 JSON 对象的字段">
+<pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'size' as pizza_size,
+    pizza->>'crust' as pizza_crust
+FROM pizzeria.order_items
+WHERE order_id = 100;
+</pre>
+</div>
+<div class="code out"><pre>
+ order_id | order_item_id |  pizza_size   | pizza_crust
+----------+---------------+---------------+-------------
+      100 |             1 | "small"       | thin
+      100 |             2 | "small"       | gluten_free
+      100 |             3 | "extra_large" | thin
+(3 rows)
+</pre></div>
+
+<p>
+  注意 pizza_size 带双引号，pizza_crust 不带：<code>-&gt;</code> 返回的是 JSON 字符串，按 JSON 规范文本值必须带双引号；
+  <code>-&gt;&gt;</code> 把它转换成了 Postgres 的 text 类型，就没有引号了。这个差别在 <code>WHERE</code> 里尤其要注意：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.2 · 用 -> 和 ->> 过滤数据">
+<pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'size' as pizza_size,
+    pizza->>'crust' as pizza_crust
+FROM pizzeria.order_items
+WHERE
+    order_id = 100 AND
+    pizza->'size' = '"small"' AND pizza->>'crust' = 'gluten_free';
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 和 JSON 比较要带双引号</div>
+  <p><code>pizza-&gt;'size'</code> 是 jsonb，所以要和 JSON 字符串 <code>'"small"'</code> 比较。写成 <code>pizza-&gt;'size' = 'small'</code> 会报错：</p>
+  <div class="code out"><pre>
+DETAIL: Token "small" is invalid.
+CONTEXT: JSON data, line 1: small
+</pre></div>
+  <p>经验法则：<strong>要拿来和普通字符串比较，就用 <code>-&gt;&gt;</code></strong>。</p>
+</div>
+
+<h4>链式调用，深入嵌套结构</h4>
+
+<p>运算符可以串起来，一层层往里走。比如查订单里每个披萨要加的蔬菜：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.3 · 链式使用 -> 运算符">
+<pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'toppings'->'veggies' as veggies_toppings
+FROM pizzeria.order_items
+WHERE order_id = 100;
+</pre>
+</div>
+<div class="code out"><pre>
+ order_id | order_item_id |   veggies_toppings
+----------+---------------+-----------------------
+      100 |             1 | [{"tomato": "light"}]
+      100 |             2 | [{"onion": "light"}]
+      100 |             3 |
+(3 rows)
+</pre></div>
+
+<p>第三个披萨顾客没选蔬菜，所以是空的。结果是数组（<code>[]</code>）。要取数组里的某个元素，传它的<strong>下标（从 0 开始）</strong>：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'toppings'->'veggies'->0 as veggies_toppings
+FROM pizzeria.order_items
+WHERE order_id = 100;
+-- 结果不再带 [ ]：{"tomato": "light"}、{"onion": "light"}
+</pre></div>
+
+<p><code>-&gt;</code> 和 <code>-&gt;&gt;</code> 可以混用：先用 <code>-&gt;</code> 一路走到目标，最后一步用 <code>-&gt;&gt;</code> 取出文本：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'toppings'->'veggies'->0->>'onion' as onions_amount
+FROM pizzeria.order_items
+WHERE order_id = 100;
+</pre></div>
+<div class="code out"><pre>
+ order_id | order_item_id | onions_amount
+----------+---------------+---------------
+      100 |             1 |
+      100 |             2 | light
+      100 |             3 |
+(3 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 150" role="img" aria-label="链式运算符一步步深入 JSON 结构">
+  <rect class="bx-a" x="20" y="40" width="90" height="40" rx="8"/><text class="mono on-a" x="65" y="65" text-anchor="middle">pizza</text>
+  <path class="ln" d="M112 60 H146" marker-end="url(#ar)"/><text class="mono" x="129" y="52" text-anchor="middle">-&gt;</text>
+  <rect class="bx" x="150" y="40" width="120" height="40" rx="8"/><text class="mono" x="210" y="65" text-anchor="middle">'toppings'</text>
+  <path class="ln" d="M272 60 H306" marker-end="url(#ar)"/><text class="mono" x="289" y="52" text-anchor="middle">-&gt;</text>
+  <rect class="bx" x="310" y="40" width="110" height="40" rx="8"/><text class="mono" x="365" y="65" text-anchor="middle">'veggies'</text>
+  <path class="ln" d="M422 60 H456" marker-end="url(#ar)"/><text class="mono" x="439" y="52" text-anchor="middle">-&gt;</text>
+  <rect class="bx" x="460" y="40" width="60" height="40" rx="8"/><text class="mono" x="490" y="65" text-anchor="middle">0</text>
+  <path class="ln-a" d="M522 60 H566" marker-end="url(#ar-a)"/><text class="mono on-a" x="544" y="52" text-anchor="middle">-&gt;&gt;</text>
+  <rect class="bx-g" x="570" y="40" width="90" height="40" rx="8"/><text class="mono" x="615" y="65" text-anchor="middle">'onion'</text>
+  <path class="ln" d="M662 60 H696" marker-end="url(#ar)"/>
+  <text class="mono on-g b" x="700" y="65">light</text>
+
+  <text class="sm" x="65" y="104" text-anchor="middle">{…}</text>
+  <text class="sm" x="210" y="104" text-anchor="middle">{"cheese":…,"veggies":…}</text>
+  <text class="sm" x="365" y="104" text-anchor="middle">[{"onion":"light"}]</text>
+  <text class="sm" x="490" y="104" text-anchor="middle">{"onion":"light"}</text>
+  <text class="sm" x="615" y="104" text-anchor="middle">text</text>
+  <text class="sm" x="380" y="136" text-anchor="middle">每一步都是 jsonb，最后一步用 -&gt;&gt; 变成普通文本；中间任何一步取不到，结果就是 NULL</text>
+</svg>
+<figcaption>图 5-5　链式运算符：一步步“钻进”JSON</figcaption>
+</figure>
+
+<h3>用 ? 检查键是否存在</h3>
+
+<p><code>?</code> 运算符检查 JSON 里是否存在某个键，只支持 jsonb。厨师要去仓库拿食材，想知道排队中的订单需要哪些肉：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.4 · 检查字段键是否存在">
+<pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'toppings'->'meats' as meats
+FROM pizzeria.order_items
+WHERE pizza->'toppings' ? 'meats'
+ORDER BY order_id LIMIT 5;
+</pre>
+</div>
+<div class="code out"><pre>
+ order_id | order_item_id |          meats
+----------+---------------+--------------------------
+        1 |             1 | [{"salami": "regular"}]
+        1 |             2 | [{"chicken": "regular"}]
+        2 |             1 | [{"salami": "regular"}]
+        3 |             1 | [{"salami": "regular"}]
+        5 |             1 | [{"salami": "regular"}]
+(5 rows)
+</pre></div>
+
+<p>厨师回来说意大利香肠（sausage）快用完了，要联系点了香肠的顾客商量换别的。香肠在 meats <strong>数组</strong>里的某个对象中，需要先把数组展开：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.5 · 检查数组中是否存在某个键">
+<pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'toppings'->'meats' AS meats
+FROM pizzeria.order_items
+WHERE EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(pizza->'toppings'->'meats') AS meats
+    WHERE meats ? 'sausage'
+)
+ORDER BY order_id LIMIT 5;
+</pre>
+</div>
+
+<ul>
+  <li><code>jsonb_array_elements(…)</code> 把 meats 数组展开成一行一个 JSON 对象。</li>
+  <li><code>WHERE meats ? 'sausage'</code> 只保留包含 sausage 键的对象。</li>
+  <li>子查询不需要返回具体值，只要有一行就说明“存在”，所以写 <code>SELECT 1</code>。</li>
+</ul>
+
+<div class="code out"><pre>
+ order_id | order_item_id |         meats
+----------+---------------+------------------------
+       20 |             5 | [{"sausage": "light"}]
+       26 |             5 | [{"sausage": "extra"}]
+       34 |             2 | [{"sausage": "extra"}]
+       37 |             2 | [{"sausage": "extra"}]
+       47 |             1 | [{"sausage": "extra"}]
+(5 rows)
+</pre></div>
+
+<p>（后面会用 JSON path 表达式把这个子查询改写得更简洁。）</p>
+
+<h3>用 @&gt; 比较对象（包含）</h3>
+
+<p>
+  <strong>包含运算符 <code>@&gt;</code></strong> 检查左边的 JSON 是否在结构上“包含”右边的 JSON，也只支持 jsonb。
+  市场团队做了一个推广无麸质饼底的活动，想知道效果如何：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.6 · 用 @> 过滤数据">
+<pre>
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"crust": "gluten_free"}';
+-- 749
+</pre>
+</div>
+
+<p>其中有多少是自定义配方？再加一个条件 —— 两个字段都在顶层，写在同一个对象里就行：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"crust": "gluten_free", "type": "custom"}';
+-- 148
+</pre></div>
+
+<p>再看其中要“多加番茄”的。番茄在 toppings → veggies 数组里，右边的 JSON 也照着这个层级写：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"crust": "gluten_free",
+"type": "custom", "toppings": {"veggies": [{"tomato": "extra"}]}}';
+-- 7
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="包含运算符：右边的 JSON 是左边 JSON 的一个子集">
+  <rect class="bx" x="20" y="20" width="380" height="200" rx="12"/>
+  <text class="ttl" x="36" y="44">左：一份订单 pizza</text>
+  <text class="mono" x="36" y="70">{ "size": "small",</text>
+  <text class="mono on-a b" x="36" y="90">  "type": "custom",</text>
+  <text class="mono on-a b" x="36" y="110">  "crust": "gluten_free",</text>
+  <text class="mono" x="36" y="130">  "sauce": "pesto",</text>
+  <text class="mono" x="36" y="150">  "toppings": { "veggies": [</text>
+  <text class="mono on-a b" x="36" y="170">     {"tomato": "extra"},</text>
+  <text class="mono" x="36" y="190">     {"onion": "light"} ] } }</text>
+
+  <text class="ttl on-a" x="440" y="110">@&gt;</text>
+
+  <rect class="bx-a" x="480" y="40" width="260" height="140" rx="12"/>
+  <text class="ttl on-a" x="496" y="64">右：要找的模式</text>
+  <text class="mono" x="496" y="90">{ "type": "custom",</text>
+  <text class="mono" x="496" y="110">  "crust": "gluten_free",</text>
+  <text class="mono" x="496" y="130">  "toppings": {"veggies":</text>
+  <text class="mono" x="496" y="150">    [{"tomato":"extra"}]}}</text>
+  <text class="sm on-g" x="610" y="206" text-anchor="middle">✓ 右边的每个键值都能在左边</text>
+  <text class="sm on-g" x="610" y="222" text-anchor="middle">的相同位置找到 → true</text>
+</svg>
+<figcaption>图 5-6　<code>@&gt;</code>：“左边包含右边吗？”数组只要求包含所列元素，不要求顺序和全部相同</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#128161; -&gt; 和 @&gt; 搭配，更好读</div>
+  <div class="code" data-lang="sql"><pre>
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"crust": "gluten_free", "type": "custom"}' AND
+     pizza->'toppings'->'veggies' @> '[{"tomato": "extra"}]';
+</pre></div>
+  <p>先用 <code>-&gt;</code> 走到 veggies 数组，再用 <code>@&gt;</code> 检查数组里是否有 <code>{"tomato": "extra"}</code>。</p>
+</div>
+
+<h3>JSON path 表达式</h3>
+
+<p>
+  除了基础运算符，Postgres 还有一个强大的<strong>路径引擎</strong>，能执行 <strong>SQL/JSON path 语言</strong>写的表达式。
+  它特别适合从多层结构或对象数组里取数据，一个简单的路径表达式往往能省掉子查询。比如清单 5.5 找香肠订单的子查询，可以改写成：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT
+    order_id, order_item_id,
+    pizza->'toppings'->'meats' AS meats
+FROM pizzeria.order_items
+WHERE jsonb_path_exists(pizza, '$.toppings.meats[*] ? (exists(@.sausage))')
+ORDER BY order_id LIMIT 5;
+</pre></div>
+
+<p>看不懂 <code>$</code>、<code>@</code> 没关系，先看路径语言的基本元素，再从简单的例子学起：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="JSON path 表达式的组成部分">
+  <rect class="bx-d" x="20" y="20" width="720" height="50" rx="10"/>
+  <text class="mono" x="380" y="52" text-anchor="middle" style="font-size:16px"><tspan class="on-a b">$</tspan><tspan class="on-b">.toppings.meats</tspan><tspan class="on-g b">[*]</tspan> <tspan class="on-p b">?</tspan> (exists(<tspan class="on-r b">@</tspan>.sausage))</text>
+
+  <rect class="bx-a" x="20" y="90" width="132" height="106" rx="8"/>
+  <text class="mono on-a b" x="86" y="114" text-anchor="middle">$</text>
+  <text class="sm" x="86" y="138" text-anchor="middle">当前被查询的</text>
+  <text class="sm" x="86" y="156" text-anchor="middle">整个 JSON</text>
+  <text class="sm" x="86" y="174" text-anchor="middle">（这里是 pizza）</text>
+
+  <rect class="bx-b" x="166" y="90" width="132" height="106" rx="8"/>
+  <text class="mono on-b b" x="232" y="114" text-anchor="middle">.key</text>
+  <text class="sm" x="232" y="138" text-anchor="middle">访问器：</text>
+  <text class="sm" x="232" y="156" text-anchor="middle">取某个键的值</text>
+
+  <rect class="bx-g" x="312" y="90" width="132" height="106" rx="8"/>
+  <text class="mono on-g b" x="378" y="114" text-anchor="middle">[*]</text>
+  <text class="sm" x="378" y="138" text-anchor="middle">取数组的</text>
+  <text class="sm" x="378" y="156" text-anchor="middle">所有元素</text>
+  <text class="sm" x="378" y="174" text-anchor="middle">（[0] 取第一个）</text>
+
+  <rect class="bx-p" x="458" y="90" width="132" height="106" rx="8"/>
+  <text class="mono on-p b" x="524" y="114" text-anchor="middle">? ( … )</text>
+  <text class="sm" x="524" y="138" text-anchor="middle">过滤器，</text>
+  <text class="sm" x="524" y="156" text-anchor="middle">相当于 WHERE</text>
+  <text class="sm" x="524" y="174" text-anchor="middle">== exists &amp;&amp; ||</text>
+
+  <rect class="bx-r" x="604" y="90" width="136" height="106" rx="8"/>
+  <text class="mono on-r b" x="672" y="114" text-anchor="middle">@</text>
+  <text class="sm" x="672" y="138" text-anchor="middle">过滤器里</text>
+  <text class="sm" x="672" y="156" text-anchor="middle">“当前正在检查</text>
+  <text class="sm" x="672" y="174" text-anchor="middle">的那个元素”</text>
+</svg>
+<figcaption>图 5-7　JSON path 表达式从左往右求值</figcaption>
+</figure>
+
+<p>每天营业结束后，应用要给管理层发一份报告。第一部分：最受欢迎的披萨类型。</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.7 · 用路径表达式访问 JSON 字段">
+<pre>
+SELECT
+    count(*) as total_cnt,
+    jsonb_path_query(pizza,'$.type') as pizza_type
+FROM pizzeria.order_items
+GROUP BY pizza_type ORDER BY total_cnt DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+ total_cnt |   pizza_type
+-----------+----------------
+       646 | "pepperoni"
+       585 | "three cheese"
+       582 | "veggie"
+       563 | "custom"
+       562 | "margherita"
+(5 rows)
+</pre></div>
+
+<p><code>jsonb_path_query</code> 对每行的 pizza 执行路径表达式：<code>$</code> 指 pizza 对象本身，<code>.type</code> 取它的 type 字段。</p>
+
+<p>路径表达式处理<strong>数组</strong>时尤其好用。报告的下一部分：最受欢迎的奶酪。</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.8 · 用路径表达式查询 JSON 数组">
+<pre>
+SELECT
+    count(*) as total_cnt,
+    jsonb_object_keys(
+        jsonb_path_query(pizza, '$.toppings.cheese[*]')
+    ) as cheese_topping
+FROM pizzeria.order_items
+GROUP BY cheese_topping ORDER BY total_cnt DESC;
+</pre>
+</div>
+
+<ul>
+  <li><code>$.toppings.cheese</code> 走到奶酪数组，<code>[*]</code> 取出数组里的所有对象，比如 <code>{"cheddar": "regular"}</code>。</li>
+  <li><code>jsonb_object_keys</code> 取出这些对象的键 —— 也就是奶酪的名字。</li>
+</ul>
+
+<div class="code out"><pre>
+ total_cnt | cheese_topping
+-----------+----------------
+      2575 | mozzarella
+       771 | cheddar
+       762 | parmesan
+(3 rows)
+</pre></div>
+
+<p>路径表达式还能带<strong>过滤器</strong>，以 <code>?</code> 开头、条件写在括号里，作用类似 SQL 的 WHERE。报告的下一部分：用到帕玛森奶酪的披萨有哪些类型？</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.9 · 在路径表达式里使用过滤器">
+<pre>
+SELECT
+    count(*) AS total_cnt,
+    pizza->'type' as pizza_type
+FROM pizzeria.order_items
+WHERE jsonb_path_exists(pizza,
+        '$.toppings.cheese[*] ? (exists(@.parmesan))')
+GROUP BY pizza_type
+ORDER BY total_cnt DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+ total_cnt |   pizza_type
+-----------+----------------
+       585 | "three cheese"
+       177 | "custom"
+(2 rows)
+</pre></div>
+
+<p>
+  <code>jsonb_path_exists</code> 检查路径表达式能否求出任何值，能就返回 true，这一行就被保留。
+  <code>@</code> 代表数组里当前正被检查的那个奶酪对象，<code>@.parmesan</code> 取它的 parmesan 字段，<code>exists(…)</code> 判断这个字段是否存在。
+</p>
+
+<p>过滤器还可以<strong>串联</strong>，后一个过滤器作用在前一个的结果上。报告的最后一部分：自定义披萨里要“多加帕玛森”的有多少？</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.10 · 串联多个过滤表达式">
+<pre>
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE jsonb_path_exists(
+    pizza,
+    '$ ? (@.type == "custom") .toppings.cheese[*].parmesan ? (@ == "extra")'
+);
+-- 64
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="串联过滤器的求值过程">
+  <rect class="bx-a" x="20" y="30" width="60" height="44" rx="8"/><text class="mono on-a b" x="50" y="57" text-anchor="middle">$</text>
+  <path class="ln" d="M82 52 H106" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="110" y="30" width="190" height="44" rx="8"/><text class="mono on-p" x="205" y="57" text-anchor="middle">? (@.type == "custom")</text>
+  <path class="ln" d="M302 52 H326" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="330" y="30" width="250" height="44" rx="8"/><text class="mono on-b" x="455" y="57" text-anchor="middle">.toppings.cheese[*].parmesan</text>
+  <path class="ln" d="M582 52 H606" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="610" y="30" width="130" height="44" rx="8"/><text class="mono on-p" x="675" y="57" text-anchor="middle">? (@ == "extra")</text>
+
+  <text class="sm" x="50" y="98" text-anchor="middle">① 整个订单</text>
+  <text class="sm" x="205" y="98" text-anchor="middle">② 是自定义披萨吗？</text>
+  <text class="sm" x="205" y="114" text-anchor="middle">不是就到此为止</text>
+  <text class="sm" x="455" y="98" text-anchor="middle">③ 走到奶酪数组，</text>
+  <text class="sm" x="455" y="114" text-anchor="middle">取每个元素的 parmesan 值</text>
+  <text class="sm" x="675" y="98" text-anchor="middle">④ 用量是 extra 吗？</text>
+  <text class="sm" x="380" y="152" text-anchor="middle">这里的 @ 在两个过滤器中含义不同：第一个指整个订单对象，第二个指取到的 parmesan 值</text>
+</svg>
+<figcaption>图 5-8　路径表达式从左到右，每一步都作用在上一步的结果上</figcaption>
+</figure>
+
+<h2 id="modify">修改 JSON 数据</h2>
+
+<p>最简单的修改方式：把 JSON 读到应用层，改好，再整个写回去：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT pizza
+FROM pizzeria.order_items
+WHERE order_id = $1 and order_item_id = $2;
+
+-- 应用修改后：
+UPDATE pizzeria.order_items
+SET pizza = new_pizza_order_json
+WHERE order_id = $1 and order_item_id = $2;
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; $1、$2 是什么</div>
+  <p>这是<strong>参数占位符</strong>：应用用预编译语句（prepared statement）执行 SQL 时，把实际值作为参数传进来。这样也能防止 SQL 注入。</p>
+</div>
+
+<p>
+  但最简单的未必最高效。如果 JSON 结构很复杂、而你只改一个字段，直接在数据库里改更划算，不用在应用和数据库之间来回搬整个对象。
+  Postgres 提供 <code>jsonb_set</code> 函数修改字段，<code>#-</code> 运算符删除字段。来看一个顾客反复改单的故事。当前订单：
+</p>
+
+<div class="code out"><pre>
+{
+    "size": "extra_large",
+    "type": "custom",
+    "crust": "stuffed",
+    "sauce": "alfredo",
+    "toppings": {
+        "meats":   [ {"sausage": "light"} ],
+        "cheese":  [ {"parmesan": "regular"} ],
+        "veggies": [ {"tomato": "light"} ]
+    }
+}
+</pre></div>
+
+<p>五分钟后顾客回到 App（幸好厨房还没开始做），把饼底从芝心（stuffed）改成普通（regular）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.11 · 用 jsonb_set 更新 JSON 字段">
+<pre>
+UPDATE pizzeria.order_items
+SET pizza = jsonb_set(pizza,'{crust}', '"regular"', false)
+WHERE order_id = 20 and order_item_id = 5;
+</pre>
+</div>
+
+<div class="tw"><table>
+<tr><th>参数</th><th>含义</th><th>本例</th></tr>
+<tr><td>① 原 JSON</td><td>要修改的 JSON 对象</td><td><code>pizza</code></td></tr>
+<tr><td>② 路径</td><td>目标字段的路径，格式 <code>{a,b,c}</code>：a 下面的 b 下面的 c</td><td><code>'{crust}'</code></td></tr>
+<tr><td>③ 新值</td><td>要设置的新值，必须是合法的 JSON（字符串要带双引号）</td><td><code>'"regular"'</code></td></tr>
+<tr><td>④ 缺失时创建？</td><td>目标字段不存在时：true 就新增，false 就不管</td><td><code>false</code>（crust 一定存在）</td></tr>
+</table></div>
+
+<p>保存后顾客又发现番茄选成了“少量”，改成“多加番茄”并加上菠菜。这次路径指向嵌套的 veggies 数组，直接替换整个数组：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.12 · 用 jsonb_set 更新 JSON 数组">
+<pre>
+UPDATE pizzeria.order_items
+SET pizza = jsonb_set(
+    pizza,
+    '{toppings,veggies}',
+   '[{"tomato":"extra"}, {"spinach":"regular"}]',
+   false
+)
+WHERE order_id = 20 and order_item_id = 5;
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 路径里可以写数组下标</div>
+  <p>知道元素在数组里的位置时，可以直接写进路径：<code>'{toppings,veggies,0,tomato}'</code> 定位到 veggies 数组第一个元素的 tomato 字段，再设成 <code>'"extra"'</code>。</p>
+</div>
+
+<p>顾客正要放下手机，孩子发现他<strong>又</strong>点了香肠，建议去掉肉。爸爸做了最后一次修改：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.13 · 用 #- 运算符删除 JSON 字段">
+<pre>
+UPDATE pizzeria.order_items
+SET pizza = pizza #- '{toppings,meats}'
+WHERE order_id = 20 AND order_item_id = 5;
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="三次修改前后的 JSON 对比">
+  <rect class="bx" x="20" y="20" width="330" height="214" rx="12"/>
+  <text class="ttl" x="36" y="44">修改前</text>
+  <text class="mono" x="36" y="70">"crust": <tspan class="on-r">"stuffed"</tspan></text>
+  <text class="mono" x="36" y="92">"toppings": {</text>
+  <text class="mono on-r" x="36" y="114">  "meats": [{"sausage":"light"}],</text>
+  <text class="mono" x="36" y="136">  "cheese": [{"parmesan":"regular"}],</text>
+  <text class="mono" x="36" y="158">  "veggies": <tspan class="on-r">[{"tomato":"light"}]</tspan></text>
+  <text class="mono" x="36" y="180">}</text>
+
+  <path class="ln-a" d="M356 128 H404" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="380" y="118" text-anchor="middle">3 次</text>
+
+  <rect class="bx-g" x="410" y="20" width="330" height="214" rx="12"/>
+  <text class="ttl on-g" x="426" y="44">修改后（厨房看到的）</text>
+  <text class="mono" x="426" y="70">"crust": <tspan class="on-g b">"regular"</tspan></text>
+  <text class="sm on-a" x="640" y="70">← jsonb_set</text>
+  <text class="mono" x="426" y="92">"toppings": {</text>
+  <text class="mono" x="426" y="114">  "cheese": [{"parmesan":"regular"}],</text>
+  <text class="mono" x="426" y="136">  "veggies": [</text>
+  <text class="mono on-g b" x="426" y="158">    {"tomato":"extra"},</text>
+  <text class="mono on-g b" x="426" y="180">    {"spinach":"regular"}]</text>
+  <text class="sm on-a" x="640" y="158">← jsonb_set</text>
+  <text class="mono" x="426" y="202">}</text>
+  <text class="sm on-a" x="426" y="224">meats 整个被 #- 删掉了</text>
+</svg>
+<figcaption>图 5-9　直接在数据库里改 JSON 的局部，不必在网络上搬整个对象</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#128161; 在数据库里构造 JSON</div>
+  <p>除了查询和修改，Postgres 还能从零生成 JSON：<code>json_build_object</code>、<code>row_to_json</code>、<code>jsonb_agg</code> 等。想在数据库层直接产出 JSON（比如 API 响应）时很有用。详见<a href="https://www.postgresql.org/docs/current/functions-json.html">官方文档</a>。</p>
+</div>
+
+<h2 id="index">为 JSON 数据建索引</h2>
+
+<h3>B-tree 表达式索引</h3>
+
+<p>应用里好几个组件都要统计某种类型的披萨数量：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza ->> 'type' = 'custom';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (actual time=1.135..1.136 rows=1 loops=1)
+   -> Seq Scan on order_items (actual time=0.034..1.062 rows=563 loops=1)
+         Filter: ((pizza ->> 'type'::text) = 'custom'::text)
+         Rows Removed by Filter: 2375
+ Planning Time: 0.174 ms
+ Execution Time: 1.185 ms
+</pre></div>
+
+<p>全表扫描。用第 4 章学的表达式索引，为 <code>pizza -&gt;&gt; 'type'</code> 建索引：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.14 · 为 JSON 字段创建表达式索引">
+<pre>
+CREATE INDEX idx_pizza_type
+ON pizzeria.order_items ((pizza ->> 'type'));
+</pre>
+</div>
+<div class="code out"><pre>
+ Aggregate (actual time=0.299..0.300 rows=1 loops=1)
+   -> Bitmap Heap Scan on order_items (actual time=0.170..0.257 rows=563 loops=1)
+         Recheck Cond: ((pizza ->> 'type'::text) = 'custom'::text)
+         Heap Blocks: exact=101
+         -> Bitmap Index Scan on idx_pizza_type (actual time=0.068..0.068 rows=563 loops=1)
+               Index Cond: ((pizza ->> 'type'::text) = 'custom'::text)
+ Planning Time: 0.164 ms
+ Execution Time: 0.376 ms
+</pre></div>
+
+<p>快了近 4 倍。但表达式索引有个代价：<strong>它只匹配建索引时写的那个表达式</strong>，稍有不同就用不上：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 换成 -> 运算符：索引用不上了，退回 Seq Scan
+SELECT count(*) FROM pizzeria.order_items WHERE pizza -> 'type' = '"custom"';
+
+-- 换一个字段 size：没有对应的索引，Seq Scan
+SELECT count(*) FROM pizzeria.order_items WHERE pizza ->> 'size' = 'large';
+</pre></div>
+
+<p>
+  可以规定开发团队一律写 <code>pizza -&gt;&gt; 'type'</code>，也可以再给 size 建一个表达式索引。但 JSON 里要查的字段一多，这种做法就扩展不了 —— 索引越多，维护越慢。
+</p>
+
+<p>为什么我们非要用表达式索引，而不是直接给整个 pizza 列建一个索引？先看看 idx_pizza_type 的定义：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.15 · 查看索引详情">
+<pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'pizzeria'
+  AND tablename = 'order_items'
+  AND indexdef LIKE '%idx_pizza_type%';
+</pre>
+</div>
+<div class="code out"><pre>
+   indexname    |                      indexdef
+----------------+----------------------------------------------------
+ idx_pizza_type | CREATE INDEX idx_pizza_type
+                |   ON pizzeria.order_items
+                |   USING btree (((pizza ->> 'type'::text)))
+(1 row)
+</pre></div>
+
+<p>
+  它用的是默认的 B-tree。如果直接用 B-tree 给整个 pizza 列建索引，它会把整个 JSON 当成<strong>一个值</strong>来索引：
+  <code>-&gt;&gt;</code>、<code>@&gt;</code> 这些运算符都用不上它，你只能拿一个一模一样的完整 JSON（连空格都一样）去做 <code>=</code> 比较 —— 毫无意义。
+  B-tree 不是唯一的选择，<strong>GIN</strong> 更适合 JSON。
+</p>
+
+<h3>GIN 索引</h3>
+
+<p>
+  用 GIN 作为底层数据结构，<strong>只需在 JSON 列上建一个普通的单列索引</strong>，就能高效搜索整个嵌套结构。
+  Postgres 为 JSON 提供两种 GIN 索引，存储方式不同，支持的<strong>运算符类（operator class）</strong>也不同：
+</p>
+
+<ul>
+  <li><strong>默认 GIN</strong>（<code>jsonb_ops</code>）：把 JSON 里所有的<strong>键、值、数组元素</strong>都拆出来，各自作为独立的索引条目。</li>
+  <li><strong>jsonb_path_ops</strong>：只索引从根到每个值的<strong>路径</strong>，并且存的是路径的哈希值。</li>
+</ul>
+
+<h4>默认 GIN 索引</h4>
+
+<p>以这份“三重奶酪”订单为例：</p>
+
+<div class="code" data-lang="json"><pre>
+{
+ "size": "large", "type": "three cheese", "crust": "thin", "sauce": "marinara",
+ "toppings": { "cheese": [ {"cheddar": "regular"}, {"mozzarella": "extra"}, {"parmesan": "light"} ] }
+}
+</pre></div>
+
+<p>默认 GIN 索引会把它拆成以下条目，每个条目都指向存着这份订单的那一行：</p>
+
+<ul>
+  <li><strong>键</strong>：size、type、crust、sauce、toppings、cheese、cheddar、mozzarella、parmesan</li>
+  <li><strong>值</strong>：large、three cheese、thin、marinara、regular、extra、light</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="默认 GIN 索引结构示意：按字母序存放键和值，每个条目指向包含它的行">
+  <text class="sm" x="380" y="16" text-anchor="middle">根索引页</text>
+  <rect class="bx-a" x="290" y="24" width="180" height="34" rx="6"/>
+  <text class="mono" x="335" y="46" text-anchor="middle">extra</text>
+  <text class="mono" x="415" y="46" text-anchor="middle">marinara</text>
+
+  <path class="ln" d="M320 60 L135 98" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 60 V98" marker-end="url(#ar)"/>
+  <path class="ln" d="M440 60 L625 98" marker-end="url(#ar)"/>
+
+  <text class="sm" x="135" y="96" text-anchor="end">&lt; extra</text>
+  <rect class="bx" x="20" y="102" width="230" height="40" rx="6"/>
+  <text class="mono" x="60" y="127" text-anchor="middle">cheese</text><text class="mono" x="135" y="127" text-anchor="middle">cheddar</text><text class="mono" x="210" y="127" text-anchor="middle">crust</text>
+  <rect class="bx" x="265" y="102" width="230" height="40" rx="6"/>
+  <text class="mono" x="305" y="127" text-anchor="middle">extra</text><text class="mono" x="380" y="127" text-anchor="middle">large</text><text class="mono" x="455" y="127" text-anchor="middle">light</text>
+  <text class="sm" x="625" y="96" text-anchor="start">≥ marinara</text>
+  <rect class="bx" x="510" y="102" width="230" height="40" rx="6"/>
+  <text class="mono" x="555" y="127" text-anchor="middle">marinara</text><text class="mono" x="630" y="127" text-anchor="middle">type</text><text class="mono" x="700" y="127" text-anchor="middle">veggies</text>
+
+  <g class="sm">
+    <text class="mono on-a" x="60" y="166" text-anchor="middle">tr1</text><text class="mono" x="60" y="184" text-anchor="middle">tr2</text><text class="mono" x="60" y="202" text-anchor="middle">tr3</text>
+    <text class="mono on-a" x="135" y="166" text-anchor="middle">tr1</text><text class="mono" x="135" y="184" text-anchor="middle">tr3</text>
+    <text class="mono on-a" x="210" y="166" text-anchor="middle">tr1</text><text class="mono" x="210" y="184" text-anchor="middle">tr2</text><text class="mono" x="210" y="202" text-anchor="middle">tr3</text>
+    <text class="mono on-a" x="305" y="166" text-anchor="middle">tr1</text>
+    <text class="mono on-a" x="380" y="166" text-anchor="middle">tr1</text><text class="mono" x="380" y="184" text-anchor="middle">tr2</text>
+    <text class="mono on-a" x="455" y="166" text-anchor="middle">tr1</text><text class="mono" x="455" y="184" text-anchor="middle">tr3</text>
+    <text class="mono on-a" x="555" y="166" text-anchor="middle">tr1</text><text class="mono" x="555" y="184" text-anchor="middle">tr2</text>
+    <text class="mono on-a" x="630" y="166" text-anchor="middle">tr1</text><text class="mono" x="630" y="184" text-anchor="middle">tr2</text><text class="mono" x="630" y="202" text-anchor="middle">tr3</text>
+    <text class="mono" x="700" y="166" text-anchor="middle">tr3</text>
+  </g>
+
+  <rect class="bx-d" x="20" y="222" width="720" height="58" rx="8"/>
+  <text class="sm" x="380" y="244" text-anchor="middle">tr1 = 上面那份三重奶酪订单。除了 veggies（它没有蔬菜），所有条目都指向 tr1。</text>
+  <text class="sm" x="380" y="264" text-anchor="middle">条目按字母序分布在多个索引页中。支持 ? 、?| 、?&amp; 、@&gt; 、@? 、@@ 运算符。</text>
+</svg>
+<figcaption>图 5-10　默认 GIN 索引：每个键和值都是一个条目，后面跟着“哪些行包含它”的列表（倒排索引）</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么叫“倒排索引”</div>
+  <p>普通的思路是“一行 → 包含哪些词”；倒排索引反过来，“一个词 → 出现在哪些行”。就像书末的索引页：查“MVCC”，告诉你在第 39、42 页。第 6 章的全文搜索也用 GIN，原理一样。</p>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 5.16 · 创建默认 GIN 索引">
+<pre>
+CREATE INDEX idx_pizza_orders_gin
+ON pizzeria.order_items
+USING GIN(pizza);
+</pre>
+</div>
+
+<p>统计自定义披萨的数量，这次用 <code>@&gt;</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"type": "custom"}';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (actual time=0.784..0.785 rows=1 loops=1)
+   -> Bitmap Heap Scan on order_items (actual time=0.139..0.747 rows=563 loops=1)
+         Recheck Cond: (pizza @> '{"type": "custom"}'::jsonb)
+         Heap Blocks: exact=101
+         -> Bitmap Index Scan on idx_pizza_orders_gin
+              (actual time=0.109..0.110 rows=563 loops=1)
+               Index Cond: (pizza @> '{"type": "custom"}'::jsonb)
+ Planning Time: 1.444 ms
+ Execution Time: 0.830 ms
+</pre></div>
+
+<p>GIN 查询总是走 <strong>Bitmap Index Scan</strong>，因为索引里只存了零散的键和值，而不是完整的 JSON：</p>
+
+<ol class="steps">
+  <li>Postgres 分析 Index Cond，拆出要找的条目：<code>type</code> 和 <code>custom</code>。</li>
+  <li>在 GIN 索引里找到这两个条目，生成位图：标记出 JSON 里含有 type <em>或</em> custom 的行。</li>
+  <li>Bitmap Heap Scan 逐一检查这些行（Recheck），只保留真正满足 <code>{"type": "custom"}</code> 的 —— type 必须是顶层键、custom 是它的值。这样能排除 <code>{"custom": "type"}</code> 这种结构反过来的行。</li>
+</ol>
+
+<p>同一个索引能服务各种键和值的查询，包括多个条件组合、嵌套数组：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 小号 + 青酱：照样用 idx_pizza_orders_gin
+SELECT count(*) FROM pizzeria.order_items
+WHERE pizza @> '{"sauce": "pesto"}' and pizza @> '{"size": "small"}';
+
+-- 嵌套数组：常规用量的切达奶酪
+SELECT count(*) FROM pizzeria.order_items
+WHERE pizza @> '{"toppings":{"cheese":[{"cheddar":"regular"}]}}';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (actual time=1.290..1.291 rows=1 loops=1)
+   -> Bitmap Heap Scan on order_items (actual time=0.284..1.243 rows=638 loops=1)
+         Recheck Cond: (pizza @> '{"toppings": {"cheese": [{"cheddar": "regular"}]}}'::jsonb)
+         Rows Removed by Index Recheck: 90
+         Heap Blocks: exact=101
+         -> Bitmap Index Scan on idx_pizza_orders_gin (actual time=0.248..0.248 rows=728 loops=1)
+ Execution Time: 1.351 ms
+</pre></div>
+
+<p>
+  条件看起来复杂，但 Postgres 只是拆出 toppings、cheese、cheddar、regular 四个条目去索引里找，再回表核实层级和顺序是否完全匹配。
+  <code>Rows Removed by Index Recheck: 90</code> 就是“四个词都有、但位置对不上”被剔除的行。
+  <strong>一个 GIN 索引，足以支撑对嵌套 JSON 的各种快速查询。</strong>
+</p>
+
+<h4>非默认 GIN 索引：jsonb_path_ops</h4>
+
+<p>同一份三重奶酪订单，用 <code>jsonb_path_ops</code> 建索引时，会生成 7 条<strong>路径</strong>：</p>
+
+<ul>
+  <li>4 条从顶层键到值的路径：<code>size.large</code>、<code>type.three cheese</code>、<code>crust.thin</code>、<code>sauce.marinara</code></li>
+  <li>3 条从 toppings 到嵌套数组里每个值的路径：<code>toppings.cheese.cheddar.regular</code>、<code>toppings.cheese.mozzarella.extra</code>、<code>toppings.cheese.parmesan.light</code></li>
+</ul>
+
+<p>而且存的不是文本，而是对每条路径算出的<strong>哈希值</strong>：定长整数比变长文本更小、比较更快。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="jsonb_path_ops 索引把每条路径哈希后存储">
+  <text class="ttl" x="20" y="22">JSON 订单</text>
+  <rect class="bx" x="20" y="32" width="210" height="190" rx="10"/>
+  <text class="mono" x="32" y="56">size: large</text>
+  <text class="mono" x="32" y="78">type: three cheese</text>
+  <text class="mono" x="32" y="100">crust: thin</text>
+  <text class="mono" x="32" y="122">sauce: marinara</text>
+  <text class="mono" x="32" y="144">toppings.cheese:</text>
+  <text class="mono" x="44" y="166">cheddar: regular</text>
+  <text class="mono" x="44" y="188">mozzarella: extra</text>
+  <text class="mono" x="44" y="210">parmesan: light</text>
+
+  <path class="ln-a" d="M234 126 H274" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="254" y="116" text-anchor="middle">拆路径</text>
+
+  <text class="ttl" x="280" y="22">7 条路径</text>
+  <rect class="bx-b" x="280" y="32" width="250" height="190" rx="10"/>
+  <text class="mono" x="292" y="56">size.large</text>
+  <text class="mono" x="292" y="78">type.three cheese</text>
+  <text class="mono" x="292" y="100">crust.thin</text>
+  <text class="mono" x="292" y="122">sauce.marinara</text>
+  <text class="mono" x="292" y="160">toppings.cheese.cheddar.regular</text>
+  <text class="mono" x="292" y="182">…mozzarella.extra</text>
+  <text class="mono" x="292" y="204">…parmesan.light</text>
+
+  <path class="ln-a" d="M534 126 H574" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="554" y="116" text-anchor="middle">hash()</text>
+
+  <text class="ttl" x="580" y="22">索引里存的</text>
+  <rect class="bx-a" x="580" y="32" width="160" height="190" rx="10"/>
+  <text class="mono" x="592" y="56">0x5a1f… → tr1</text>
+  <text class="mono" x="592" y="78">0x93c2… → tr1</text>
+  <text class="mono" x="592" y="100">0x1be7… → tr1</text>
+  <text class="mono" x="592" y="122">0xd408… → tr1</text>
+  <text class="mono" x="592" y="160">0x77aa… → tr1</text>
+  <text class="mono" x="592" y="182">0x0c3e… → tr1</text>
+  <text class="mono" x="592" y="204">0xe95b… → tr1</text>
+
+  <text class="sm" x="380" y="252" text-anchor="middle">查 @&gt; '{"type":"custom"}' → 算 hash(type.custom) → 在索引里找 → 回表核实（同时排除哈希碰撞）</text>
+</svg>
+<figcaption>图 5-11　jsonb_path_ops：只存“路径 → 值”的哈希，不单独存键（哈希值为示意）</figcaption>
+</figure>
+
+<div class="code" data-lang="sql" data-file="清单 5.17 · 用 jsonb_path_ops 运算符类创建 GIN 索引">
+<pre>
+CREATE INDEX idx_pizza_orders_paths_ops_gin
+ON pizzeria.order_items
+USING GIN (pizza jsonb_path_ops);
+</pre>
+</div>
+
+<p>再执行同一个 <code>@&gt; '{"type": "custom"}'</code> 查询，Postgres 选择了新的索引：</p>
+
+<div class="code out"><pre>
+ Aggregate (actual time=0.681..0.682 rows=1 loops=1)
+   -> Bitmap Heap Scan on order_items (actual time=0.106..0.644 rows=563 loops=1)
+         Recheck Cond: (pizza @> '{"type": "custom"}'::jsonb)
+         Heap Blocks: exact=101
+         -> Bitmap Index Scan on idx_pizza_orders_paths_ops_gin
+              (actual time=0.070..0.070 rows=563 loops=1)
+               Index Cond: (pizza @> '{"type": "custom"}'::jsonb)
+ Planning Time: 0.544 ms
+ Execution Time: 0.736 ms
+</pre></div>
+
+<ol>
+  <li>把 Index Cond 转换成路径 <code>type.custom</code>，算出哈希值。</li>
+  <li>用哈希值在 GIN 索引里做 Bitmap Index Scan，把可能匹配的行加入位图。</li>
+  <li>Bitmap Heap Scan 回表核实，只保留真正满足条件的行 —— 这一步也处理了<strong>哈希碰撞</strong>（别的路径碰巧算出了同样的哈希值）。</li>
+</ol>
+
+<p>对 <code>@&gt;</code> 查询，Postgres 更偏爱 jsonb_path_ops 索引，因为定长整数的查找比变长文本快。而且它通常更小：</p>
+
+<div class="code" data-lang="sql" data-file="清单 5.18 · 比较两个 GIN 索引的大小">
+<pre>
+SELECT
+    c.relname AS index_name,
+    pg_size_pretty(pg_relation_size(c.oid)) AS index_size
+FROM pg_class c
+JOIN pg_index i ON c.oid = i.indexrelid
+WHERE c.relname IN ('idx_pizza_orders_paths_ops_gin',
+                    'idx_pizza_orders_gin');
+</pre>
+</div>
+<div class="code out"><pre>
+           index_name           | index_size
+--------------------------------+------------
+ idx_pizza_orders_gin           | 112 kB
+ idx_pizza_orders_paths_ops_gin | 56 kB
+(2 rows)
+</pre></div>
+
+<p>只有一半大。代价是<strong>灵活性</strong>：它不单独存键，所以<strong>不支持 <code>?</code> 这类“键是否存在”的运算符</strong>。比如找所有带“特殊说明”的订单：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza ? 'special_instructions';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (actual time=0.095..0.096 rows=1 loops=1)
+   -> Bitmap Heap Scan on order_items (actual time=0.089..0.089 rows=0 loops=1)
+         Recheck Cond: (pizza ? 'special_instructions'::text)
+         -> Bitmap Index Scan on idx_pizza_orders_gin (actual time=0.077..0.077 rows=0 loops=1)
+               Index Cond: (pizza ? 'special_instructions'::text)
+ Execution Time: 0.150 ms
+</pre></div>
+
+<p>这次 Postgres 只能选默认 GIN 索引。</p>
+
+<div class="tw"><table>
+<tr><th></th><th>B-tree 表达式索引</th><th>默认 GIN（jsonb_ops）</th><th>GIN（jsonb_path_ops）</th></tr>
+<tr><td>建法</td><td><code>((pizza-&gt;&gt;'type'))</code></td><td><code>USING GIN (pizza)</code></td><td><code>USING GIN (pizza jsonb_path_ops)</code></td></tr>
+<tr><td>覆盖范围</td><td>只有一个字段</td><td>整个 JSON 的所有键和值</td><td>整个 JSON 的所有路径</td></tr>
+<tr><td>支持的运算符</td><td>该表达式的 <code>=</code> <code>&lt;</code> <code>&gt;</code> 等</td><td><code>?</code> <code>?|</code> <code>?&amp;</code> <code>@&gt;</code> <code>@?</code> <code>@@</code></td><td><code>@&gt;</code> <code>@?</code> <code>@@</code></td></tr>
+<tr><td>大小</td><td>小</td><td>较大</td><td>约为默认 GIN 的一半</td></tr>
+<tr><td>适合</td><td>频繁按某个固定字段过滤、排序、范围查询</td><td>查询模式多样，需要判断键是否存在</td><td>主要用 <code>@&gt;</code> 包含查询</td></tr>
+</table></div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 2012 年开始支持 JSON，之后持续增强。</li>
+  <li>有 <code>json</code> 和 <code>jsonb</code> 两种 JSON 类型，默认用 <strong>jsonb</strong>：二进制格式存储，查询更快，能用 GIN 索引。</li>
+  <li>在 JSON 的灵活性和关系类型的效率之间找平衡，<strong>混合模式</strong>往往是好选择。</li>
+  <li><code>-&gt;</code>/<code>-&gt;&gt;</code> 取值，<code>?</code> 判断键存在，<code>@&gt;</code> 判断包含；<strong>SQL/JSON path</strong> 表达式能简洁地处理多层结构和数组。</li>
+  <li><code>jsonb_set</code> 修改字段，<code>#-</code> 删除字段，不必整对象读写。</li>
+  <li>B-tree 表达式索引适合单个固定字段；两种 <strong>GIN</strong> 索引覆盖整个 JSON，<code>jsonb_ops</code> 更灵活，<code>jsonb_path_ops</code> 更小更快。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>统计每种饼底（crust）的订单数和平均价格（price），按订单数从多到少排列。</li>
+    <li>用 <code>jsonb_path_query</code> 找出最受欢迎的蔬菜配料（参考清单 5.8）。</li>
+    <li>用 <code>jsonb_set</code> 的第四个参数 <code>true</code>，给 order_id = 1 的所有披萨加上 <code>"special_instructions": "cut into 8 slices"</code>，然后再运行本章最后那条 <code>?</code> 查询。</li>
+    <li>用 <code>jsonb_agg</code> 和 <code>jsonb_build_object</code> 把 order_id = 100 的三个披萨组装成一个 JSON 数组，形如 <code>[{"item": 1, "type": "margherita", "price": …}, …]</code>。</li>
+    <li>删掉 jsonb_path_ops 索引，对比 <code>@&gt;</code> 查询在默认 GIN 和没有 GIN 两种情况下的执行时间。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

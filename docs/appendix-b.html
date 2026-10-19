@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>附录 B · 什么时候别用 Postgres — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="13">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">附录 B</span>
+<h1>什么时候别用 Postgres</h1>
+<p class="lede">
+  和任何技术一样，Postgres 有长处也有短处：有些场景它大放异彩，有些负载它并不是最佳选择。
+  虽然这本书叫《Just Use Postgres!》，Postgres 社区的很多人也在推广它，但大家都明白：它既不是银弹，也不是能替代所有数据库的瑞士军刀。
+</p>
+
+<div id="chapter-toc"></div>
+
+<h2 id="why-not-list">为什么不列一张“弱点清单”</h2>
+
+<p>
+  如果你期待这篇附录列出 Postgres 的一串弱点，作者恐怕要让你失望了。主要原因是：就算现在说“场景 X 别用 Postgres”，书出版一两年后这条建议可能就不成立了。
+  Postgres 和它的生态发展得太快，<strong>今天不支持的，不久之后可能轻松就能做到</strong> —— 回顾本书，向量搜索、时序、消息队列，几年前都还不是人们会想到 Postgres 的场景。
+</p>
+
+<p>但抛开技术和业务场景，作者在决定是否使用 Postgres 之前，总会考虑<strong>三个理由</strong>。它们能帮你做出更周全、更少偏见的决定。</p>
+
+<h2 id="three-reasons">三种情况下不用 Postgres</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="决定是否引入 Postgres 前的三个问题">
+  <rect class="bx-a" x="270" y="12" width="220" height="44" rx="10"/>
+  <text class="ttl on-a" x="380" y="40" text-anchor="middle">要不要在这个项目里用 Postgres？</text>
+  <path class="ln" d="M380 58 V78" marker-end="url(#ar)"/>
+
+  <rect class="bx" x="200" y="82" width="360" height="50" rx="10"/>
+  <text class="sm b" x="380" y="104" text-anchor="middle">① 另一个数据库明显更适合这个场景，</text>
+  <text class="sm b" x="380" y="122" text-anchor="middle">而改用 Postgres 很难甚至不可能？</text>
+  <path class="ln-r" d="M562 107 H610" marker-end="url(#ar-r)"/><text class="sm on-r" x="586" y="99" text-anchor="middle">是</text>
+  <path class="ln-g" d="M380 134 V154" marker-end="url(#ar-g)"/><text class="sm on-g" x="390" y="148">否</text>
+
+  <rect class="bx" x="200" y="158" width="360" height="50" rx="10"/>
+  <text class="sm b" x="380" y="180" text-anchor="middle">② 应用已经在用另一个数据库，</text>
+  <text class="sm b" x="380" y="198" text-anchor="middle">而且大家都满意，没有真正的替换需求？</text>
+  <path class="ln-r" d="M562 183 H610" marker-end="url(#ar-r)"/><text class="sm on-r" x="586" y="175" text-anchor="middle">是</text>
+  <path class="ln-g" d="M380 210 V230" marker-end="url(#ar-g)"/><text class="sm on-g" x="390" y="224">否</text>
+
+  <rect class="bx" x="200" y="234" width="360" height="50" rx="10"/>
+  <text class="sm b" x="380" y="256" text-anchor="middle">③ 两者都适合，但团队大多数人</text>
+  <text class="sm b" x="380" y="274" text-anchor="middle">对另一个数据库有经验得多？</text>
+  <path class="ln-r" d="M562 259 H610" marker-end="url(#ar-r)"/><text class="sm on-r" x="586" y="251" text-anchor="middle">是</text>
+  <path class="ln-g" d="M380 286 V300" marker-end="url(#ar-g)"/>
+
+  <rect class="bx-r" x="614" y="82" width="126" height="202" rx="10"/>
+  <text class="ttl on-r" x="677" y="160" text-anchor="middle">用另一个</text>
+  <text class="ttl on-r" x="677" y="180" text-anchor="middle">数据库</text>
+  <text class="sm" x="677" y="206" text-anchor="middle">不要为了用</text>
+  <text class="sm" x="677" y="222" text-anchor="middle">Postgres 而用</text>
+
+  <rect class="bx-g" x="270" y="302" width="220" height="26" rx="8"/>
+  <text class="sm b on-g" x="380" y="320" text-anchor="middle">Just use Postgres!</text>
+
+  <rect class="bx-d" x="20" y="82" width="160" height="202" rx="10"/>
+  <text class="sm b" x="100" y="106" text-anchor="middle">注意</text>
+  <text class="sm" x="100" y="130" text-anchor="middle">这三条都与技术</text>
+  <text class="sm" x="100" y="148" text-anchor="middle">能力无关，而是关于</text>
+  <text class="sm" x="100" y="174" text-anchor="middle">“合适”</text>
+  <text class="sm" x="100" y="192" text-anchor="middle">“现状”</text>
+  <text class="sm" x="100" y="210" text-anchor="middle">“团队”</text>
+  <text class="sm" x="100" y="236" text-anchor="middle">技术能力会变，</text>
+  <text class="sm" x="100" y="254" text-anchor="middle">这三条不会</text>
+</svg>
+<figcaption>图 B-1　引入 Postgres 前，作者会问自己的三个问题</figcaption>
+</figure>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#129513;</span><h4>① 别的数据库就是更合适</h4><p>另一个数据库能轻松支持这个场景，而改用 Postgres 很难或不可能。没必要过度设计，硬把 Postgres 塞进去，给自己和团队添麻烦。</p></div>
+  <div class="card"><span class="ic">&#128737;</span><h4>② 现有方案运行良好</h4><p>应用已经在用另一个数据库，并没有真正的替换需要。为了用 Postgres 而用 Postgres 毫无意义。它干得好、大家没意见，就别去破坏已经正常运转的东西 —— 哪怕它是付费产品、公司每年花一大笔钱，公司愿意付就让它付。</p></div>
+  <div class="card"><span class="ic">&#128101;</span><h4>③ 团队更熟悉别的数据库</h4><p>如果 Postgres 和另一个数据库同样适合，那就利用团队已有的经验：你们可能交付得更快、犯错更少、处理线上问题更有把握。这也许还是你学点新东西、拓宽数据库视野的好机会。</p></div>
+</div>
+
+<h2 id="story">作者的亲身经历</h2>
+
+<div class="box key">
+  <div class="t">&#10077; 一个没有被替换掉的文档数据库</div>
+  <p>
+    尽管 Postgres 是作者最喜欢、也是默认的数据库，他在把它引入项目之前，仍然会认真对待这三条理由。
+    有一次他加入一个项目，团队正在顺利地使用一个文档数据库：它对这个应用很合适，整个团队也用得非常顺手。
+    在他的帮助下，团队完全可以轻松地把它换成 Postgres —— 但他<strong>提都没提</strong>。
+    相反，他决定更深入地研究那个数据库，最后帮团队大幅优化了它的用法，<strong>把基础设施成本降到了原来的五分之一</strong>。
+  </p>
+</div>
+
+<p>
+  这正是第 1 章说的那句话的另一面：“Just use Postgres”是一个<strong>经验之谈</strong>，提醒你在往技术栈里加第二个数据库之前，先看看 Postgres 能不能搞定；
+  它<strong>不是</strong>一条要求你把一切都换成 Postgres 的教条。
+</p>
+
+<h2 id="afterword">后记：少一个系统，少一份负担</h2>
+
+<p>本书的后记由《High-Performance Java Persistence》的作者 Vlad Mihalcea 撰写，他的经历从另一个角度说明了“就用 Postgres”的价值：</p>
+
+<ul>
+  <li>2008 年他第一次在一个物流企业应用里用 PostgreSQL（之前只用过 Oracle 和 SQL Server），就惊讶于 Postgres 8.3 的丰富特性：数组、枚举类型、全文搜索和 GIN 索引、几何类型和 GiST 索引、多值插入、NOWAIT……</li>
+  <li>2011 年一个项目需要处理外部供应商的 JSON 文档：解析后存入关系表，同时还要保留原始 JSON 以便审计时追溯。当时的关系数据库还不支持在 JSON 里搜索，于是他们引入了 MongoDB。</li>
+  <li>他的结论是：<strong>开发阶段加一个数据库很容易，在生产环境维护它很难</strong> —— 监控、备份、升级、新人培训，还要仔细评估哪些特性影响性能。</li>
+  <li>从 9.4 版开始 PostgreSQL 原生支持 JSON（jsonb），很多以前需要 NoSQL 数据库的项目从此可以“就用 Postgres”。运行的系统越少，可动的部件越少，系统越容易维持。<strong>“保持简单”不只适用于开发，对系统架构甚至更有价值。</strong></li>
+  <li>近年来在他的培训课上，越来越多的项目几乎只用 PostgreSQL。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="多数据库架构与单一 Postgres 架构的运维负担对比">
+  <text class="ttl on-r" x="190" y="22" text-anchor="middle">多个数据库</text>
+  <rect class="bx-p" x="130" y="34" width="120" height="34" rx="8"/><text class="sm b on-p" x="190" y="56" text-anchor="middle">应用</text>
+  <rect class="bx" x="20" y="96" width="100" height="34" rx="6"/><text class="sm" x="70" y="118" text-anchor="middle">关系库</text>
+  <rect class="bx" x="140" y="96" width="100" height="34" rx="6"/><text class="sm" x="190" y="118" text-anchor="middle">文档库</text>
+  <rect class="bx" x="260" y="96" width="100" height="34" rx="6"/><text class="sm" x="310" y="118" text-anchor="middle">向量库 …</text>
+  <path class="ln" d="M170 70 L70 94"/><path class="ln" d="M190 70 V94"/><path class="ln" d="M210 70 L310 94"/>
+  <text class="sm on-r" x="190" y="156" text-anchor="middle">× 监控 × 备份 × 升级 × 培训 × 调优</text>
+  <text class="sm on-r" x="190" y="174" text-anchor="middle">× 跨库一致性</text>
+
+  <path class="ln-d" d="M380 30 V200"/>
+
+  <text class="ttl on-g" x="570" y="22" text-anchor="middle">就用 Postgres</text>
+  <rect class="bx-p" x="510" y="34" width="120" height="34" rx="8"/><text class="sm b on-p" x="570" y="56" text-anchor="middle">应用</text>
+  <rect class="bx-a" x="440" y="96" width="260" height="54" rx="10"/>
+  <text class="sm b on-a" x="570" y="116" text-anchor="middle">Postgres</text>
+  <text class="sm" x="570" y="136" text-anchor="middle">关系 · JSON · 全文 · 向量 · 时序 · 地理 · 队列</text>
+  <path class="ln" d="M570 70 V94"/>
+  <text class="sm on-g" x="570" y="174" text-anchor="middle">一套监控、备份、升级、技能</text>
+  <text class="sm on-g" x="570" y="192" text-anchor="middle">跨“负载”的数据天然在一个事务里</text>
+</svg>
+<figcaption>图 B-2　少一个系统，就少一整套运维负担 —— 前提是 Postgres 真的能胜任</figcaption>
+</figure>
+
+<h2 id="next">接下来</h2>
+
+<p>书到这里就结束了，但你和 Postgres 的旅程还在继续：</p>
+
+<ul>
+  <li><strong>从没在项目里用过 Postgres？</strong>开始用它。第 1–4 章的内容足以支撑大多数事务型应用。</li>
+  <li><strong>已经用了很多年？</strong>试试把它用在本书介绍的另一个场景上：JSON、全文搜索、向量、时序、地理、队列……</li>
+  <li><strong>想看看底层？</strong>本书仓库的 <code>postgres_internals_videos.md</code> 收录了两个深入内部机制的视频：
+    <ul>
+      <li><a href="https://www.youtube.com/watch?v=TBmDBw1IIoY">PostgreSQL Internals in Action: MVCC</a> —— Postgres 用 MVCC 在一致的快照上并发执行事务和查询。一条记录可以同时存在多个版本，每个版本对一组特定的事务可见；记录被更新或删除后并不会立即从库里移除，旧版本保留一段时间后才被垃圾回收（<a href="https://github.com/dmagda/DevMastersDb/blob/main/postgres/postgres_mvcc_backstage.md">配套代码</a>）。</li>
+      <li><a href="https://www.youtube.com/watch?v=Vq34xPYZwXg">Database Connection Pooling: Why It Matters? Essential OS-Level Insights</a> —— 从操作系统层面看，没有连接池时应用和数据库之间发生了什么，以及连接池为什么能减少开关连接的开销。</li>
+    </ul>
+  </li>
+  <li><strong>想看更多 AI 示例？</strong>仓库的 <code>ai_samples/more_samples.md</code> 有 Text-to-SQL 智能体和基于 pgvector 的 ChatGPT 插件的视频与代码（见第 8 章末尾）。</li>
+</ul>
+
+<div class="box tip">
+  <div class="t">&#128161; 最后一句话</div>
+  <p>持续在 Postgres 上投入时间吧。考虑到它已经无处不在、普及速度又这么快，这份投入一定会有丰厚的回报。</p>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 不是银弹；“Just use Postgres”是建议，不是教条。</li>
+  <li>技术上的弱点会随着 Postgres 和生态的快速演进而改变，所以不必背一张“弱点清单”。</li>
+  <li>三种情况下别用 Postgres：别的数据库明显更适合；现有数据库运转良好、没有替换需求；团队对另一个同样合适的数据库更熟悉。</li>
+  <li>系统越少，运维负担越轻 —— 在 Postgres 能胜任的前提下，少引入一个数据库就是赚到。</li>
+</ul>
+
+<div class="exercise">
+  <h3>思考题</h3>
+  <ol>
+    <li>回顾你正在参与的项目：它用了几种数据存储？如果把其中某一个换成 Postgres，用三个问题（图 B-1）检验一下，值得吗？</li>
+    <li>挑本书中的一个场景（比如第 11 章的消息队列），列出在你的业务规模下，什么信号会让你决定“该换专用系统了”。</li>
+    <li>试着为你的团队写一页“数据库选型原则”，其中至少包含本附录的三条理由。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

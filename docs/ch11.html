@@ -1,0 +1,1046 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 11 章 · 用 Postgres 做消息队列 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="11">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 11 章</span>
+<h1>用 Postgres 做消息队列</h1>
+<p class="lede">
+  <strong>消息队列</strong>让服务和系统组件之间可以<strong>异步</strong>通信：一个服务（<strong>生产者</strong>）不直接调用另一个服务，而是把消息发到队列；
+  另一个服务（<strong>消费者</strong>）稍后读取并处理。队列一直保存着消息，直到它们被处理、删除。
+  常见用途有：用队列作为异步通信层来解耦应用、广播和交换事件、在多个工作进程之间分发任务。
+  这一章我们为<strong>车管所（DMV）</strong>开发一个访客登记和叫号系统，学习何时以及如何把 Postgres 当作消息队列。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>判断什么时候适合用 Postgres 做消息队列</li>
+    <li>基于普通表和 PL/pgSQL 函数实现一个自定义队列</li>
+    <li>理解 <code>FOR UPDATE SKIP LOCKED</code> 如何让多个消费者并行取消息而不互相阻塞</li>
+    <li>用 <code>LISTEN</code>/<code>NOTIFY</code> 通知消费者有新消息，并了解它的局限</li>
+    <li>知道索引、分区、失败恢复等实现上的考量</li>
+    <li>用 pgmq 扩展：发送、读取、可见性超时、归档</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 180" role="img" aria-label="消息队列：生产者发送消息到队列，消费者稍后读取处理">
+  <rect class="bx-p" x="20" y="50" width="170" height="80" rx="12"/>
+  <text class="ttl on-p" x="105" y="82" text-anchor="middle">生产者</text>
+  <text class="sm" x="105" y="104" text-anchor="middle">登记终端</text>
+  <path class="ln-p" d="M192 90 H246" marker-end="url(#ar-p)"/>
+  <text class="sm" x="219" y="82" text-anchor="middle">发送</text>
+
+  <rect class="bx-a" x="250" y="40" width="260" height="100" rx="12"/>
+  <text class="ttl on-a" x="380" y="64" text-anchor="middle">队列（先进先出）</text>
+  <rect class="bx" x="268" y="80" width="50" height="40" rx="6"/><text class="sm" x="293" y="105" text-anchor="middle">msg 3</text>
+  <rect class="bx" x="326" y="80" width="50" height="40" rx="6"/><text class="sm" x="351" y="105" text-anchor="middle">msg 2</text>
+  <rect class="bx-g" x="384" y="80" width="50" height="40" rx="6"/><text class="sm" x="409" y="105" text-anchor="middle">msg 1</text>
+  <text class="sm" x="470" y="105" text-anchor="middle">→</text>
+
+  <path class="ln-g" d="M512 90 H566" marker-end="url(#ar-g)"/>
+  <text class="sm" x="539" y="82" text-anchor="middle">读取</text>
+  <rect class="bx-g" x="570" y="30" width="170" height="54" rx="10"/>
+  <text class="ttl on-g" x="655" y="54" text-anchor="middle">消费者 A</text><text class="sm" x="655" y="72" text-anchor="middle">1 号窗口</text>
+  <rect class="bx-g" x="570" y="96" width="170" height="54" rx="10"/>
+  <text class="ttl on-g" x="655" y="120" text-anchor="middle">消费者 B</text><text class="sm" x="655" y="138" text-anchor="middle">2 号窗口</text>
+  <text class="sm" x="380" y="170" text-anchor="middle">生产者和消费者互不认识、不必同时在线 —— 这就是“解耦”和“异步”</text>
+</svg>
+<figcaption>图 11-1　消息队列的基本模型</figcaption>
+</figure>
+
+<h2 id="when">什么时候用 Postgres 做消息队列</h2>
+
+<p>任何消息队列至少要提供两项基本能力：一是能<strong>接收并保存</strong>生产者的消息，直到消费者需要（有的只存内存、速度快；有的持久化到磁盘，重启也不丢）；二是提供发布、读取、管理消息的 <strong>API</strong>。Postgres 这样支持它们：</p>
+
+<ul>
+  <li>队列可以建在一张<strong>普通表</strong>上，每条消息一行。和其他表数据一样，Postgres 把消息持久化到磁盘以保证事务一致性和持久性，并按可用资源缓存在内存里。</li>
+  <li>消息结构可以用丰富的数据类型定义：message_id、created_time 用 int8、timestamptz 这类严格类型，保证格式正确；真正的消息<strong>载荷</strong>用 json/jsonb，生产者可以发任意结构。</li>
+  <li>API 方面，最底层就是用 SQL 存取消息；往上可以封装成数据库函数（存储过程），或者某种语言的客户端库，底下依然是表和 SQL。</li>
+  <li>数据库还有各种能力，保证消息量或生产者、消费者数量增长时，性能不会退化。</li>
+</ul>
+
+<p>但 Postgres <strong>毕竟不是专门的消息队列</strong>。用下面三条标准判断是否该用它：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="是否用 Postgres 做消息队列的三条判断标准">
+  <rect class="bx-g" x="20" y="20" width="230" height="230" rx="12"/>
+  <text class="ttl on-g" x="135" y="46" text-anchor="middle">① 需要事务</text>
+  <text class="sm" x="135" y="72" text-anchor="middle">业务操作和它产生的消息</text>
+  <text class="sm" x="135" y="90" text-anchor="middle">必须<tspan class="b">原子地</tspan>一起成功或失败</text>
+  <rect class="bx" x="40" y="108" width="190" height="64" rx="8"/>
+  <text class="mono" x="135" y="130" text-anchor="middle">BEGIN;</text>
+  <text class="mono" x="135" y="146" text-anchor="middle">登记 + enqueue</text>
+  <text class="mono" x="135" y="162" text-anchor="middle">COMMIT;</text>
+  <text class="sm" x="135" y="196" text-anchor="middle">用专门的 MQ 时，要自己处理</text>
+  <text class="sm" x="135" y="212" text-anchor="middle">“登记成功了但消息没发出去”</text>
+
+  <rect class="bx-b" x="265" y="20" width="230" height="230" rx="12"/>
+  <text class="ttl on-b" x="380" y="46" text-anchor="middle">② 消息量撑得住</text>
+  <text class="sm" x="380" y="72" text-anchor="middle">单台 Postgres 能在处理其他</text>
+  <text class="sm" x="380" y="90" text-anchor="middle">业务的同时消化这些消息</text>
+  <text class="sm" x="281" y="122">• 读太多：加只读副本分流</text>
+  <text class="sm" x="281" y="144">• 写太多：换更大的主机，</text>
+  <text class="sm" x="281" y="162">  或用分片/分布式 Postgres</text>
+  <text class="sm" x="281" y="180">  （如 Citus、YugabyteDB）</text>
+  <text class="sm" x="380" y="212" text-anchor="middle">务必做基准测试和压测；</text>
+  <text class="sm" x="380" y="230" text-anchor="middle">调优太费劲就换专用方案</text>
+
+  <rect class="bx-a" x="510" y="20" width="230" height="230" rx="12"/>
+  <text class="ttl on-a" x="625" y="46" text-anchor="middle">③ 已经在用 Postgres</text>
+  <text class="sm" x="625" y="72" text-anchor="middle">不想往架构里再加一个系统</text>
+  <text class="sm" x="526" y="108">✓ 已经用 Postgres 做业务库：</text>
+  <text class="sm" x="526" y="126">  先试试它，架构不变，</text>
+  <text class="sm" x="526" y="144">  团队不用学新系统</text>
+  <text class="sm" x="526" y="176">⚠ 只为当队列而引入 Postgres：</text>
+  <text class="sm" x="526" y="194">  要慎重。先看现有数据库能否</text>
+  <text class="sm" x="526" y="212">  胜任，不行就考虑专用 MQ</text>
+</svg>
+<figcaption>图 11-2　三条判断标准</figcaption>
+</figure>
+
+<ol>
+  <li><strong>需要用 Postgres 的事务把业务操作和它产生的消息原子地记录下来。</strong>
+    访客到车管所后在登记终端为某项业务（申请驾照、车辆注册等）签到，然后进入等候队列，轮到时被叫号。签到成功会产生一条“有新访客等待叫号”的消息。
+    如果你希望<strong>签到和入队在同一个事务里</strong>完成 —— 要么都成功，要么都失败 —— 就用 Postgres。
+    换成专用消息队列，应用就得自己保证：先在 Postgres 里签到，再把消息发到另一个队列；万一队列没记录下来，应用必须尽快处理，因为访客已经签到了、正等着被叫。</li>
+  <li><strong>消息量 Postgres 轻松应付得了。</strong>
+    默认 Postgres 是单台服务器处理读写。如果它能在处理其他业务的同时消化应用产生和消费的消息量，就用它。
+    消费者太多、读请求压垮数据库时，可以加只读副本；生产者太多、写请求饱和时，要升级主机配置或迁移到分片/分布式 Postgres（如 CitusData 或 YugabyteDB）。
+    无论如何都要做基准和压力测试；如果优化工作量太大、配置太复杂，就考虑专用队列。
+    车管所的消息量很小，不用怎么优化；但如果是全球电商或社交网络这种规模，就要重新考虑了。</li>
+  <li><strong>你已经在用 Postgres，不想再引入别的方案。</strong>
+    应用已经用 Postgres，现在要加个队列场景，先试 Postgres：合适的话架构不变，团队也不用学习、优化、维护一个新系统。
+    反过来，如果你没有（也不打算）把 Postgres 用于本书讲的其他场景，只想拿它当队列，就要慎重 —— 比如车管所的业务数据存在别的数据库里，那么只为队列引入 Postgres 未必是最优选择。</li>
+</ol>
+
+<h2 id="custom">构建一个自定义消息队列</h2>
+
+<p>我们实现三个数据库函数：</p>
+
+<div class="tw"><table>
+<tr><th>函数</th><th>作用</th></tr>
+<tr><td><code>mq.enqueue(new_message JSON)</code></td><td>把一条 JSON 消息加入队列</td></tr>
+<tr><td><code>mq.dequeue(messages_cnt INT)</code></td><td>从队头取出接下来的 messages_cnt 条消息。取出的消息对其他消费者不可见，但仍留在队列里，直到当前消费者调用 mark_completed</td></tr>
+<tr><td><code>mq.mark_completed(message_ids BIGINT[], to_delete BOOLEAN DEFAULT FALSE)</code></td><td>把指定 ID 的消息标记为已完成（处理成功）；to_delete 为 TRUE 时直接删除</td></tr>
+</table></div>
+
+<div class="box note">
+  <div class="t">&#9432; 用哪个容器</div>
+  <p>前几章的任何一个 Postgres 容器都可以：<code>docker exec -it &lt;container-name&gt; psql -U postgres</code>。</p>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 11.1 · 用普通表实现队列">
+<pre>
+CREATE SCHEMA mq;
+
+CREATE TYPE mq.status AS ENUM ('new', 'processing', 'completed');
+
+CREATE TABLE mq.queue (
+    id BIGSERIAL PRIMARY KEY,
+    message JSON NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    status mq.status NOT NULL DEFAULT 'new'
+);
+</pre>
+</div>
+
+<ul>
+  <li><strong>id</strong>：64 位自增整数，最多 2⁶³ 个 ID；用不了那么多可以用 32 位的 SERIAL。两者都依赖序列。如果大量生产者并发发消息，每个都要等序列生成下一个 ID，成为瓶颈时可以改用 UUID + <code>gen_random_uuid()</code>。</li>
+  <li><strong>message</strong>：消息载荷。这里特意用 <strong>JSON</strong> 而不是 JSONB：队列只需要原样存下生产者的消息、稍后原样交给消费者。JSONB 会预处理（可能拖慢写入、还会重排键），它的好处在于在数据库里遍历、查询、修改 JSON（第 5 章），而队列只是“搬运”，不做转换。</li>
+  <li><strong>created_at</strong>：入队时间，用来按<strong>先进先出（FIFO）</strong>顺序交给消费者。</li>
+  <li><strong>status</strong>：消息状态。<code>CREATE TYPE … AS ENUM</code> 定义了一个只允许这三个值的<strong>枚举类型</strong>。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="消息的状态流转：new、processing、completed 或删除；超时回到 new">
+  <rect class="bx-b" x="20" y="70" width="140" height="60" rx="30"/>
+  <text class="ttl on-b" x="90" y="96" text-anchor="middle">new</text>
+  <text class="sm" x="90" y="114" text-anchor="middle">已发布，未被取走</text>
+
+  <path class="ln-a" d="M162 100 H298" marker-end="url(#ar-a)"/>
+  <text class="mono on-a" x="230" y="92" text-anchor="middle">dequeue()</text>
+
+  <rect class="bx-a" x="302" y="70" width="160" height="60" rx="30"/>
+  <text class="ttl on-a" x="382" y="96" text-anchor="middle">processing</text>
+  <text class="sm" x="382" y="114" text-anchor="middle">处理中，对他人不可见</text>
+
+  <path class="ln-g" d="M464 88 L598 52" marker-end="url(#ar-g)"/>
+  <text class="mono on-g" x="520" y="58" text-anchor="middle">mark_completed()</text>
+  <rect class="bx-g" x="602" y="22" width="140" height="56" rx="28"/>
+  <text class="ttl on-g" x="672" y="48" text-anchor="middle">completed</text>
+  <text class="sm" x="672" y="66" text-anchor="middle">之后归档或删除</text>
+
+  <path class="ln-r" d="M464 112 L598 148" marker-end="url(#ar-r)"/>
+  <text class="mono on-r" x="510" y="150" text-anchor="middle">…, TRUE</text>
+  <rect class="bx-r" x="602" y="124" width="140" height="56" rx="28"/>
+  <text class="ttl on-r" x="672" y="150" text-anchor="middle">已删除</text>
+  <text class="sm" x="672" y="168" text-anchor="middle">直接从表中移除</text>
+
+  <path class="ln-d" d="M382 132 Q382 190 230 190 Q90 190 90 134" marker-end="url(#ar)"/>
+  <text class="sm" x="236" y="204" text-anchor="middle">消费者挂了、超时未处理 → 由应用（或定时任务）重置回 new</text>
+  <text class="mono" x="90" y="52" text-anchor="middle">enqueue()</text>
+  <path class="ln-p" d="M90 58 V68" marker-end="url(#ar-p)"/>
+</svg>
+<figcaption>图 11-3　消息状态机</figcaption>
+</figure>
+
+<p>
+  processing 状态在故障场景下也很有用：消费者取了消息、开始处理、然后挂了。应用可以定期检查在 processing 状态停留太久的消息，按自己定义的时间阈值把它们重置为 new。
+</p>
+
+<h3>入队函数</h3>
+
+<div class="code" data-lang="sql" data-file="清单 11.2 · 往队列添加消息的函数">
+<pre>
+CREATE OR REPLACE FUNCTION mq.enqueue(new_message JSON)
+RETURNS VOID AS $$
+BEGIN
+  INSERT INTO mq.queue (message)
+  VALUES (new_message);
+END;
+$$ LANGUAGE plpgsql;
+</pre>
+</div>
+
+<p>只插入消息本身，其他字段由 Postgres 自动填：id 取序列的下一个值，created_at 是当前时间，status 是 new。</p>
+
+<h3>出队函数</h3>
+
+<div class="code" data-lang="sql" data-file="清单 11.3 · 从队列取出消息的函数">
+<pre>
+CREATE OR REPLACE FUNCTION mq.dequeue(messages_cnt INT)
+RETURNS TABLE (msg_id BIGINT, message JSON, enqueued_at TIMESTAMPTZ) AS $$
+BEGIN
+  RETURN QUERY
+  WITH new_messages AS (
+     SELECT id FROM mq.queue
+     WHERE status = 'new' ORDER BY created_at
+     FOR UPDATE SKIP LOCKED
+     LIMIT messages_cnt
+  )
+  UPDATE mq.queue q
+  SET status = 'processing'
+  FROM new_messages WHERE q.id = new_messages.id
+  RETURNING q.id, q.message,
+     date_trunc('seconds',q.created_at) AS created_at;
+END;
+$$ LANGUAGE plpgsql;
+</pre>
+</div>
+
+<ol>
+  <li>先算 CTE <code>new_messages</code>：找出状态为 new 的消息，按 created_at 升序（先来的在前），<code>LIMIT</code> 取最多 messages_cnt 条。</li>
+  <li><code>UPDATE</code> 把这些消息的状态改为 processing。</li>
+  <li><code>RETURNING</code> 返回被改的行，<code>RETURN QUERY</code> 把它们放进函数的结果集。created_at 用 <code>date_trunc</code> 截断到秒。（CTE 和 PL/pgSQL 复习见第 2、3 章。）</li>
+</ol>
+
+<h4>关键：FOR UPDATE SKIP LOCKED</h4>
+
+<p>
+  <code>FOR UPDATE</code> 给 CTE 选出的每一条消息加上<strong>行级锁</strong>，保证只有当前这个消费者能处理它们。锁在执行 dequeue 的事务提交或回滚时才释放。
+  这个事务可以是显式的（dequeue 和其他业务逻辑放在同一个 <code>BEGIN…COMMIT</code> 里），也可以是调用函数时 Postgres 自动开启的隐式事务（函数结束即提交、释放锁）：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+BEGIN;
+-- 执行一些业务逻辑
+SELECT * FROM mq.dequeue(1);
+-- 再执行一些业务逻辑
+COMMIT;      -- 成功提交或失败回滚时，锁才释放
+</pre></div>
+
+<p>
+  <code>SKIP LOCKED</code> 告诉 Postgres <strong>跳过已经被其他事务锁住的行</strong>。多个消费者同时调用 dequeue 时，每个只拿到别人没在处理的消息，可以并行处理、互不阻塞，整体吞吐量更高。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="两个消费者并发出队：没有 SKIP LOCKED 时第二个被阻塞，有 SKIP LOCKED 时第二个跳过锁住的行">
+  <text class="ttl" x="20" y="22">队列表（按 created_at 排序）</text>
+  <rect class="cell-h" x="20" y="32" width="200" height="24"/><text class="sm b" x="30" y="49">id · status</text>
+  <rect class="cell-a" x="20" y="56" width="200" height="28"/><text class="mono" x="30" y="75">1 · new 🔒A</text>
+  <rect class="cell-b" x="20" y="84" width="200" height="28"/><text class="mono" x="30" y="103">2 · new 🔒B</text>
+  <rect class="cell" x="20" y="112" width="200" height="28"/><text class="mono" x="30" y="131">3 · new</text>
+  <rect class="cell" x="20" y="140" width="200" height="28"/><text class="mono" x="30" y="159">4 · new</text>
+
+  <rect class="bx-r" x="260" y="32" width="230" height="130" rx="10"/>
+  <text class="ttl on-r" x="375" y="56" text-anchor="middle">只有 FOR UPDATE</text>
+  <text class="sm" x="276" y="82">A 锁住了 1 号</text>
+  <text class="sm" x="276" y="102">B 也想拿“第一条 new”= 1 号</text>
+  <text class="sm on-r" x="276" y="122">⏸ B 被阻塞，等 A 提交</text>
+  <text class="sm" x="276" y="146">消费者再多也是排队执行</text>
+
+  <rect class="bx-g" x="510" y="32" width="230" height="130" rx="10"/>
+  <text class="ttl on-g" x="625" y="56" text-anchor="middle">FOR UPDATE SKIP LOCKED</text>
+  <text class="sm" x="526" y="82">A 锁住了 1 号</text>
+  <text class="sm" x="526" y="102">B 跳过被锁的 1 号</text>
+  <text class="sm on-g" x="526" y="122">✓ B 立刻拿到 2 号</text>
+  <text class="sm" x="526" y="146">多个消费者真正并行</text>
+
+  <rect class="bx-d" x="20" y="190" width="720" height="66" rx="10"/>
+  <text class="sm" x="380" y="214" text-anchor="middle">这正是银行叫号的逻辑：1 号窗口叫走了 1 号，2 号窗口不会也去叫 1 号，而是直接叫下一个</text>
+  <text class="sm" x="380" y="240" text-anchor="middle">SKIP LOCKED 让 Postgres 成为一个靠谱的“工作队列”：加多少个消费者，就有多少个并行处理的窗口</text>
+</svg>
+<figcaption>图 11-4　SKIP LOCKED：被别人锁住的消息直接跳过，而不是排队等待</figcaption>
+</figure>
+
+<h3>标记完成函数</h3>
+
+<div class="code" data-lang="sql" data-file="清单 11.4 · 修改消息状态的函数">
+<pre>
+CREATE OR REPLACE FUNCTION mq.mark_completed(
+  message_ids BIGINT[], to_delete BOOLEAN DEFAULT FALSE)
+RETURNS VOID AS $$
+BEGIN
+  IF to_delete THEN
+     DELETE FROM mq.queue
+     WHERE id = ANY(message_ids);
+  ELSE
+     UPDATE mq.queue
+     SET status = 'completed'
+     WHERE id = ANY(message_ids);
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+</pre>
+</div>
+
+<p>消费者传入处理成功的消息 ID 数组。<code>id = ANY(数组)</code> 表示“id 等于数组中任意一个”。to_delete 为 TRUE 就删除，否则把状态改为 completed。</p>
+
+<h2 id="use">使用自定义队列</h2>
+
+<p>车管所开门之前，等候队列是空的（<code>SELECT * FROM mq.queue;</code> 返回 0 行）。早上 8 点开门，第一位访客 Emily Carter 来注册新车。她在终端签到，终端把她加入队列：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT mq.enqueue('{
+  "service": "car_registration",
+  "visitor": "Emily Carter"
+}'::json);
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 把入队放进更大的业务事务</div>
+  <p>enqueue 可以和其他业务操作放在同一个事务里，原子地执行 —— 这正是用 Postgres 做队列的第一条理由：</p>
+  <div class="code" data-lang="sql"><pre>
+BEGIN;
+-- 执行一些业务逻辑（比如在访客表里记录签到）
+SELECT mq.enqueue('{
+  "service": "car_registration",
+  "visitor": "Emily Carter"
+}'::json);
+-- 再执行一些业务逻辑
+COMMIT;
+</pre></div>
+  <p>只有所有操作都成功、事务顺利提交，消息才会出现在队列里。</p>
+</div>
+
+<p>几分钟后又来了两位：Liam Rodriguez 考驾照，Ava Thompson 换车牌。终端依次把他们加入队列：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT mq.enqueue('{
+  "service": "driving_license_exam",
+  "visitor": "Liam Rodriguez"
+}'::json);
+
+SELECT mq.enqueue('{
+  "service": "car_plate_renewal",
+  "visitor": "Ava Thompson"
+}'::json);
+
+SELECT id, message,
+  date_trunc('seconds',created_at) AS created_at,
+  status
+FROM mq.queue
+ORDER BY created_at;
+</pre></div>
+<div class="code out"><pre>
+ id |                message                 |       created_at       | status
+----+----------------------------------------+------------------------+--------
+  1 | {                                     +| 2025-06-19 08:03:16+00 | new
+    |    "service": "car_registration",     +|                        |
+    |    "visitor": "Emily Carter"          +|                        |
+    | }                                      |                        |
+  2 | {                                     +| 2025-06-19 08:05:28+00 | new
+    |    "service": "driving_license_exam", +|                        |
+    |    "visitor": "Liam Rodriguez"        +|                        |
+    | }                                      |                        |
+  3 | {                                     +| 2025-06-19 08:07:43+00 | new
+    |    "service": "car_plate_renewal",    +|                        |
+    |    "visitor": "Ava Thompson"          +|                        |
+    | }                                      |                        |
+(3 rows)
+</pre></div>
+
+<p>（注意 JSON 类型原样保留了换行和空格。）一位办事员上班登录，叫第一位访客 —— 一次只能接待一人，所以参数是 1：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM mq.dequeue(1);
+</pre></div>
+<div class="code out"><pre>
+ msg_id |              message              |      enqueued_at
+--------+-----------------------------------+------------------------
+      1 | {                                +| 2025-06-19 08:03:16+00
+        |   "service": "car_registration", +|
+        |   "visitor": "Emily Carter"      +|
+        | }                                 |
+(1 row)
+</pre></div>
+
+<p>等候区的屏幕显示 Emily，她走向窗口。很快第二位办事员也上班了，叫下一位 —— Liam。再看队列表：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="车管所叫号过程中队列表的状态变化">
+  <g class="sm b">
+    <text x="20" y="22">时刻</text><text x="160" y="22">1 · Emily</text><text x="300" y="22">2 · Liam</text><text x="440" y="22">3 · Ava</text><text x="580" y="22">调用</text>
+  </g>
+  <text class="sm" x="20" y="51">三人签到后</text>
+  <rect class="cell-b" x="150" y="34" width="132" height="26"/><text class="sm" x="160" y="51">new</text>
+  <rect class="cell-b" x="290" y="34" width="132" height="26"/><text class="sm" x="300" y="51">new</text>
+  <rect class="cell-b" x="430" y="34" width="132" height="26"/><text class="sm" x="440" y="51">new</text>
+  <text class="sm" x="20" y="91">窗口 1、2 各叫一人</text>
+  <rect class="cell-a" x="150" y="74" width="132" height="26"/><text class="sm" x="160" y="91">processing·窗口1</text>
+  <rect class="cell-a" x="290" y="74" width="132" height="26"/><text class="sm" x="300" y="91">processing·窗口2</text>
+  <rect class="cell-b" x="430" y="74" width="132" height="26"/><text class="sm" x="440" y="91">new</text>
+  <text class="mono" x="580" y="91">dequeue(1) ×2</text>
+  <text class="sm" x="20" y="131">Emily 办完</text>
+  <rect class="cell-g" x="150" y="114" width="132" height="26"/><text class="sm" x="160" y="131">completed</text>
+  <rect class="cell-a" x="290" y="114" width="132" height="26"/><text class="sm" x="300" y="131">processing</text>
+  <rect class="cell-b" x="430" y="114" width="132" height="26"/><text class="sm" x="440" y="131">new</text>
+  <text class="mono" x="580" y="131">mark_completed(ARRAY[1])</text>
+  <text class="sm" x="20" y="171">窗口 1 叫下一位</text>
+  <rect class="cell-g" x="150" y="154" width="132" height="26"/><text class="sm" x="160" y="171">completed</text>
+  <rect class="cell-a" x="290" y="154" width="132" height="26"/><text class="sm" x="300" y="171">processing</text>
+  <rect class="cell-a" x="430" y="154" width="132" height="26"/><text class="sm" x="440" y="171">processing·窗口1</text>
+  <text class="mono" x="580" y="171">dequeue(1)</text>
+  <text class="sm" x="20" y="211">Liam 办完，直接删除</text>
+  <rect class="cell-g" x="150" y="194" width="132" height="26"/><text class="sm" x="160" y="211">completed</text>
+  <rect class="cell-r" x="290" y="194" width="132" height="26"/><text class="sm on-r" x="300" y="211">（已删除）</text>
+  <rect class="cell-a" x="430" y="194" width="132" height="26"/><text class="sm" x="440" y="211">processing</text>
+  <text class="mono" x="580" y="211">…(ARRAY[2], TRUE)</text>
+  <text class="sm" x="380" y="250" text-anchor="middle">completed 的记录可以晚些归档后删除，也可以像 Liam 这样处理完立刻删除</text>
+  <text class="sm" x="380" y="270" text-anchor="middle">只要状态不是 new，dequeue 就看不见它；先来先服务的顺序由 ORDER BY created_at 保证</text>
+</svg>
+<figcaption>图 11-5　一上午的叫号过程，队列表里的状态变化</figcaption>
+</figure>
+
+<p>Emily 的新车注册办完了，系统把她标记为完成（ARRAY[1] 里的 1 是她的记录 ID）。第一位办事员接着叫下一位 —— 最后登记的 Ava：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT mq.mark_completed(ARRAY[1]);
+
+SELECT * FROM mq.dequeue(1);
+</pre></div>
+<div class="code out"><pre>
+ msg_id |              message               |      enqueued_at
+--------+------------------------------------+------------------------
+      3 | {                                 +| 2025-06-19 08:07:43+00
+        |   "service": "car_plate_renewal", +|
+        |   "visitor": "Ava Thompson"       +|
+        | }                                  |
+(1 row)
+</pre></div>
+
+<p>Liam 办完后，这次直接删除他的记录（第二个参数 to_delete 设为 TRUE）：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT mq.mark_completed(ARRAY[2], TRUE);
+</pre></div>
+<div class="code out"><pre>
+ id |               message               |     created_at      |   status
+----+-------------------------------------+---------------------+------------
+  1 | {                                  +| 2025-06-19 08:03:16 | completed
+    |    "service": "car_registration",  +|                     |
+    |    "visitor": "Emily Carter"       +|                     |
+    | }                                   |                     |
+  3 | {                                  +| 2025-06-19 08:07:43 | processing
+    |    "service": "car_plate_renewal", +|                     |
+    |    "visitor": "Ava Thompson"       +|                     |
+    | }                                   |                     |
+(2 rows)
+</pre></div>
+
+<p>（书中为了排版去掉了 created_at 末尾的时区 +00，你看到的输出里会有。）</p>
+
+<h2 id="notify">使用 LISTEN 和 NOTIFY</h2>
+
+<p>
+  早高峰过后，车管所没那么忙了，等候区没人，办事员大多在忙别的事。但一有新访客签到，系统就会自动通知办事员。这可以用 Postgres 的 <strong>LISTEN</strong> 和 <strong>NOTIFY</strong> 实现：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+LISTEN channel_name              -- 把当前会话注册为该频道的监听者
+NOTIFY channel_name, [payload]   -- 通知该频道的所有监听者；payload 可选，是一段文本
+</pre></div>
+
+<p>假设办事员登录电脑时，系统打开一个 Postgres 连接并监听 queue_new_message 频道。在你的 psql 里执行：</p>
+
+<div class="code" data-lang="sql"><pre>
+LISTEN queue_new_message;
+</pre></div>
+
+<p>然后修改 enqueue，每次有新访客入队就发一条通知：</p>
+
+<div class="code" data-lang="sql" data-file="清单 11.5 · 让 mq.enqueue 发送通知">
+<pre>
+CREATE OR REPLACE FUNCTION mq.enqueue(new_message JSON)
+RETURNS VOID AS $$
+BEGIN
+  INSERT INTO mq.queue (message)
+  VALUES (new_message);
+
+  -- 通知监听者：有新消息了
+  PERFORM pg_notify('queue_new_message', 'new_message');
+END;
+$$ LANGUAGE plpgsql;
+</pre>
+</div>
+
+<p><code>pg_notify</code> 函数和 NOTIFY 语句作用相同，但在函数和存储过程里更好用。<code>PERFORM</code> 是 PL/pgSQL 里“执行但丢弃结果”的写法。在同一个正在监听的 psql 连接里加一位访客试试：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT mq.enqueue('{
+  "service": "car_plate_renewal",
+  "visitor": "Marta Jones"
+}'::json);
+</pre></div>
+<div class="code out"><pre>
+Asynchronous notification "queue_new_message" with payload "new_message"
+received from server process with PID 1699.
+</pre></div>
+
+<p>但现实中访客是从登记终端加入的，终端用的是另一个连接。用两个 psql 会话模拟：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 306" role="img" aria-label="LISTEN/NOTIFY：终端会话发送通知，办事员会话收到通知">
+  <rect class="bx-p" x="20" y="20" width="230" height="110" rx="12"/>
+  <text class="ttl on-p" x="135" y="44" text-anchor="middle">会话 2：登记终端</text>
+  <text class="mono" x="36" y="70">SELECT mq.enqueue('{</text>
+  <text class="mono" x="36" y="88">  …"Roland Deschain"…</text>
+  <text class="mono" x="36" y="106">}'::json);</text>
+  <text class="sm" x="135" y="124" text-anchor="middle">→ 内部执行 pg_notify(…)</text>
+
+  <path class="ln-p" d="M252 75 H316" marker-end="url(#ar-p)"/>
+  <rect class="bx-a" x="320" y="30" width="170" height="90" rx="12"/>
+  <text class="ttl on-a" x="405" y="56" text-anchor="middle">Postgres</text>
+  <text class="sm" x="405" y="78" text-anchor="middle">频道</text>
+  <text class="mono" x="405" y="98" text-anchor="middle">queue_new_message</text>
+  <path class="ln-a" d="M492 60 L566 40" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M492 90 L566 110" marker-end="url(#ar-a)"/>
+
+  <rect class="bx-g" x="570" y="16" width="170" height="54" rx="10"/>
+  <text class="sm b on-g" x="655" y="38" text-anchor="middle">会话 1：办事员 A</text>
+  <text class="mono" x="655" y="58" text-anchor="middle">LISTEN …</text>
+  <rect class="bx-g" x="570" y="84" width="170" height="54" rx="10"/>
+  <text class="sm b on-g" x="655" y="106" text-anchor="middle">办事员 B</text>
+  <text class="mono" x="655" y="126" text-anchor="middle">LISTEN …</text>
+
+  <rect class="bx" x="20" y="160" width="720" height="136" rx="10"/>
+  <text class="ttl" x="36" y="184">为什么办事员的 psql 没有立刻显示通知？</text>
+  <text class="sm" x="36" y="208">psql 没有持续监听的事件循环，只在执行下一条 SQL（比如 SELECT 1;）时才检查并打印收到的通知：</text>
+  <text class="mono" x="36" y="230">Asynchronous notification "queue_new_message" with payload "new_message"</text>
+  <text class="mono" x="36" y="248">received from server process with PID 1746.</text>
+  <text class="sm" x="36" y="272">真实应用不必轮询：大多数语言的 Postgres 驱动都会在内部处理，把通知异步地推给应用层。</text>
+  <text class="sm" x="36" y="288">（Marta 那次能立刻看到，是因为连接自己通知了自己。）</text>
+</svg>
+<figcaption>图 11-6　LISTEN / NOTIFY：发布-订阅式的轻量通知（对应原书表 11.1）</figcaption>
+</figure>
+
+<ol class="steps">
+  <li>保持第一个 psql（办事员的电脑）继续监听 queue_new_message。</li>
+  <li>在另一个终端窗口打开第二个 psql（登记终端）：<code>docker exec -it postgres psql -U postgres</code>，执行 enqueue 加入访客 Roland Deschain，函数会在频道上发通知。</li>
+  <li>回到第一个 psql —— 什么也没显示。执行任意一条 SQL，比如 <code>SELECT 1;</code>，通知随即打印出来。</li>
+</ol>
+
+<h2 id="considerations">实现上的考量</h2>
+
+<p>对车管所来说，这个自定义队列已经够用：写入速度取决于访客和终端数量，读取速度受办事员人数和空闲程度限制，都不高，只是早上高峰、傍晚清闲。但你的场景可能有更高的要求，下面几点值得注意。</p>
+
+<h3>LISTEN / NOTIFY 的两个局限</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="LISTEN/NOTIFY 的两个局限：没有积压、只能在主节点上订阅">
+  <rect class="bx-r" x="20" y="20" width="350" height="196" rx="12"/>
+  <text class="ttl on-r" x="195" y="44" text-anchor="middle">① 不保存历史通知</text>
+  <path class="ln" d="M40 100 H350" marker-end="url(#ar)"/>
+  <circle class="dot-p" cx="110" cy="100" r="7"/><text class="sm" x="110" y="84" text-anchor="middle">NOTIFY</text>
+  <rect class="bx-g" x="170" y="88" width="170" height="24" rx="6"/><text class="sm" x="255" y="105" text-anchor="middle">办事员 10 秒后才开始 LISTEN</text>
+  <text class="sm" x="36" y="144">只有<tspan class="b">当前已连接并正在监听</tspan>的客户端能收到。</text>
+  <text class="sm" x="36" y="164">之后才连上、或重启过的客户端会错过之前的通知。</text>
+  <text class="sm" x="36" y="190">车管所没问题：错过通知的办事员，</text>
+  <text class="sm" x="36" y="208">连上后照样会去叫下一位。消息本身还在表里。</text>
+
+  <rect class="bx-r" x="390" y="20" width="350" height="196" rx="12"/>
+  <text class="ttl on-r" x="565" y="44" text-anchor="middle">② 只能在主节点上订阅</text>
+  <rect class="bx-a" x="420" y="62" width="110" height="44" rx="8"/><text class="sm b on-a" x="475" y="89" text-anchor="middle">主节点</text>
+  <rect class="bx" x="600" y="56" width="110" height="28" rx="6"/><text class="sm" x="655" y="75" text-anchor="middle">只读副本 1</text>
+  <rect class="bx" x="600" y="90" width="110" height="28" rx="6"/><text class="sm" x="655" y="109" text-anchor="middle">只读副本 2</text>
+  <path class="ln" d="M532 80 L596 70"/><path class="ln" d="M532 88 L596 104"/>
+  <text class="sm on-r" x="655" y="134" text-anchor="middle">✗ 不支持 LISTEN</text>
+  <text class="sm" x="406" y="164">解决：为 LISTEN/NOTIFY 单独保持一个</text>
+  <text class="sm" x="406" y="182">直连主节点的连接；其他查询仍走连接池</text>
+  <text class="sm" x="406" y="200">或负载均衡，分摊到主节点和副本上。</text>
+</svg>
+<figcaption>图 11-7　LISTEN/NOTIFY 适合做“提醒”，不适合做“可靠投递”</figcaption>
+</figure>
+
+<p>车管所正好可以这样做：终端和办事员的工作站都直连主节点，终端用这个连接签到并发通知，办事员用自己的连接接收通知；工作站上的其他查询通过连接池，把读请求路由到副本，减轻主节点负担。</p>
+
+<h3>索引</h3>
+
+<p>目前 mq.queue 只有主键索引：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'mq' AND tablename = 'queue';
+-- queue_pkey | CREATE UNIQUE INDEX queue_pkey ON mq.queue USING btree (id)
+</pre></div>
+
+<p>
+  它能加速 mark_completed（按 ID 找行再更新或删除）。但 dequeue 每次都要<strong>全表扫描</strong>：created_at 上没有索引，取最早的消息得把表排序；status 上也没有索引，没法跳过非 new 的消息。
+  车管所每天下班队列就清空了，已完成的消息归档或删除，用不着更多索引。但写入和读取频率高得多时，可以考虑：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 方案一：created_at 上的单列索引，取最早的消息不用排序
+CREATE INDEX mq_created_at_index_btree
+ON mq.queue (created_at);
+
+-- 方案二：只包含 new 消息的部分索引，更小，还能跳过 processing/completed
+CREATE INDEX mq_partial_index_btree
+ON mq.queue (created_at, status)
+WHERE status = 'new';
+</pre></div>
+
+<p>当然，如果你修改了队列的设计，也可以选别的、更贴合自己场景的索引策略。</p>
+
+<h3>分区</h3>
+
+<p>
+  第 9 章用分区优化了时序负载。高吞吐的消息队列同样受益：写入速度很高时表会迅速膨胀，影响取消息和改状态的性能。
+  而且<strong>删掉的消息并不会立刻消失</strong>：被删除的行（<strong>死元组</strong>，dead tuple）仍留在表的物理结构里，直到被 Postgres 的 <strong>autovacuum</strong> 进程回收。为了跟上负载，可能得调整 vacuum 设置，让它更积极地清理。
+</p>
+
+<div class="box deep">
+  <div class="t">&#9670; UPDATE 也会产生死元组</div>
+  <p>
+    把消息从 new 改成 processing 时同样会产生死元组：UPDATE 实际上是删掉旧版本、插入一个新版本（第 2 章的 MVCC）。旧版本留在表里，直到被 autovacuum 回收。
+    想看实际演示，可以看仓库 <code>postgres_internals_videos.md</code> 里的视频 <a href="https://www.youtube.com/watch?v=TBmDBw1IIoY">“PostgreSQL Internals in Action: MVCC”</a>。
+    队列这种“频繁插入、更新、删除”的表，是死元组的重灾区。
+  </p>
+</div>
+
+<p>分区后消息分散在多个分区里，不用大量调优 vacuum 等设置也能支撑高吞吐。一种策略是按 created_at 做范围分区：</p>
+
+<div class="code" data-lang="sql"><pre>
+DROP TABLE mq.queue;
+
+CREATE TABLE mq.queue (
+    id BIGSERIAL,
+    message JSON NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    status mq.status NOT NULL DEFAULT 'new',
+    PRIMARY KEY (id, created_at)      -- 分区表的主键必须包含分区键
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE mq.queue_2025_06_22 PARTITION OF mq.queue
+FOR VALUES FROM ('2025-06-22 00:00:00') TO ('2025-06-23 00:00:00');
+
+CREATE TABLE mq.queue_2025_06_23 PARTITION OF mq.queue
+FOR VALUES FROM ('2025-06-23 00:00:00') TO ('2025-06-24 00:00:00');
+
+CREATE TABLE mq.queue_default PARTITION OF mq.queue DEFAULT;
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="按天分区的队列：旧分区整个删除，新消息进当天分区">
+  <rect class="bx-a" x="270" y="14" width="220" height="40" rx="10"/>
+  <text class="mono on-a" x="380" y="39" text-anchor="middle">mq.queue（父表）</text>
+  <rect class="bx-r" x="20" y="90" width="180" height="60" rx="8" style="stroke-dasharray:5 4"/>
+  <text class="sm b" x="110" y="114" text-anchor="middle">queue_2025_06_22</text>
+  <text class="sm on-r" x="110" y="134" text-anchor="middle">昨天的：整个 DROP 掉</text>
+  <rect class="bx-g" x="220" y="90" width="200" height="60" rx="8"/>
+  <text class="sm b on-g" x="320" y="114" text-anchor="middle">queue_2025_06_23</text>
+  <text class="sm" x="320" y="134" text-anchor="middle">今天：所有读写都在这里</text>
+  <rect class="bx" x="440" y="90" width="150" height="60" rx="8"/>
+  <text class="sm b" x="515" y="114" text-anchor="middle">queue_default</text>
+  <text class="sm" x="515" y="134" text-anchor="middle">其他日期的消息</text>
+  <rect class="bx-d" x="610" y="90" width="130" height="60" rx="8"/>
+  <text class="sm" x="675" y="114" text-anchor="middle">明天的分区</text>
+  <text class="sm" x="675" y="134" text-anchor="middle">由 pg_partman 预建</text>
+  <path class="ln" d="M320 56 L110 86"/><path class="ln-g" d="M370 56 L320 86" marker-end="url(#ar-g)"/><path class="ln" d="M420 56 L515 86"/><path class="ln-d" d="M460 56 L675 86"/>
+  <text class="sm" x="380" y="180" text-anchor="middle">删整个分区几乎是瞬间完成的，不产生死元组；规划器也不再考虑已删除的分区</text>
+</svg>
+<figcaption>图 11-8　按天分区的队列</figcaption>
+</figure>
+
+<p>
+  Postgres 会自动把 6 月 22 日的消息放进 queue_2025_06_22，23 日的放进 queue_2025_06_23，其他日期的进默认分区。三个队列函数照常操作父表 mq.queue，由数据库决定往哪个分区写、从哪个分区读。
+  假设今天是 6 月 23 日，所有新消息都在当天分区里透明地读写；像 queue_2025_06_22 这样存着过期消息的分区可以稍后删掉，减少资源占用。只保留一个或少数几个最新分区，Postgres 就能更高效地处理高吞吐的消息负载，而不用花大量时间调整数据库配置。
+</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 自动化分区管理</div>
+  <p>可以组合使用 pg_partman（用后台进程自动创建和维护分区）和 pg_cron（按计划定时运行 pg_partman 的维护任务），自动创建新日期的分区、删除旧分区。分区策略也不止这一种：可以按 status 分区（new / processing / completed 各一个分区），也可以同时按时间和状态分区。</p>
+</div>
+
+<h3>消息处理的失败恢复</h3>
+
+<p>
+  车管所的场景里，办事员叫号后消息变成 processing；如果访客一分钟内没到窗口，消息就改回 new，把他放回队首；到了的话，消息一直保持 processing 直到办完、改成 completed。消息不会卡在 processing 状态。
+</p>
+
+<p>
+  但在别的场景，消费者取到消息、开始处理，然后可能挂掉。比如一个任务调度系统：生产者把任务入队，工作进程取出执行；工作进程中途崩溃，那些任务就永远停在 processing。
+  解决办法是引入<strong>超时机制</strong>：消息在 processing 状态最多停留一段时间，超时就重置为 new，让别的工作进程接手。可以用 <strong>pg_cron</strong> 在数据库里安排一个定期任务来做这件事：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 示意：需要先安装 pg_cron 扩展，并给队列表加一个记录“开始处理时间”的列
+SELECT cron.schedule('requeue-stuck', '* * * * *', $$
+  UPDATE mq.queue SET status = 'new'
+  WHERE status = 'processing'
+    AND processing_started_at < now() - interval '5 minutes'
+$$);
+</pre></div>
+
+<p>（这段是示意代码，书中只描述了思路。下一节的 pgmq 直接内置了这种机制：<strong>可见性超时</strong>。）</p>
+
+<h2 id="pgmq">启动带 pgmq 的 Postgres</h2>
+
+<p>
+  <strong>pgmq</strong>（Postgres Message Queue）扩展定位为一个<strong>轻量级消息队列</strong>，API 和 <strong>AWS SQS</strong>（Simple Queue Service）保持一致。
+  它把我们自己实现时操心的细节都封装好了，还支持队列分区、消息处理失败恢复等高级能力。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 先停掉之前的容器</div>
+  <p>用 <code>docker ps --filter "name=postgres" --filter "publish=5432"</code> 找到占用 5432 端口的容器，再 <code>docker container stop &lt;container-name&gt;</code>。</p>
+</div>
+
+<div class="code" data-lang="bash" data-file="清单 11.6 · 在 Unix 上启动带 pgmq 的 Postgres">
+<pre>
+docker volume create postgres-pgmq-volume
+
+docker run --name postgres-pgmq \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password \
+    -p 5432:5432 \
+    -v postgres-pgmq-volume:/var/lib/postgresql/data \
+    -d ghcr.io/pgmq/pg17-pgmq:v1.5.1
+</pre>
+</div>
+
+<div class="code" data-lang="powershell" data-file="清单 11.7 · 在 Windows 上启动带 pgmq 的 Postgres">
+<pre>
+docker volume create postgres-pgmq-volume
+
+docker run --name postgres-pgmq `
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password `
+    -p 5432:5432 `
+    -v postgres-pgmq-volume:/var/lib/postgresql/data `
+    -d ghcr.io/pgmq/pg17-pgmq:v1.5.1
+</pre>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 11.8 · 查看可用的 pgmq 版本">
+<pre>
+-- docker exec -it postgres-pgmq psql -U postgres
+SELECT * FROM pg_available_extensions
+WHERE name = 'pgmq';
+</pre>
+</div>
+<div class="code out"><pre>
+ name | default_version | installed_version |           comment
+------+-----------------+-------------------+------------------------------
+ pgmq | 1.5.1           |                   | A lightweight message queue.
+      |                 |                   | Like AWS SQS and RSMQ
+      |                 |                   | but on Postgres.
+</pre></div>
+
+<p>installed_version 为空，需要启用：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION pgmq;
+-- 再执行清单 11.8，installed_version = 1.5.1
+</pre></div>
+
+<h2 id="use-pgmq">使用 pgmq</h2>
+
+<p>pgmq 提供了 40 多个函数，可以创建和管理队列、收发消息、按自定义保留策略归档等，都在 pgmq 模式下：</p>
+
+<div class="code" data-lang="sql" data-file="清单 11.9 · 列出 pgmq 支持的函数">
+<pre>
+SELECT p.proname AS function_name,
+  pg_catalog.pg_get_function_arguments(p.oid) AS arguments
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'pgmq';
+</pre>
+</div>
+<div class="code out"><pre>
+    function_name   |                 arguments
+--------------------+--------------------------------------------
+ acquire_queue_lock | queue_name text
+ format_table_name  | queue_name text, prefix text
+ read               | queue_name text, vt integer, qty integer,
+                    |   conditional jsonb DEFAULT '{}'::jsonb
+ send               | queue_name text, msg jsonb,
+                    |   delay timestamp with time zone
+ send               | queue_name text, msg jsonb, headers jsonb,
+                    |   delay integer
+ ...
+</pre></div>
+
+<h3>创建并使用访客队列</h3>
+
+<div class="code" data-lang="sql"><pre>
+SELECT pgmq.create('visitors_queue');
+</pre></div>
+
+<p>每个队列背后都有一张自己的表，放在 pgmq 模式下，表名是 <code>q_</code> 前缀加队列名：</p>
+
+<div class="code" data-lang="sql"><pre>
+\d pgmq.q_visitors_queue
+</pre></div>
+<div class="code out"><pre>
+                   Table "pgmq.q_visitors_queue"
+   Column    |           Type           | Nullable |           Default
+-------------+--------------------------+----------+------------------------------
+ msg_id      | bigint                   | not null | generated always as identity
+ read_ct     | integer                  | not null | 0
+ enqueued_at | timestamp with time zone | not null | now()
+ vt          | timestamp with time zone | not null |
+ message     | jsonb                    |          |
+ headers     | jsonb                    |          |
+Indexes:
+    "q_visitors_queue_pkey" PRIMARY KEY, btree (msg_id)
+    "q_visitors_queue_vt_idx" btree (vt)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="pgmq 的函数与底层表：send、read、pop、archive、delete">
+  <rect class="bx-p" x="20" y="90" width="140" height="70" rx="10"/>
+  <text class="ttl on-p" x="90" y="118" text-anchor="middle">生产者</text>
+  <text class="mono" x="90" y="140" text-anchor="middle">pgmq.send()</text>
+  <path class="ln-p" d="M162 125 H226" marker-end="url(#ar-p)"/>
+
+  <rect class="bx-a" x="230" y="30" width="250" height="190" rx="12"/>
+  <text class="ttl on-a" x="355" y="54" text-anchor="middle">pgmq.q_visitors_queue</text>
+  <text class="sm" x="246" y="80"><tspan class="mono">msg_id</tspan>　消息 ID（identity）</text>
+  <text class="sm" x="246" y="100"><tspan class="mono">read_ct</tspan>　被 read 过几次</text>
+  <text class="sm" x="246" y="120"><tspan class="mono">enqueued_at</tspan>　入队时间</text>
+  <text class="sm" x="246" y="140"><tspan class="mono on-a b">vt</tspan>　何时重新可见（可见性超时）</text>
+  <text class="sm" x="246" y="160"><tspan class="mono">message</tspan>　载荷（jsonb）</text>
+  <text class="sm" x="246" y="180"><tspan class="mono">headers</tspan>　可选消息头</text>
+  <text class="sm" x="246" y="206">自带 msg_id 和 vt 上的索引</text>
+
+  <path class="ln-g" d="M482 70 H560" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="564" y="44" width="176" height="56" rx="10"/>
+  <text class="mono on-g b" x="652" y="66" text-anchor="middle">pgmq.read(q, vt, qty)</text>
+  <text class="sm" x="652" y="86" text-anchor="middle">取出但不删，vt 秒内不可见</text>
+
+  <path class="ln-g" d="M482 130 H560" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="564" y="110" width="176" height="44" rx="10"/>
+  <text class="mono on-g b" x="652" y="130" text-anchor="middle">pgmq.pop(q)</text>
+  <text class="sm" x="652" y="146" text-anchor="middle">取出并立即删除</text>
+
+  <path class="ln-b" d="M482 190 H560" marker-end="url(#ar-b)"/>
+  <rect class="bx-b" x="564" y="168" width="176" height="56" rx="10"/>
+  <text class="mono on-b b" x="652" y="190" text-anchor="middle">pgmq.archive / delete</text>
+  <text class="sm" x="652" y="210" text-anchor="middle">处理完：移到 a_ 表或删除</text>
+  <text class="mono" x="380" y="248" text-anchor="middle">归档表：pgmq.a_visitors_queue</text>
+</svg>
+<figcaption>图 11-9　pgmq：一个队列 = 一张 q_ 表（+ 一张 a_ 归档表）+ 一组函数</figcaption>
+</figure>
+
+<p>
+  每条消息有唯一的 msg_id，载荷存在 jsonb 类型的 message 列。enqueued_at 是入队时间；<strong>vt</strong> 是<strong>可见性超时（visibility timeout）</strong>：如果消费者因故障等原因没在 vt 时间内处理完，之前取走的消息会重新出现在队列里。
+  headers 存可选的消息头，read_ct 记录消息被 pgmq.read 读过几次。扩展还默认建好了几个索引来加速访问。用 <code>pgmq.send</code> 把一位签到的访客加入等候队列：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM pgmq.send(
+   queue_name => 'visitors_queue',
+   msg =>'{"service": "car_registration", "visitor": "Olivia Morgan"}'
+);
+</pre></div>
+
+<p>办事员准备接待下一位时，系统调用 <code>pgmq.pop</code>：取出下一条消息并<strong>立即删除</strong>：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT msg_id, message, enqueued_at
+FROM pgmq.pop('visitors_queue');
+</pre></div>
+<div class="code out"><pre>
+ msg_id |              message              |          enqueued_at
+--------+-----------------------------------+-------------------------------
+      1 | {"service": "car_registration",   | 2025-06-26 01:18:19.149045+00
+        |  "visitor": "Olivia Morgan"}      |
+(1 row)
+</pre></div>
+
+<p>在有新访客入队之前，再调用 pop 都会返回空结果。</p>
+
+<h3>可见性超时</h3>
+
+<p>除了 pop，pgmq 还提供 <code>pgmq.read</code>：取出消息但<strong>不立即删除</strong>：</p>
+
+<div class="code" data-lang="text"><pre>
+pgmq.read(
+  queue_name text, vt integer, qty integer,
+  conditional jsonb DEFAULT '{}'::jsonb)
+</pre></div>
+
+<ul>
+  <li><code>queue_name</code>：队列名；<code>qty</code>：一次取几条；<code>conditional</code>（可选）：按 JSON 结构过滤消息。</li>
+  <li><code>vt</code>：可见性超时（秒）。消息被一个消费者读取后，在这段时间内对其他消费者不可见。如果这个消费者没在超时之前删除或归档它，消息就重新可见，可以被别人处理。</li>
+</ul>
+
+<p>
+  可见性超时既能实现消费者故障时的失败恢复，也能实现特定的业务逻辑。比如：办事员叫号后，系统给访客两分钟时间走到窗口；两分钟没到，就自动把他放回等候列表，让办事员叫下一位。
+  Noah Bennett 来考驾照，终端把他加入队列：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM pgmq.send(
+   queue_name => 'visitors_queue',
+   msg => '{"service": "driving_license_exam", "visitor": "Noah Bennett"}'
+);
+</pre></div>
+
+<p>过了一会儿，一位办事员空了，系统用两分钟（120 秒）的可见性超时取一位访客：</p>
+
+<div class="code" data-lang="sql" data-file="清单 11.10 · 以两分钟可见性超时取下一位访客">
+<pre>
+SELECT msg_id, message, enqueued_at
+FROM pgmq.read(
+   queue_name => 'visitors_queue',
+   vt         => 120,
+   qty        => 1
+);
+</pre>
+</div>
+<div class="code out"><pre>
+ msg_id |               message               |          enqueued_at
+--------+-------------------------------------+-------------------------------
+      2 | {"service": "driving_license_exam", | 2025-06-27 00:30:10.798186+00
+        |  "visitor": "Noah Bennett"}         |
+(1 row)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="可见性超时的时间线：read 后两分钟不可见，超时后重新可见，再次 read 后 archive">
+  <path class="ln" d="M30 120 H740" marker-end="url(#ar)"/>
+  <text class="sm" x="740" y="140" text-anchor="end">时间</text>
+
+  <circle class="dot-p" cx="60" cy="120" r="7"/>
+  <text class="mono" x="60" y="100" text-anchor="middle">send</text>
+  <text class="sm" x="60" y="146" text-anchor="middle">可见</text>
+
+  <circle class="dot-g" cx="150" cy="120" r="7"/>
+  <text class="mono on-g" x="150" y="100" text-anchor="middle">read(vt=120)</text>
+  <rect class="area-r" x="150" y="108" width="200" height="24" style="fill:var(--red-bg);stroke:var(--red)"/>
+  <text class="sm on-r" x="250" y="125" text-anchor="middle">不可见 2 分钟</text>
+  <text class="sm" x="250" y="160" text-anchor="middle">其他办事员 read → 0 rows</text>
+  <text class="sm" x="250" y="176" text-anchor="middle">Noah 去接电话了，没到窗口</text>
+
+  <circle class="dot-b" cx="350" cy="120" r="6"/>
+  <text class="sm on-b" x="350" y="100" text-anchor="middle">超时，重新可见</text>
+  <text class="sm" x="410" y="146" text-anchor="middle">回到等候列表</text>
+
+  <circle class="dot-g" cx="480" cy="120" r="7"/>
+  <text class="mono on-g" x="480" y="100" text-anchor="middle">read(vt=120)</text>
+  <rect class="area-g" x="480" y="108" width="100" height="24"/>
+  <text class="sm" x="510" y="160" text-anchor="middle">另一位办事员再次叫到他，</text>
+  <text class="sm" x="510" y="176" text-anchor="middle">这次按时到了窗口</text>
+
+  <circle class="dot-a" cx="580" cy="120" r="7"/>
+  <text class="mono on-a" x="660" y="82" text-anchor="middle">archive(msg_id=2)</text>
+  <path class="ln-a" d="M640 86 L586 112"/>
+  <text class="sm" x="672" y="160" text-anchor="middle">移到 a_visitors_queue，</text>
+  <text class="sm" x="672" y="176" text-anchor="middle">之后 read 再也找不到他</text>
+
+  <rect class="bx-d" x="30" y="206" width="710" height="54" rx="8"/>
+  <text class="sm" x="385" y="228" text-anchor="middle">可见性超时 = 自动的失败恢复：消费者拿了消息却没在 vt 内处理完（崩溃、超时、人没来），消息自动“回到”队列</text>
+  <text class="sm" x="385" y="246" text-anchor="middle">这正是前面自定义队列需要用 pg_cron 手动实现的功能</text>
+</svg>
+<figcaption>图 11-10　可见性超时：取走 ≠ 处理完</figcaption>
+</figure>
+
+<p>在接下来的两分钟里，Noah 的记录对其他办事员不可见 —— 期间再执行清单 11.10 会返回 0 行。</p>
+
+<p>但 Noah 走到一边接电话，没在两分钟内到窗口。pgmq 让他的消息重新可见，相当于把他放回了等候列表。几分钟后他回来了，另一位办事员空了，系统再次执行清单 11.10，又叫到了 Noah。这次他准时到了窗口，办事员确认后，系统调用 <code>pgmq.archive</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT pgmq.archive(
+   queue_name => 'visitors_queue',
+   msg_id     => 2
+);
+
+SELECT msg_id, message FROM pgmq.a_visitors_queue;
+</pre></div>
+<div class="code out"><pre>
+ msg_id |                            message
+--------+----------------------------------------------------------------
+      2 | {"service": "driving_license_exam", "visitor": "Noah Bennett"}
+(1 row)
+</pre></div>
+
+<p>archive 根据 msg_id 把消息从 q_visitors_queue 表移到 <code>pgmq.a_visitors_queue</code> —— pgmq 用来存放所有归档消息的表。之后再执行清单 11.10，就找不到 Noah 了。</p>
+
+<div class="box note">
+  <div class="t">&#9432; pgmq 与 LISTEN/NOTIFY</div>
+  <p>写书时 pgmq 还不支持 LISTEN/NOTIFY，计划在未来版本加入。详见 <a href="https://github.com/pgmq/pgmq">pgmq 仓库</a>。</p>
+</div>
+
+<div class="tw"><table>
+<tr><th></th><th>自定义队列（mq.*）</th><th>pgmq</th></tr>
+<tr><td>入队</td><td><code>mq.enqueue(json)</code></td><td><code>pgmq.send(queue, msg)</code>（还支持延迟投递）</td></tr>
+<tr><td>出队</td><td><code>mq.dequeue(n)</code>：改为 processing</td><td><code>pgmq.read(queue, vt, qty)</code> / <code>pgmq.pop(queue)</code></td></tr>
+<tr><td>完成</td><td><code>mq.mark_completed(ids, to_delete)</code></td><td><code>pgmq.archive</code> / <code>pgmq.delete</code></td></tr>
+<tr><td>并发消费</td><td>自己写 <code>FOR UPDATE SKIP LOCKED</code></td><td>内置</td></tr>
+<tr><td>失败恢复</td><td>自己写定时任务把 processing 重置为 new</td><td>可见性超时 vt，内置</td></tr>
+<tr><td>多个队列</td><td>自己设计</td><td><code>pgmq.create</code> 一行一个</td></tr>
+<tr><td>通知</td><td>LISTEN/NOTIFY</td><td>写书时尚不支持</td></tr>
+<tr><td>适合</td><td>需要高度定制、想完全掌控实现</td><td>想要开箱即用、熟悉 SQS 语义</td></tr>
+</table></div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 可以作为消息队列，在生产者和消费者之间交换消息、事件和任务。判断标准：需要事务原子性、消息量撑得住、已经在用 Postgres。</li>
+  <li>自定义队列可以建在普通表上，按自己的场景定制实现。</li>
+  <li><code>FOR UPDATE SKIP LOCKED</code> 支持多个消费者并发取消息、互不阻塞。</li>
+  <li><code>LISTEN</code> / <code>NOTIFY</code>（<code>pg_notify</code>）能在新消息入队时通知消费者，但不保存历史、只能在主节点订阅。</li>
+  <li>实现时要考虑索引、分区（应对死元组和表膨胀）和消息处理的失败恢复。</li>
+  <li><strong>pgmq</strong> 扩展提供开箱即用、API 与 AWS SQS 一致的消息队列，内置可见性超时和归档。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>开两个 psql 会话，都执行 <code>BEGIN; SELECT * FROM mq.dequeue(1);</code>（先不提交），确认两人拿到的是不同的消息。再把函数里的 <code>SKIP LOCKED</code> 去掉重做一次，观察第二个会话的表现。</li>
+    <li>给 mq.queue 加一列 <code>processing_started_at</code>，修改 dequeue 在出队时写入当前时间，再写一条 SQL 把超过 1 分钟仍在 processing 的消息重置为 new。</li>
+    <li>修改清单 11.5，让 <code>pg_notify</code> 的 payload 带上新消息的 id（提示：<code>INSERT … RETURNING id INTO 变量</code>）。</li>
+    <li>用 <code>pgmq.send</code> 的 delay 参数发一条 30 秒后才可见的消息，验证在此之前 read 不到它。</li>
+    <li>反复 read 同一条消息（每次等 vt 过期），观察 <code>read_ct</code> 列的变化。想一想：怎样利用它实现“失败超过 3 次就移入死信队列”？</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

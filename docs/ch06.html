@@ -1,0 +1,1219 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 6 章 · 全文搜索 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="6">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 6 章</span>
+<h1>全文搜索</h1>
+<p class="lede">
+  Postgres 一直支持各种文本类型和搜索运算符：<code>=</code>、<code>LIKE</code>/<code>ILIKE</code> 模式匹配、<code>~</code>/<code>~*</code> 正则匹配……
+  它们对付简单文本够用，但面对大段文档、需要理解“词的变形”和“相关度排序”时就力不从心了。
+  <strong>全文搜索</strong>是 Postgres 的另一项核心能力：用语言学技术对文本做分词、规范化、排序和索引，让搜索更快、更准。
+  这一章我们为一个电影推荐服务开发搜索模块。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解全文搜索的四步流程：分词 → 规范化 → 存储与索引 → 搜索</li>
+    <li>认识 <strong>词素（lexeme）</strong>、<code>tsvector</code>、<code>tsquery</code>、全文搜索配置</li>
+    <li>用生成列自动维护 tsvector</li>
+    <li>用 <code>@@</code>、<code>plainto_tsquery</code>、<code>to_tsquery</code> 搜索，用 <code>ts_rank</code> + 权重排序，用 <code>ts_headline</code> 高亮</li>
+    <li>用 GIN 和 GiST 索引加速，并知道两者的取舍</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="basics">Postgres 全文搜索基础</h2>
+
+<p>先看看为什么 <code>LIKE</code> 不够用。假设用户想找“explorers traveling to a galaxy”的电影：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="LIKE 模式匹配与全文搜索的差别">
+  <rect class="bx-r" x="20" y="20" width="350" height="174" rx="12"/>
+  <text class="ttl on-r" x="36" y="44">LIKE '%traveling%'</text>
+  <text class="sm" x="36" y="70">只认字面上一模一样的字符：</text>
+  <text class="sm on-g" x="36" y="94">✓ "…are traveling to…"</text>
+  <text class="sm on-r" x="36" y="116">✗ "…he travels to…"（变形）</text>
+  <text class="sm on-r" x="36" y="138">✗ 不知道哪部电影“更相关”</text>
+  <text class="sm on-r" x="36" y="160">✗ 前置 % 用不了普通索引，</text>
+  <text class="sm on-r" x="36" y="178">　只能全表扫描</text>
+
+  <rect class="bx-g" x="390" y="20" width="350" height="174" rx="12"/>
+  <text class="ttl on-g" x="406" y="44">全文搜索</text>
+  <text class="sm" x="406" y="70">把文本变成“词根”，再按词根匹配：</text>
+  <text class="sm on-g" x="406" y="94">✓ traveling / travels / traveled → travel</text>
+  <text class="sm on-g" x="406" y="116">✓ 自动忽略 a、the、to 这类停用词</text>
+  <text class="sm on-g" x="406" y="138">✓ AND / OR / NOT / 短语 / 词距</text>
+  <text class="sm on-g" x="406" y="160">✓ 相关度排序、关键词高亮</text>
+  <text class="sm on-g" x="406" y="182">✓ GIN / GiST 索引</text>
+</svg>
+<figcaption>图 6-1　LIKE 做的是字符匹配，全文搜索做的是“词义”匹配</figcaption>
+</figure>
+
+<p>Postgres 的全文搜索大致分四步：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="全文搜索流程：分词、规范化、存储与索引、搜索">
+  <rect class="bx" x="20" y="30" width="160" height="70" rx="10"/>
+  <text class="ttl" x="100" y="54" text-anchor="middle">文档 document</text>
+  <text class="sm" x="100" y="74" text-anchor="middle">"5 explorers are</text>
+  <text class="sm" x="100" y="90" text-anchor="middle">traveling"</text>
+
+  <path class="ln" d="M182 65 H214" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="218" y="30" width="160" height="70" rx="10"/>
+  <text class="ttl on-b" x="298" y="54" text-anchor="middle">① 分词</text>
+  <text class="sm" x="298" y="74" text-anchor="middle">token：5 · explorers</text>
+  <text class="sm" x="298" y="90" text-anchor="middle">· are · traveling</text>
+
+  <path class="ln" d="M380 65 H412" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="416" y="30" width="160" height="70" rx="10"/>
+  <text class="ttl on-p" x="496" y="54" text-anchor="middle">② 规范化</text>
+  <text class="sm" x="496" y="74" text-anchor="middle">小写 · 词干 · 去停用词</text>
+  <text class="sm" x="496" y="90" text-anchor="middle">→ 5 · explor · travel</text>
+
+  <path class="ln" d="M578 65 H610" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="614" y="30" width="126" height="70" rx="10"/>
+  <text class="ttl on-a" x="677" y="54" text-anchor="middle">③ 存储/索引</text>
+  <text class="mono" x="677" y="74" text-anchor="middle">tsvector</text>
+  <text class="sm" x="677" y="90" text-anchor="middle">+ GIN / GiST</text>
+
+  <path class="ln-a" d="M677 102 V150" marker-end="url(#ar-a)"/>
+  <rect class="bx-g" x="440" y="154" width="300" height="70" rx="10"/>
+  <text class="ttl on-g" x="590" y="178" text-anchor="middle">④ 搜索：tsvector @@ tsquery</text>
+  <text class="sm" x="590" y="198" text-anchor="middle">用户的查询也要先分词、规范化</text>
+  <text class="sm" x="590" y="214" text-anchor="middle">变成 tsquery，再和 tsvector 匹配</text>
+
+  <rect class="bx" x="20" y="154" width="200" height="70" rx="10"/>
+  <text class="ttl" x="120" y="178" text-anchor="middle">用户输入</text>
+  <text class="sm" x="120" y="198" text-anchor="middle">"explorer travels"</text>
+  <path class="ln" d="M222 189 H262" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="266" y="164" width="140" height="50" rx="10"/>
+  <text class="mono on-p" x="336" y="186" text-anchor="middle">tsquery</text>
+  <text class="sm" x="336" y="204" text-anchor="middle">'explor' &amp; 'travel'</text>
+  <path class="ln" d="M408 189 H436" marker-end="url(#ar)"/>
+
+  <text class="sm" x="380" y="256" text-anchor="middle">词素（lexeme）= 语言中有意义的基本单位。两边都变成词素，“travels”和“traveling”就能对上了</text>
+</svg>
+<figcaption>图 6-2　Postgres 全文搜索的工作流程</figcaption>
+</figure>
+
+<ol>
+  <li><strong>分词（tokenization）</strong>：原始文本（通常叫<strong>文档</strong>）被解析成一个个<strong>词元（token）</strong>，比如单词或短语。“5 explorers are traveling”被切成 “5”、“explorers”、“are”、“traveling”。</li>
+  <li><strong>规范化（normalization）</strong>：把词元转换成<strong>词素（lexeme）</strong>——语言中有意义的基本单位。这一步会去掉大小写差异、把词还原成<strong>词干</strong>（stemming）、去掉冠词介词这类<strong>停用词</strong>（stop word）。上面四个词元变成三个词素：“5”、“explor”、“travel”。“are”是停用词被去掉了。</li>
+  <li><strong>存储和索引</strong>：把词素存进数据库，避免每次重复分词和规范化。Postgres 有专门的 <code>tsvector</code> 类型来存词素，还能对它建索引。</li>
+  <li><strong>搜索</strong>：应用对存储的词素执行全文搜索查询。</li>
+</ol>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么 explorers 变成 explor 而不是 explore</div>
+  <p>Postgres 默认的英文词干提取器会去掉 “-er”、“-s” 这类常见后缀，所以 explorers → explor。词干不一定是一个真实的单词，只要同一个词的各种变形都能还原成同一个词干就行。</p>
+</div>
+
+<h3>分词与规范化</h3>
+
+<p>用 <code>ts_debug</code>（测试和调试全文搜索配置的函数）看看一句话是怎么被处理的：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.1 · 用 ts_debug 分析分词和规范化">
+<pre>
+SELECT token, description, lexemes, dictionary
+FROM ts_debug('5 explorers are traveling to a distant galaxy');
+</pre>
+</div>
+<div class="code out"><pre>
+   token   |   description    |  lexemes  |  dictionary
+-----------+------------------+-----------+--------------
+ 5         | Unsigned integer | {5}       | simple
+           | Space symbols    |           |
+ explorers | Word, all ASCII  | {explor}  | english_stem
+           | Space symbols    |           |
+ are       | Word, all ASCII  | {}        | english_stem
+           | Space symbols    |           |
+ traveling | Word, all ASCII  | {travel}  | english_stem
+           | Space symbols    |           |
+ to        | Word, all ASCII  | {}        | english_stem
+           | Space symbols    |           |
+ a         | Word, all ASCII  | {}        | english_stem
+           | Space symbols    |           |
+ distant   | Word, all ASCII  | {distant} | english_stem
+           | Space symbols    |           |
+ galaxy    | Word, all ASCII  | {galaxi}  | english_stem
+(15 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="每个词元按类型交给不同的字典，生成词素">
+  <text class="sm b" x="20" y="22">token（词元）</text>
+  <text class="sm b" x="230" y="22">类型 → 字典</text>
+  <text class="sm b" x="560" y="22">lexeme（词素）</text>
+  <g>
+    <rect class="bx" x="20" y="32" width="120" height="26" rx="5"/><text class="mono" x="80" y="50" text-anchor="middle">5</text>
+    <rect class="bx" x="20" y="64" width="120" height="26" rx="5"/><text class="mono" x="80" y="82" text-anchor="middle">explorers</text>
+    <rect class="bx" x="20" y="96" width="120" height="26" rx="5"/><text class="mono" x="80" y="114" text-anchor="middle">are</text>
+    <rect class="bx" x="20" y="128" width="120" height="26" rx="5"/><text class="mono" x="80" y="146" text-anchor="middle">traveling</text>
+    <rect class="bx" x="20" y="160" width="120" height="26" rx="5"/><text class="mono" x="80" y="178" text-anchor="middle">to · a</text>
+    <rect class="bx" x="20" y="192" width="120" height="26" rx="5"/><text class="mono" x="80" y="210" text-anchor="middle">galaxy</text>
+  </g>
+  <rect class="bx-b" x="200" y="32" width="300" height="26" rx="5"/><text class="sm on-b" x="350" y="50" text-anchor="middle">Unsigned integer → simple（原样保留）</text>
+  <rect class="bx-p" x="200" y="64" width="300" height="154" rx="8"/>
+  <text class="sm on-p b" x="350" y="84" text-anchor="middle">Word, all ASCII → english_stem</text>
+  <text class="sm" x="350" y="114" text-anchor="middle">提取词干：去掉 -ers、-ing、-y→i …</text>
+  <text class="sm" x="350" y="146" text-anchor="middle">停用词 → 空词素 { }</text>
+  <text class="sm" x="350" y="164" text-anchor="middle">（保留它的位置编号，</text>
+  <text class="sm" x="350" y="180" text-anchor="middle">供 &lt;-&gt; 计算词距时使用）</text>
+
+  <path class="ln" d="M142 45 H196"/><path class="ln" d="M142 77 H196"/><path class="ln" d="M142 109 H196"/><path class="ln" d="M142 141 H196"/><path class="ln" d="M142 173 H196"/><path class="ln" d="M142 205 H196"/>
+  <path class="ln-a" d="M502 45 H556" marker-end="url(#ar-a)"/><path class="ln-a" d="M502 77 H556" marker-end="url(#ar-a)"/><path class="ln-r" d="M502 109 H556" marker-end="url(#ar-r)"/><path class="ln-a" d="M502 141 H556" marker-end="url(#ar-a)"/><path class="ln-r" d="M502 173 H556" marker-end="url(#ar-r)"/><path class="ln-a" d="M502 205 H556" marker-end="url(#ar-a)"/>
+  <text class="mono on-a b" x="562" y="50">{5}</text>
+  <text class="mono on-a b" x="562" y="82">{explor}</text>
+  <text class="mono on-r" x="562" y="114">{ }  停用词</text>
+  <text class="mono on-a b" x="562" y="146">{travel}</text>
+  <text class="mono on-r" x="562" y="178">{ }  停用词</text>
+  <text class="mono on-a b" x="562" y="210">{galaxi}</text>
+</svg>
+<figcaption>图 6-3　解析器把文本切成词元并识别类型，字典再把词元变成词素</figcaption>
+</figure>
+
+<ul>
+  <li><code>token</code> 列是切出来的词元，<code>description</code> 是词元类型：“5”是 Unsigned integer（无符号整数），七个单词是 Word, all ASCII，还有七个空格（Space symbols）。</li>
+  <li>切分由 Postgres 内置的<strong>解析器</strong> <code>pg_catalog.default</code> 完成（<code>SELECT prsname FROM pg_ts_parser;</code> 可以看到它）。</li>
+  <li><code>lexemes</code> 是规范化后的词素，<code>dictionary</code> 是用了哪个<strong>字典</strong>：
+    <ul>
+      <li><strong>simple</strong> 字典原样处理词元，不做词干提取或去停用词，所以“5”还是 {5}。</li>
+      <li><strong>english_stem</strong> 字典按英语规则提取词干、去停用词。停用词被映射为空词素 {} 而不是彻底删除，是为了<strong>保留它们的位置信息</strong>，供 <code>&lt;-&gt;</code>（紧跟）运算符使用。</li>
+      <li>空格不对应任何词素，dictionary 列为空。</li>
+    </ul>
+  </li>
+</ul>
+
+<h3>全文搜索配置</h3>
+
+<p>
+  Postgres 只有一个预定义的解析器，但内置了很多字典。用哪个字典处理哪类词元，由<strong>全文搜索配置</strong>决定。
+  Postgres 为很多种人类语言预定义了配置，默认配置在安装时设定，存在 <code>default_text_search_config</code> 参数里。按第 1 章的方式启动的容器，默认是 english：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+show default_text_search_config;
+</pre></div>
+<div class="code out"><pre>
+ default_text_search_config
+----------------------------
+ pg_catalog.english
+(1 row)
+</pre></div>
+
+<p>很多全文搜索函数都接受一个可选的配置参数（类型是 <code>regconfig</code>），不传就用默认配置。比如 <code>ts_debug</code> 的签名：</p>
+
+<div class="code" data-lang="text"><pre>
+ts_debug([ config regconfig, ] document text)
+</pre></div>
+
+<p>方括号表示可选。显式传 <code>'english'</code> 结果和清单 6.1 完全一样：<code>ts_debug('english', '5 explorers are …')</code>。查看某个配置用了哪些字典，用 <code>\dF+</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+\dF+ english
+</pre></div>
+<div class="code out"><pre>
+Text search configuration "pg_catalog.english"
+Parser: "pg_catalog.default"
+      Token      | Dictionaries
+-----------------+--------------
+ asciihword      | english_stem
+ asciiword       | english_stem
+ email           | simple
+ file            | simple
+ float           | simple
+ host            | simple
+ hword           | english_stem
+ int             | simple
+ numword         | simple
+ uint            | simple
+ url             | simple
+ version         | simple
+ word            | english_stem
+ ...
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="全文搜索配置 = 一个解析器 + 每种词元类型对应的字典">
+  <rect class="bx-a" x="20" y="20" width="230" height="160" rx="12"/>
+  <text class="ttl on-a" x="135" y="46" text-anchor="middle">配置 english</text>
+  <text class="sm" x="135" y="70" text-anchor="middle">= 解析器 + 映射表</text>
+  <rect class="bx" x="40" y="86" width="190" height="30" rx="6"/><text class="sm" x="135" y="106" text-anchor="middle">解析器 pg_catalog.default</text>
+  <rect class="bx" x="40" y="126" width="190" height="40" rx="6"/><text class="sm" x="135" y="144" text-anchor="middle">词元类型 → 字典</text><text class="sm" x="135" y="160" text-anchor="middle">（见上面 \dF+ 的输出）</text>
+
+  <path class="ln" d="M252 100 H300" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="304" y="20" width="200" height="72" rx="10"/>
+  <text class="ttl on-b" x="404" y="44" text-anchor="middle">english_stem</text>
+  <text class="sm" x="404" y="64" text-anchor="middle">单词：词干 + 停用词</text>
+  <text class="sm" x="404" y="80" text-anchor="middle">word, asciiword, hword…</text>
+  <rect class="bx-b" x="304" y="108" width="200" height="72" rx="10"/>
+  <text class="ttl on-b" x="404" y="132" text-anchor="middle">simple</text>
+  <text class="sm" x="404" y="152" text-anchor="middle">原样保留（小写化）</text>
+  <text class="sm" x="404" y="168" text-anchor="middle">数字、邮箱、URL、版本号…</text>
+
+  <rect class="bx-d" x="530" y="20" width="210" height="160" rx="12"/>
+  <text class="ttl" x="635" y="46" text-anchor="middle">其他语言</text>
+  <text class="sm" x="635" y="72" text-anchor="middle">\dF 列出全部预定义配置：</text>
+  <text class="sm" x="635" y="94" text-anchor="middle">arabic · danish · dutch</text>
+  <text class="sm" x="635" y="112" text-anchor="middle">french · german · greek</text>
+  <text class="sm" x="635" y="130" text-anchor="middle">hindi · italian · russian …</text>
+  <text class="sm" x="635" y="156" text-anchor="middle">都不合适？可以自定义配置</text>
+</svg>
+<figcaption>图 6-4　全文搜索配置决定了“哪类词元交给哪个字典”</figcaption>
+</figure>
+
+<p>默认配置只有一个，但运行时可以随意指定别的配置。比如把同一句话翻译成俄语，用 russian 配置处理：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.2 · 使用 russian 配置做全文搜索">
+<pre>
+SELECT token, description, lexemes, dictionary
+FROM ts_debug('russian',
+'5 исследователей путешествуют к далёкой галактике.');
+</pre>
+</div>
+<div class="code out"><pre>
+     token      |    description    |    lexemes     |  dictionary
+----------------+-------------------+----------------+--------------
+ 5              | Unsigned integer  | {5}            | simple
+                | Space symbols     |                |
+ исследователей | Word, all letters | {исследовател} | russian_stem
+                | Space symbols     |                |
+ путешествуют   | Word, all letters | {путешеств}    | russian_stem
+                | Space symbols     |                |
+ к              | Word, all letters | {}             | russian_stem
+                | Space symbols     |                |
+ далёкой        | Word, all letters | {далек}        | russian_stem
+                | Space symbols     |                |
+ галактике      | Word, all letters | {галактик}     | russian_stem
+ .              | Space symbols     |                |
+(12 rows)
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 关于中文</div>
+  <p>
+    Postgres 内置配置里<strong>没有中文</strong>。中文词与词之间没有空格，默认解析器无法正确分词（整句会被当成一个词元）。
+    处理中文全文搜索需要安装 <code>zhparser</code>、<code>pg_jieba</code> 等第三方分词扩展，或者用第 8 章的向量搜索。本章的例子都是英文。
+  </p>
+</div>
+
+<h2 id="prepare">为文本搜索准备数据</h2>
+
+<p>我们负责电影推荐服务的搜索模块：用户或其他组件来要推荐，它要返回最相关的结果。第一步是把电影数据准备成可以全文搜索的样子。</p>
+
+<h3>用 to_tsvector 生成词素</h3>
+
+<div class="code" data-lang="text"><pre>
+to_tsvector([ config regconfig, ] document text) returns tsvector
+</pre></div>
+
+<p>它把原始文本转换成 <code>tsvector</code> 类型的词素列表。用户搜索“The explorers must save the fragile peace between Earth and the aliens.”：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.3 · 使用 to_tsvector 函数">
+<pre>
+SELECT * FROM to_tsvector(
+    'The explorers must save the fragile peace between Earth and the aliens.');
+</pre>
+</div>
+<div class="code out"><pre>
+                              to_tsvector
+-----------------------------------------------------------------------
+ 'alien':12 'earth':9 'explor':2 'fragil':6 'must':3 'peac':7 'save':4
+(1 row)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 190" role="img" aria-label="tsvector 的构成：词素加位置编号，停用词虽然被删但仍占位置">
+  <text class="sm" x="20" y="24">原句（位置编号）：</text>
+  <g>
+    <rect class="cell-r" x="20" y="34" width="50" height="30"/><text class="sm" x="45" y="54" text-anchor="middle">The¹</text>
+    <rect class="cell-a" x="70" y="34" width="72" height="30"/><text class="sm" x="106" y="54" text-anchor="middle">explorers²</text>
+    <rect class="cell-a" x="142" y="34" width="52" height="30"/><text class="sm" x="168" y="54" text-anchor="middle">must³</text>
+    <rect class="cell-a" x="194" y="34" width="52" height="30"/><text class="sm" x="220" y="54" text-anchor="middle">save⁴</text>
+    <rect class="cell-r" x="246" y="34" width="44" height="30"/><text class="sm" x="268" y="54" text-anchor="middle">the⁵</text>
+    <rect class="cell-a" x="290" y="34" width="64" height="30"/><text class="sm" x="322" y="54" text-anchor="middle">fragile⁶</text>
+    <rect class="cell-a" x="354" y="34" width="58" height="30"/><text class="sm" x="383" y="54" text-anchor="middle">peace⁷</text>
+    <rect class="cell-r" x="412" y="34" width="74" height="30"/><text class="sm" x="449" y="54" text-anchor="middle">between⁸</text>
+    <rect class="cell-a" x="486" y="34" width="58" height="30"/><text class="sm" x="515" y="54" text-anchor="middle">Earth⁹</text>
+    <rect class="cell-r" x="544" y="34" width="50" height="30"/><text class="sm" x="569" y="54" text-anchor="middle">and¹⁰</text>
+    <rect class="cell-r" x="594" y="34" width="50" height="30"/><text class="sm" x="619" y="54" text-anchor="middle">the¹¹</text>
+    <rect class="cell-a" x="644" y="34" width="70" height="30"/><text class="sm" x="679" y="54" text-anchor="middle">aliens¹²</text>
+  </g>
+  <path class="ln-a" d="M380 70 V100" marker-end="url(#ar-a)"/>
+  <rect class="bx-a" x="20" y="104" width="720" height="40" rx="8"/>
+  <text class="mono" x="380" y="129" text-anchor="middle"><tspan class="on-a b">'alien'</tspan>:12 <tspan class="on-a b">'earth'</tspan>:9 <tspan class="on-a b">'explor'</tspan>:2 <tspan class="on-a b">'fragil'</tspan>:6 <tspan class="on-a b">'must'</tspan>:3 <tspan class="on-a b">'peac'</tspan>:7 <tspan class="on-a b">'save'</tspan>:4</text>
+  <text class="sm" x="20" y="168">• 词素按字母序排列，冒号后面是它在原文中的位置</text>
+  <text class="sm" x="20" y="184">• 红色停用词被去掉，但位置编号仍然保留（explor 是第 2 个而不是第 1 个）</text>
+  <text class="sm" x="430" y="168">• 同一词素出现多次会记录多个位置：'explor':2,4</text>
+  <text class="sm" x="430" y="184">• 'between' 在英文配置里也被视为停用词</text>
+</svg>
+<figcaption>图 6-5　tsvector = 去重排序后的词素 + 每个词素在原文中的位置</figcaption>
+</figure>
+
+<p>搜索模块允许用户同时提供标题和描述。用字符串拼接运算符 <code>||</code> 把它们合成一个字符串再传进去（中间加个空格）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.4 · 对拼接后的字符串使用 to_tsvector">
+<pre>
+SELECT * FROM to_tsvector(
+'Space Explorers' ||
+' ' ||                    -- 加一个空格
+'The explorers must save the fragile peace between Earth and the aliens.');
+</pre>
+</div>
+<div class="code out"><pre>
+                               to_tsvector
+-------------------------------------------------------------------------
+ 'alien':14 'earth':11 'explor':2,4 'fragil':8 'must':5 'peac':9
+ 'save':6 'space':1
+(1 row)
+</pre></div>
+
+<p>“explorers”在标题和描述里各出现一次，所以 <code>'explor':2,4</code> 记录了两个位置。也可以分别生成：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.5 · 分别为标题和描述生成词素">
+<pre>
+SELECT title_lexemes, description_lexemes FROM
+ to_tsvector('Space Explorers') as title_lexemes,
+ to_tsvector(
+ 'The explorers must save the fragile peace between Earth and the aliens.'
+ ) as description_lexemes;
+</pre>
+</div>
+<div class="code out"><pre>
+    title_lexemes     |                description_lexemes
+----------------------+---------------------------------------------------
+ 'explor':2 'space':1 | 'alien':12 'earth':9 'explor':2 'fragil':6 'must':3
+                      | 'peac':7 'save':4
+(1 row)
+</pre></div>
+
+<h3>把 tsvector 存进数据库</h3>
+
+<p>生成词素之后，有三种用法：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="tsvector 的三种使用方式">
+  <rect class="bx" x="20" y="20" width="230" height="174" rx="12"/>
+  <text class="ttl" x="135" y="44" text-anchor="middle">① 每次现算</text>
+  <text class="mono" x="135" y="70" text-anchor="middle">WHERE to_tsvector(col)</text>
+  <text class="mono" x="135" y="88" text-anchor="middle">@@ …</text>
+  <text class="sm on-g" x="36" y="120">✓ 不占额外空间</text>
+  <text class="sm on-r" x="36" y="142">✗ 每次查询都要重新分词</text>
+  <text class="sm on-r" x="36" y="164">✗ 算完就扔，浪费</text>
+
+  <rect class="bx-a" x="265" y="20" width="230" height="174" rx="12"/>
+  <text class="ttl on-a" x="380" y="44" text-anchor="middle">② 存进一列 ✓ 本章采用</text>
+  <text class="mono" x="380" y="70" text-anchor="middle">lexemes tsvector</text>
+  <text class="mono" x="380" y="88" text-anchor="middle">+ GIN/GiST 索引</text>
+  <text class="sm on-g" x="281" y="120">✓ 只算一次</text>
+  <text class="sm on-g" x="281" y="142">✓ 可以建索引</text>
+  <text class="sm on-g" x="281" y="164">✓ 可以灵活设置权重</text>
+  <text class="sm on-r" x="281" y="186">✗ 多占一份存储</text>
+
+  <rect class="bx" x="510" y="20" width="230" height="174" rx="12"/>
+  <text class="ttl" x="625" y="44" text-anchor="middle">③ 直接对表达式建索引</text>
+  <text class="mono" x="625" y="70" text-anchor="middle">USING GIN (to_tsvector(</text>
+  <text class="mono" x="625" y="88" text-anchor="middle">'english', col))</text>
+  <text class="sm on-g" x="526" y="120">✓ 不存词素副本，省空间</text>
+  <text class="sm on-r" x="526" y="142">✗ 必须在建索引时写死配置</text>
+  <text class="sm on-r" x="526" y="164">✗ 查询表达式要完全一致</text>
+</svg>
+<figcaption>图 6-6　tsvector 的三种用法</figcaption>
+</figure>
+
+<h4>加载电影数据集</h4>
+
+<p>数据集来自免费、由社区维护的开放电影数据库 <a href="https://www.omdb.org">OMDB</a>（Open Media Database，采用 GNU 自由文档许可和知识共享许可）。我们用其中一个子集，只有一张表：</p>
+
+<div class="code" data-lang="sql" data-file="data/movie/omdb_movies_ddl.sql"><pre>
+CREATE TABLE omdb.movies (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,          -- 片名
+    description TEXT NOT NULL,   -- 简介
+    release_date DATE,
+    runtime INT,
+    budget NUMERIC,
+    revenue NUMERIC,
+    vote_average NUMERIC,        -- 平均评分
+    votes_count BIGINT
+);
+</pre></div>
+
+<div class="code" data-lang="bash"><pre>
+cd just-use-postgres-book/
+docker cp data/movie/. postgres:/home/.
+
+docker exec -it postgres psql -U postgres -c "\i /home/omdb_movies_ddl.sql"
+docker exec -it postgres psql -U postgres -c "\i /home/omdb_movies_data.sql"
+</pre></div>
+
+<p><code>\dt omdb.*</code> 能看到 movies 表，<code>SELECT count(*) FROM omdb.movies;</code> 返回 4225。想要完整的最新数据，可以用 <a href="https://github.com/df7cb/omdb-postgresql">omdb-postgresql</a> 模块导入。</p>
+
+<h4>在 movies 表里存储词素</h4>
+
+<p>搜索模块要对 name 和 description 两列做全文搜索。先看看《2001 太空漫游》：</p>
+
+<div class="code" data-lang="sql"><pre>
+\x on
+SELECT id, name, description
+FROM omdb.movies
+WHERE name LIKE '%Space Odyssey%';
+</pre></div>
+<div class="code out"><pre>
+-[ RECORD 1 ]-----------------------------------------------------------
+id          | 62
+name        | 2001: A Space Odyssey
+description | The highly respected and often cited milestone in
+              Science Fiction cinema. Director Stanley Kubrick takes us into
+              the future, into outer space and aboard a space station that's
+              controlled by a seemingly trustworthy computer named HAL.
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; \x 扩展显示</div>
+  <p>psql 的 <code>\x on</code> 开启扩展显示模式：每一行竖着显示，列多或值很长时更好读。<code>\x off</code> 恢复成表格模式。</p>
+</div>
+
+<p>用 <code>ALTER TABLE</code> 加一个 tsvector 类型的 <code>lexemes</code> 列：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.6 · 添加存储词素的生成列">
+<pre>
+ALTER TABLE omdb.movies
+ADD COLUMN lexemes tsvector
+GENERATED ALWAYS AS (
+  to_tsvector(
+    'english', coalesce(name, '') ||
+    ' ' ||
+    coalesce(description, ''))) STORED;
+</pre>
+</div>
+
+<ul>
+  <li><code>GENERATED ALWAYS AS (…) STORED</code> 定义了一个<strong>存储型生成列</strong>：它的值由表达式自动计算并保存。片名或简介一改，词素自动重新生成，应用不用操心。</li>
+  <li>必须<strong>显式传入 <code>'english'</code></strong>：生成列的表达式必须是<strong>不可变的</strong>（immutable）。不传配置的话，to_tsvector 会依赖 <code>default_text_search_config</code>，而这个设置可以在会话或数据库级别修改，结果就不确定了，所以语句会报错。</li>
+  <li><code>coalesce(column, '')</code> 处理 NULL：<code>to_tsvector(NULL)</code> 返回 NULL，而 NULL 和任何字符串拼接的结果也是 NULL。（这里两列都有 NOT NULL 约束，其实用不着，但值得了解。）</li>
+</ul>
+
+<p>再看《2001 太空漫游》，已经有了词素：</p>
+
+<div class="code out"><pre>
+lexemes | '2001':1 'aboard':28 'cinema':15 'cite':10 'comput':39
+          'control':34 'director':16 'fiction':14 'futur':23 'hal':41
+          'high':6 'kubrick':18 'mileston':11 'name':40 'odyssey':4
+          'often':9 'outer':25 'respect':7 'scienc':13 'seem':37
+          'space':3,26,30 'stanley':17 'station':31 'take':19
+          'trustworthi':38 'us':20
+</pre></div>
+
+<h2 id="search">执行全文搜索</h2>
+
+<p>
+  用户的查询也要经过同样的规范化：去停用词、转词素。转换结果是 <strong><code>tsquery</code></strong> 类型，词素之间用特殊运算符连接，比如 <code>&amp;</code>（与）、<code>|</code>（或）。
+  然后用<strong>匹配运算符 <code>@@</code></strong> 比较 tsvector 和 tsquery：匹配返回 true，否则 false。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 190" role="img" aria-label="tsvector @@ tsquery 的匹配过程">
+  <rect class="bx-a" x="20" y="20" width="300" height="110" rx="12"/>
+  <text class="ttl on-a" x="36" y="44">tsvector（电影 Toy Story）</text>
+  <text class="mono" x="36" y="70">'anim':5 'comput':4 'film':6</text>
+  <text class="mono" x="36" y="90">'toy':1,12 'stori':2 'woodi':8</text>
+  <text class="mono" x="36" y="110">'buzz':15 'lightyear':16 …</text>
+
+  <text class="ttl on-g" x="380" y="80" text-anchor="middle">@@</text>
+  <text class="sm" x="380" y="100" text-anchor="middle">匹配吗？</text>
+
+  <rect class="bx-p" x="440" y="20" width="300" height="110" rx="12"/>
+  <text class="ttl on-p" x="456" y="44">tsquery（用户的查询）</text>
+  <text class="sm" x="456" y="68">plainto_tsquery('a computer animated film')</text>
+  <text class="mono" x="456" y="96">'comput' &amp; 'anim' &amp; 'film'</text>
+  <text class="sm" x="456" y="118">“a”被去掉，三个词素用 &amp; 连接</text>
+
+  <rect class="bx-g" x="20" y="146" width="720" height="34" rx="8"/>
+  <text class="sm on-g" x="380" y="168" text-anchor="middle">✓ comput 有 · anim 有 · film 有 → 三个都在 → true，这部电影被返回（词素为示意）</text>
+</svg>
+<figcaption>图 6-7　<code>@@</code>：拿 tsquery 的逻辑表达式去检验 tsvector</figcaption>
+</figure>
+
+<h3>plainto_tsquery：简单查询</h3>
+
+<div class="code" data-lang="text"><pre>
+plainto_tsquery([ config regconfig, ] querytext text) returns tsquery
+</pre></div>
+
+<p>用户想看动画片，在搜索框里输入“a computer animated film”：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT plainto_tsquery('a computer animated film');
+</pre></div>
+<div class="code out"><pre>
+      plainto_tsquery
+----------------------------
+ 'comput' & 'anim' & 'film'
+(1 row)
+</pre></div>
+
+<p>冠词 a 被去掉，其余规范化成词干，中间插入 <code>&amp;</code>（AND）：三个词素都必须出现才算匹配。</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.7 · 第一个全文搜索查询">
+<pre>
+SELECT id, name
+FROM omdb.movies
+WHERE lexemes @@ plainto_tsquery('a computer animated film');
+</pre>
+</div>
+<div class="code out"><pre>
+   id   |            name
+--------+----------------------------
+     12 | Finding Nemo
+    280 | Terminator 2: Judgment Day
+    425 | Ice Age
+    585 | Monsters, Inc.
+    604 | The Matrix Reloaded
+    810 | Shrek the Third
+    862 | Toy Story
+    863 | Toy Story 2
+    950 | Ice Age: The Meltdown
+    953 | Madagascar
+   1273 | TMNT
+   2310 | Beowulf
+  26301 | Avatar
+  32683 | The Croods
+ 120862 | The Lion King
+   9928 | Robots
+(16 rows)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 拼写错误怎么办？</div>
+  <p>
+    “computer animated”严格说应该写成“computer-animated”，但用户就是这么输入的，应用要能容忍小错误和拼写错误。
+    想识别拼写错误或做自动补全，可以用 <code>pg_trgm</code> 扩展提供的<strong>三元组（trigram）</strong>匹配 —— 把字符串拆成连续三个字符的组合来比较相似度。详见<a href="https://www.postgresql.org/docs/current/pgtrgm.html">文档</a>。
+  </p>
+</div>
+
+<h3>to_tsquery：高级过滤</h3>
+
+<p>plainto_tsquery 要求所有词都出现。需要更复杂的逻辑时，用 <code>to_tsquery</code>，它的输入必须用运算符把词连起来，还可以用括号分组：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="tsquery 运算符">
+  <rect class="bx-b" x="20" y="20" width="168" height="130" rx="10"/>
+  <text class="mono on-b b" x="104" y="48" text-anchor="middle">&amp;</text>
+  <text class="ttl" x="104" y="72" text-anchor="middle">AND 都要有</text>
+  <text class="mono" x="104" y="100" text-anchor="middle">lion &amp; king</text>
+
+  <rect class="bx-g" x="200" y="20" width="168" height="130" rx="10"/>
+  <text class="mono on-g b" x="284" y="48" text-anchor="middle">|</text>
+  <text class="ttl" x="284" y="72" text-anchor="middle">OR 有一个就行</text>
+  <text class="mono" x="284" y="100" text-anchor="middle">lion | donkey</text>
+
+  <rect class="bx-r" x="380" y="20" width="168" height="130" rx="10"/>
+  <text class="mono on-r b" x="464" y="48" text-anchor="middle">!</text>
+  <text class="ttl" x="464" y="72" text-anchor="middle">NOT 不能有</text>
+  <text class="mono" x="464" y="100" text-anchor="middle">lion &amp; !king</text>
+
+  <rect class="bx-p" x="560" y="20" width="180" height="130" rx="10"/>
+  <text class="mono on-p b" x="650" y="48" text-anchor="middle">&lt;-&gt;  &lt;N&gt;</text>
+  <text class="ttl" x="650" y="72" text-anchor="middle">FOLLOWED BY 紧跟</text>
+  <text class="mono" x="650" y="100" text-anchor="middle">lion &lt;-&gt; king</text>
+  <text class="sm" x="650" y="120" text-anchor="middle">king 紧跟在 lion 后面</text>
+  <text class="sm" x="650" y="138" text-anchor="middle">&lt;3&gt;：相隔 3 个位置</text>
+  <text class="sm" x="104" y="134" text-anchor="middle">（括号可以分组）</text>
+</svg>
+<figcaption>图 6-8　tsquery 支持的四类运算符</figcaption>
+</figure>
+
+<p>用户看了上面的推荐，进一步要求：电脑动画，并且有狮子、小丑鱼或驴子：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.8 · 组合使用 AND 和 OR">
+<pre>
+SELECT id, name
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('computer & animated
+      & (lion | clownfish | donkey)');
+</pre>
+</div>
+<div class="code out"><pre>
+   id   |     name
+--------+---------------
+     12 | Finding Nemo
+    808 | Shrek
+ 120862 | The Lion King
+(3 rows)
+</pre></div>
+
+<p>用户又说：要有狮子的电影，但排除《狮子王》：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.9 · 使用 NOT 运算符并按短语过滤">
+<pre>
+SELECT id, name
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('lion & !''The Lion King''');
+</pre>
+</div>
+<div class="code out"><pre>
+   id   |                              name
+--------+----------------------------------------------------------------
+    411 | The Chronicles of Narnia: The Lion, the Witch and the Wardrobe
+    630 | The Wizard of Oz
+   9904 | The Wild
+  35066 | Four Lions
+  99216 | Lion
+ 130325 | Les misérables
+(6 rows)
+</pre></div>
+
+<p>短语要用<strong>两个单引号</strong>包起来（SQL 字符串里的单引号要写两次来转义），才会被当作一个整体。它是怎么被理解的？</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM to_tsquery('lion & !''The Lion King''');
+</pre></div>
+<div class="code out"><pre>
+           to_tsquery
+---------------------------------
+ 'lion' & !( 'lion' <-> 'king' )
+(1 row)
+</pre></div>
+
+<p>
+  短语被拆成 lion 和 king（the 是停用词），中间插入 <code>&lt;-&gt;</code>：king 必须<strong>紧跟</strong>在 lion 后面。
+  <code>&lt;N&gt;</code> 可以指定距离。比如找“return”之后第 3 个位置是“king”的电影：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT id, name
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('return <3> king');
+</pre></div>
+<div class="code out"><pre>
+ id  |                     name
+-----+-----------------------------------------------
+ 122 | The Lord of the Rings: The Return of the King
+(1 row)
+</pre></div>
+
+<p>“return”后面依次是 of、the、king —— king 正好在第 3 个位置。这也说明了为什么停用词要保留位置编号。</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 另外两个转换函数</div>
+  <ul>
+    <li><code>phraseto_tsquery</code>：和 plainto_tsquery 类似，但词素之间插入 <code>&lt;-&gt;</code> 而不是 <code>&amp;</code>（按短语匹配），遇到停用词时会插入 <code>&lt;N&gt;</code>。</li>
+    <li><code>websearch_to_tsquery</code>：最适合直接处理用户的原始输入。用户可以像用搜索引擎一样写 <code>or</code>、引号短语、<code>-</code> 排除，格式写错也不会报语法错误。</li>
+  </ul>
+</div>
+
+<h2 id="rank">搜索结果排序</h2>
+
+<p>用户想看鬼片，输入“ghosts”：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.10 · 返回包含“ghosts”的电影">
+<pre>
+SELECT id, name, vote_average
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('ghosts')
+ORDER BY vote_average DESC NULLS LAST LIMIT 10;
+</pre>
+</div>
+<div class="code out"><pre>
+  id   |               name               | vote_average
+-------+----------------------------------+--------------
+ 84904 | A Girl Walks Home Alone at Night |            9
+  1548 | Ghost World                      | 8.1428575516
+ 25028 | Miracolo a Milano                |            8
+   426 | Vertigo                          | 7.6849312782
+   745 | The Sixth Sense                  | 7.5660376549
+   620 | Ghostbusters                     | 7.0500001907
+ 57784 | ParaNorman                       |            7
+ 11439 | The Ghost Writer                 | 6.5833334923
+   251 | Ghost                            | 6.3333301544
+ 10016 | Ghosts of Mars                   | 6.222219944
+(10 rows)
+</pre></div>
+
+<p>
+  按评分排序，从全文搜索的角度看合理吗？前五部里只有《Ghost World》片名里有 ghost；而且这种排法完全不管 ghost 出现了几次。
+  对比一下排第一的和排第九的：
+</p>
+
+<div class="code out"><pre>
+id      | 251
+name    | Ghost
+lexemes | ... 'ghost':1,2,15 ...       ← 出现 3 次，还在片名里
+
+id      | 84904
+name    | A Girl Walks Home Alone at Night
+lexemes | ... 'ghost':13 ...           ← 只出现 1 次
+</pre></div>
+
+<p>Postgres 提供了两个计算相关度的函数：</p>
+
+<ul>
+  <li><code>ts_rank</code>：根据词出现的<strong>频率</strong>和<strong>位置</strong>打分。</li>
+  <li><code>ts_rank_cd</code>：ts_rank 的变体，还考虑<strong>词的密度</strong>（cover density）—— 查询词彼此靠得越近，分越高。</li>
+</ul>
+
+<h3>用 ts_rank 排序</h3>
+
+<div class="code" data-lang="text"><pre>
+ts_rank([ weights float4[], ] vector tsvector,
+  query tsquery [, normalization integer ]) returns float4
+</pre></div>
+
+<div class="tw"><table>
+<tr><th>参数</th><th>含义</th></tr>
+<tr><td><code>weights</code>（可选）</td><td>按标签给词加权。共四个标签 A、B、C、D，A 通常给文档最重要的部分。格式是 <code>{D权重, C权重, B权重, A权重}</code>，默认 <code>{0.1, 0.2, 0.4, 1.0}</code>，越接近 1 越重要</td></tr>
+<tr><td><code>vector</code></td><td>文档的 tsvector</td></tr>
+<tr><td><code>query</code></td><td>tsquery 查询</td></tr>
+<tr><td><code>normalization</code>（可选）</td><td>文档长度如何影响得分，是个位掩码：0（默认）不考虑长度；1 除以文档长度；2 除以平均词频……可组合</td></tr>
+</table></div>
+
+<div class="code" data-lang="sql" data-file="清单 6.11 · 用 ts_rank 给搜索结果排序">
+<pre>
+SELECT id, name, vote_average,
+  ts_rank(lexemes, to_tsquery('ghosts')) AS search_rank
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('ghosts')
+ORDER BY search_rank DESC, vote_average DESC NULLS LAST LIMIT 10;
+</pre>
+</div>
+<div class="code out"><pre>
+   id   |               name               | vote_average | search_rank
+--------+----------------------------------+--------------+-------------
+    251 | Ghost                            | 6.3333301544 | 0.082745634
+ 210675 | A Most Annoying Ghost            |              | 0.082745634
+   1548 | Ghost World                      | 8.1428575516 | 0.075990885
+    620 | Ghostbusters                     | 7.0500001907 | 0.075990885
+  57784 | ParaNorman                       |            7 | 0.075990885
+  12175 | Ghosts of Goldfield              |            6 | 0.075990885
+ 185828 | Dhamilo Pani                     |              | 0.075990885
+ 166008 | Ghosts                           |              | 0.075990885
+  84904 | A Girl Walks Home Alone at Night |            9 | 0.06079271
+  25028 | Miracolo a Milano                |            8 | 0.06079271
+(10 rows)
+</pre></div>
+
+<p>ghost 出现得越频繁，排得越靠前。有些电影没有评分（vote_average 为空），但只要匹配了搜索条件也会出现。</p>
+
+<h3>用权重区分标题和简介</h3>
+
+<p>
+  现在 ts_rank 还分不清 ghost 是出现在片名里还是简介里 —— 词素是从“片名 + 简介”拼接后的文本生成的，只有位置信息。
+  用 <code>setweight</code> 函数可以给 tsvector 里的词素打上权重标签：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.12 · 用 setweight 分配权重">
+<pre>
+SELECT id, name, description,
+  (setweight(to_tsvector('english', coalesce(name, '')), 'A') ||
+   setweight(to_tsvector('english', coalesce(description, '')), 'B'))
+     as lexemes_with_weight
+FROM omdb.movies
+WHERE id = 251;
+</pre>
+</div>
+<div class="code out"><pre>
+lexemes_with_weight | 'award':6B 'chaotic':19B 'contact':24B 'demi':29B
+                      'ghost':1A,2B,15B 'help':22B 'love':8B 'moor':30B ...
+</pre></div>
+
+<p>片名部分标 A（最高），简介部分标 B，两个 tsvector 用 <code>||</code> 拼起来。<code>'ghost':1A,2B,15B</code>：一次在片名，两次在简介。重建 lexemes 列：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.13 · 重建存储词素的生成列">
+<pre>
+ALTER TABLE omdb.movies
+DROP COLUMN lexemes;
+
+ALTER TABLE omdb.movies
+ADD COLUMN lexemes tsvector
+GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(name, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(description, '')), 'B')
+) STORED;
+</pre>
+</div>
+
+<p>再用清单 6.11 的查询找鬼片：</p>
+
+<div class="code out"><pre>
+   id   |         name          | vote_average | search_rank
+--------+-----------------------+--------------+-------------
+    251 | Ghost                 | 6.3333301544 |   0.6957388
+ 210675 | A Most Annoying Ghost |              |   0.6957388
+   1548 | Ghost World           | 8.1428575516 |  0.66871977
+  12175 | Ghosts of Goldfield   |            6 |  0.66871977
+ 166008 | Ghosts                |              |  0.66871977
+  11439 | The Ghost Writer      | 6.5833334923 |   0.6079271
+  10016 | Ghosts of Mars        |  6.222219944 |   0.6079271
+    620 | Ghostbusters          | 7.0500001907 |  0.30396354
+  57784 | ParaNorman            |            7 |  0.30396354
+ 185828 | Dhamilo Pani          |              |  0.30396354
+(10 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 214" role="img" aria-label="加权前后的排序对比">
+  <text class="ttl" x="190" y="22" text-anchor="middle">没有权重</text>
+  <rect class="bx" x="20" y="34" width="340" height="150" rx="10"/>
+  <text class="sm" x="36" y="58">ghost 在片名里出现 = ghost 在简介里出现</text>
+  <rect class="fill-b" x="36" y="72" width="70" height="14" rx="2"/><text class="sm" x="114" y="84">Ghost 0.083</text>
+  <rect class="fill-b" x="36" y="94" width="64" height="14" rx="2"/><text class="sm" x="108" y="106">Ghostbusters 0.076</text>
+  <rect class="fill-b" x="36" y="116" width="64" height="14" rx="2"/><text class="sm" x="108" y="128">ParaNorman 0.076</text>
+  <rect class="fill-b" x="36" y="138" width="52" height="14" rx="2"/><text class="sm" x="96" y="150">A Girl Walks… 0.061</text>
+  <text class="sm" x="36" y="174">分数差距小，片名的重要性没体现</text>
+
+  <text class="ttl on-a" x="570" y="22" text-anchor="middle">片名 A · 简介 B</text>
+  <rect class="bx-a" x="400" y="34" width="340" height="150" rx="10"/>
+  <text class="sm" x="416" y="58">A 权重 1.0，B 权重 0.4</text>
+  <rect class="fill-a" x="416" y="72" width="160" height="14" rx="2"/><text class="sm" x="584" y="84">Ghost 0.70</text>
+  <rect class="fill-a" x="416" y="94" width="152" height="14" rx="2"/><text class="sm" x="576" y="106">Ghost World 0.67</text>
+  <rect class="fill-a" x="416" y="116" width="138" height="14" rx="2"/><text class="sm" x="562" y="128">The Ghost Writer 0.61</text>
+  <rect class="fill-a" x="416" y="138" width="70" height="14" rx="2"/><text class="sm" x="494" y="150">Ghostbusters 0.30</text>
+  <text class="sm" x="416" y="174">片名里有 ghost 的全部排到前面</text>
+  <text class="sm" x="380" y="202" text-anchor="middle">（Ghostbusters 片名里的 “ghostbusters” 是另一个词素，ghost 只出现在它的简介里）</text>
+</svg>
+<figcaption>图 6-9　权重让“出现在哪里”也成为相关度的一部分</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#128161; 在 tsquery 里限定权重</div>
+  <p>可以在查询词后面加 <code>:A</code>，只匹配带 A 标签的词素 —— 也就是只搜片名：</p>
+  <div class="code" data-lang="sql"><pre>
+SELECT id, name, vote_average,
+  ts_rank(lexemes, to_tsquery('ghosts')) AS search_rank
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('ghosts:A')
+ORDER BY search_rank DESC, vote_average DESC NULLS LAST LIMIT 10;
+-- 只返回 7 部片名里有 ghost 的电影
+</pre></div>
+</div>
+
+<h2 id="highlight">高亮搜索结果</h2>
+
+<p>
+  搜索模块还想支持<strong>高亮</strong>：把简介里匹配的词标出来，供其他组件进一步处理。Postgres 的 <code>ts_headline</code> 函数返回文档中的片段，并把搜索词高亮：
+</p>
+
+<div class="code" data-lang="text"><pre>
+ts_headline([ config regconfig, ] document text,
+  query tsquery [, options text ]) returns text
+</pre></div>
+
+<p>找出最相关的海盗电影，并高亮简介：</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.14 · 用 ts_headline 高亮搜索结果">
+<pre>
+SELECT id, name,description,
+    ts_headline(description, to_tsquery('pirates')) AS fragments,
+    ts_rank(lexemes, to_tsquery('pirates')) AS rank
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('pirates:B')
+ORDER BY rank DESC LIMIT 1;
+</pre>
+</div>
+
+<ol>
+  <li><code>to_tsquery('pirates:B')</code> 只在简介（B 标签）里搜。</li>
+  <li><code>ts_headline</code> 处理的是原始的 description 文本（它会自己现场生成不带权重的词素），所以这里的查询<strong>不加</strong> :B。</li>
+  <li>ts_rank 的查询也不加 :B，这样片名（A 标签）里的 pirates 也计入得分。最后取得分最高的一部。</li>
+</ol>
+
+<div class="code out"><pre>
+id          | 58
+name        | Pirates of the Caribbean: Dead Man's Chest
+description | Captain Jack is back! The bizarre and infamous pirate
+              Captain Jack is in a battle with the ocean itself. Jack knows
+              it won't be easy and gathers friends to help him on his mission to
+              find the heart of Davy Jones in this second and more slapstick
+              film from the pirate trilogy.
+fragments   | &lt;b&gt;pirate&lt;/b&gt; Captain Jack is in a battle with the ocean
+              itself. Jack knows it won't be easy
+rank        | 0.6957388
+</pre></div>
+
+<p>
+  匹配的词被包在 <code>&lt;b&gt;</code> 和 <code>&lt;/b&gt;</code> 里，这是默认的高亮标记。但简介末尾还有一个 pirate（“the pirate trilogy”）没被高亮 ——
+  因为 ts_headline 默认只返回<strong>一个</strong>片段。可以通过选项调整：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 6.15 · 定制 ts_headline 以显示更多片段">
+<pre>
+SELECT id, name, description,
+  ts_headline(description, to_tsquery('pirates'),
+    'MaxFragments=3, MinWords=5, MaxWords=10,
+     FragmentDelimiter=&lt;ft_end&gt;') AS fragments,
+  ts_rank(lexemes, to_tsquery('pirates')) AS rank
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('pirates:B')
+ORDER BY rank DESC LIMIT 1;
+</pre>
+</div>
+
+<div class="tw"><table>
+<tr><th>选项</th><th>含义</th></tr>
+<tr><td><code>MaxFragments=3</code></td><td>最多返回 3 个包含搜索词的不同片段</td></tr>
+<tr><td><code>MinWords=5, MaxWords=10</code></td><td>每个片段最少 5 个、最多 10 个词（默认 15 和 35）</td></tr>
+<tr><td><code>FragmentDelimiter=&lt;ft_end&gt;</code></td><td>片段之间的分隔符，默认是 <code>...</code></td></tr>
+</table></div>
+
+<div class="code out"><pre>
+fragments | bizarre and infamous &lt;b&gt;pirate&lt;/b&gt; Captain Jack is
+            in a battle&lt;ft_end&gt;slapstick film from the &lt;b&gt;pirate&lt;/b&gt; trilogy
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="ts_headline 从原文中截取片段并加上高亮标记">
+  <rect class="bx" x="20" y="20" width="720" height="62" rx="10"/>
+  <text class="sm" x="36" y="42">Captain Jack is back! The <tspan class="on-b b">[bizarre and infamous </tspan><tspan class="on-a b">pirate</tspan><tspan class="on-b b"> Captain Jack is in a battle]</tspan> with the ocean itself.</text>
+  <text class="sm" x="36" y="64">… gathers friends … in this second and more <tspan class="on-b b">[slapstick film from the </tspan><tspan class="on-a b">pirate</tspan><tspan class="on-b b"> trilogy]</tspan>.</text>
+  <path class="ln-a" d="M380 84 V108" marker-end="url(#ar-a)"/>
+  <rect class="bx-a" x="20" y="112" width="720" height="44" rx="10"/>
+  <text class="mono" x="380" y="139" text-anchor="middle">片段1 &lt;b&gt;pirate&lt;/b&gt; …<tspan class="on-a b">&lt;ft_end&gt;</tspan>片段2 &lt;b&gt;pirate&lt;/b&gt; trilogy</text>
+</svg>
+<figcaption>图 6-10　ts_headline：挑出包含搜索词的片段（蓝色），给匹配词加标记（橙色）</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; 当心 XSS</div>
+  <p>
+    ts_headline 的输出<strong>不保证</strong>可以直接放进网页：处理不可信的输入时可能被用来发动跨站脚本攻击（XSS）。
+    我们的 name 和 description 都是纯文本，没有这个问题；但如果你存储、搜索的是带 HTML 标记的文档，要么先去掉所有 HTML 标签，要么用 HTML 清理器（sanitizer）处理输出。
+    更多选项见<a href="https://www.postgresql.org/docs/current/textsearch-controls.html#TEXTSEARCH-HEADLINE">官方文档</a>。
+  </p>
+</div>
+
+<h2 id="index">为词素建索引</h2>
+
+<p>用户想看一部“人们为真正重要的东西而战”的历史片：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT id, name FROM omdb.movies
+WHERE lexemes @@ to_tsquery('historical & fight');
+-- Gladiator · Saints and Soldiers · Braveheart
+</pre></div>
+
+<p>找到这三部电影花了多大力气？</p>
+
+<div class="code out"><pre>
+ Seq Scan on movies (actual time=0.226..15.301 rows=3 loops=1)
+   Filter: (lexemes @@ to_tsquery('historical & fight'::text))
+   Rows Removed by Filter: 4222
+ Planning Time: 0.179 ms
+ Execution Time: 15.328 ms
+</pre></div>
+
+<p>全表扫描，对每一行都做了一次匹配，丢掉了 4222 行。来试试 GIN 和 GiST 索引。</p>
+
+<h3>GIN 索引</h3>
+
+<p>
+  <strong>GIN 是全文搜索的首选索引。</strong>第 5 章用它索引 JSON 的键和值；这里它索引的是 tsvector 的词素：每个不同的词素一个条目，条目指向包含该词素的所有行。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="全文搜索的 GIN 索引示意">
+  <text class="sm" x="380" y="16" text-anchor="middle">根索引页</text>
+  <rect class="bx-a" x="290" y="24" width="180" height="34" rx="6"/>
+  <text class="mono" x="340" y="46" text-anchor="middle">histor</text>
+  <text class="mono" x="420" y="46" text-anchor="middle">peopl</text>
+  <path class="ln" d="M320 60 L135 96" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 60 V96" marker-end="url(#ar)"/>
+  <path class="ln" d="M440 60 L625 96" marker-end="url(#ar)"/>
+
+  <rect class="bx" x="20" y="100" width="230" height="40" rx="6"/>
+  <text class="mono" x="60" y="125" text-anchor="middle">brave</text><text class="mono on-a b" x="135" y="125" text-anchor="middle">fight</text><text class="mono" x="210" y="125" text-anchor="middle">gladiat</text>
+  <rect class="bx" x="265" y="100" width="230" height="40" rx="6"/>
+  <text class="mono on-a b" x="305" y="125" text-anchor="middle">histor</text><text class="mono" x="380" y="125" text-anchor="middle">live</text><text class="mono" x="455" y="125" text-anchor="middle">must</text>
+  <rect class="bx" x="510" y="100" width="230" height="40" rx="6"/>
+  <text class="mono" x="550" y="125" text-anchor="middle">peopl</text><text class="mono" x="630" y="125" text-anchor="middle">success</text><text class="mono" x="705" y="125" text-anchor="middle">war</text>
+
+  <text class="mono" x="60" y="164" text-anchor="middle">tr3</text>
+  <text class="mono on-a" x="135" y="164" text-anchor="middle">tr1</text><text class="mono on-a" x="135" y="182" text-anchor="middle">tr2</text><text class="mono on-a" x="135" y="200" text-anchor="middle">tr3</text>
+  <text class="mono" x="210" y="164" text-anchor="middle">tr1</text>
+  <text class="mono on-a" x="305" y="164" text-anchor="middle">tr1</text><text class="mono on-a" x="305" y="182" text-anchor="middle">tr2</text><text class="mono on-a" x="305" y="200" text-anchor="middle">tr3</text>
+  <text class="mono" x="380" y="164" text-anchor="middle">tr1</text>
+  <text class="mono" x="455" y="164" text-anchor="middle">tr1</text><text class="mono" x="455" y="182" text-anchor="middle">tr3</text>
+  <text class="mono" x="550" y="164" text-anchor="middle">tr3</text>
+  <text class="mono" x="630" y="164" text-anchor="middle">tr1</text><text class="mono" x="630" y="182" text-anchor="middle">tr3</text>
+  <text class="mono" x="705" y="164" text-anchor="middle">tr3</text>
+
+  <rect class="bx-d" x="20" y="214" width="720" height="30" rx="8"/>
+  <text class="sm" x="380" y="234" text-anchor="middle">tr1/tr2/tr3 = Gladiator / Saints and Soldiers / Braveheart。fight 和 histor 都指向这三行 → 求交集即得结果</text>
+</svg>
+<figcaption>图 6-11　GIN 索引：每个词素 → 包含它的行列表（对应原书图 6.1）</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; GIN 不存位置和权重</div>
+  <p>GIN 只存词素本身，不存位置信息和权重标签。查询如果需要这些信息（比如 <code>&lt;-&gt;</code>、<code>:A</code>），Postgres 要回表去取。如果大量查询依赖位置，可以考虑 <strong>RUM</strong> 索引：原理类似 GIN，但条目里还存了词素位置。它以扩展的形式提供。</p>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 6.16 · 在 tsvector 词素上创建 GIN 索引">
+<pre>
+CREATE INDEX idx_movie_lexemes_gin
+ON omdb.movies
+USING GIN (lexemes);
+</pre>
+</div>
+<div class="code out"><pre>
+ Bitmap Heap Scan on movies (actual time=0.088..0.099 rows=3 loops=1)
+   Recheck Cond: (lexemes @@ to_tsquery('historical & fight'::text))
+   Heap Blocks: exact=3
+   -> Bitmap Index Scan on idx_movie_lexemes_gin (actual time=0.067..0.067 rows=3 loops=1)
+         Index Cond: (lexemes @@ to_tsquery('historical & fight'::text))
+ Planning Time: 0.283 ms
+ Execution Time: 0.150 ms
+</pre></div>
+
+<p>从 15.3 ms 降到 0.15 ms，<strong>快了一百倍</strong>。先 Bitmap Index Scan 在索引里找出匹配的行、生成位图，再 Bitmap Heap Scan 回表取 id 和 name。</p>
+
+<h3>GiST 索引</h3>
+
+<p>
+  <strong>GiST</strong>（Generalized Search Tree，通用搜索树）是一种灵活的平衡树，常用于支持“包含、邻近、相似”这类运算的复杂类型：几何形状、全文词素、网络地址、范围类型等。
+  它怎么工作取决于被索引的类型。比如索引二维点时，它先用大的<strong>外接矩形</strong>把点分组放在根页，再逐层拆成更小的矩形，直到叶子存真正的点（第 10 章会细讲）。
+</p>
+
+<p>
+  索引 tsvector 时，GiST 构建的是一棵<strong>签名树（signature tree）</strong>：每个条目存一个代表文档的<strong>签名</strong>——一串 0/1 位。
+  单个词素的签名只有一位是 1；文档的签名是它所有词素签名的<strong>按位或（OR）</strong>。假设签名长 8 位：
+</p>
+
+<div class="tw"><table>
+<tr><th>词素 / 文档</th><th>签名</th></tr>
+<tr><td>“histor”</td><td><code>00000001</code></td></tr>
+<tr><td>“film”</td><td><code>10000000</code></td></tr>
+<tr><td>“gladiat”</td><td><code>01000000</code></td></tr>
+<tr><td>文档 “Gladiator is a historical film”</td><td><code>11000001</code>（三者按位或）</td></tr>
+</table></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="GiST 签名树：查找 histor（最后一位为 1）时访问的节点">
+  <text class="sm" x="40" y="34">第 1 层（根）</text>
+  <rect class="bx-a" x="230" y="12" width="300" height="34" rx="6"/>
+  <text class="mono on-a b" x="310" y="34" text-anchor="middle">0011110<tspan class="on-r">1</tspan></text>
+  <text class="mono on-a b" x="450" y="34" text-anchor="middle">1111000<tspan class="on-r">1</tspan></text>
+
+  <text class="sm" x="40" y="86">第 2 层</text>
+  <rect class="bx" x="40" y="92" width="300" height="34" rx="6"/>
+  <text class="mono" x="120" y="114" text-anchor="middle">00111100</text>
+  <text class="mono on-a b" x="260" y="114" text-anchor="middle">0010010<tspan class="on-r">1</tspan></text>
+  <rect class="bx" x="420" y="92" width="300" height="34" rx="6"/>
+  <text class="mono on-a b" x="500" y="114" text-anchor="middle">1111000<tspan class="on-r">1</tspan></text>
+  <text class="mono" x="640" y="114" text-anchor="middle">11010000</text>
+  <path class="ln-a" d="M310 48 L190 90" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M450 48 L570 90" marker-end="url(#ar-a)"/>
+
+  <text class="sm" x="40" y="162">第 3 层（叶子）</text>
+  <rect class="bx" x="40" y="168" width="140" height="56" rx="6"/>
+  <text class="mono" x="110" y="190" text-anchor="middle">00111000</text><text class="mono" x="110" y="212" text-anchor="middle">00001100</text>
+  <rect class="bx-a" x="200" y="168" width="140" height="56" rx="6"/>
+  <text class="mono on-g b" x="270" y="190" text-anchor="middle">0010010<tspan class="on-r">1</tspan> ✓</text><text class="mono" x="270" y="212" text-anchor="middle">00100100</text>
+  <rect class="bx-a" x="420" y="168" width="140" height="56" rx="6"/>
+  <text class="mono" x="490" y="190" text-anchor="middle">11110000</text><text class="mono on-g b" x="490" y="212" text-anchor="middle">1100000<tspan class="on-r">1</tspan> ✓</text>
+  <rect class="bx" x="580" y="168" width="140" height="56" rx="6"/>
+  <text class="mono" x="650" y="190" text-anchor="middle">11000000</text><text class="mono" x="650" y="212" text-anchor="middle">10010000</text>
+  <path class="ln" d="M120 128 L110 166"/>
+  <path class="ln-a" d="M260 128 L270 166" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M500 128 L490 166" marker-end="url(#ar-a)"/>
+  <path class="ln" d="M640 128 L650 166"/>
+
+  <rect class="bx-d" x="20" y="240" width="720" height="52" rx="8"/>
+  <text class="sm" x="380" y="260" text-anchor="middle">查找 histor（00000001）：只走最后一位是 1 的分支（橙色）。上层签名 = 下层签名的按位或。</text>
+  <text class="sm" x="380" y="280" text-anchor="middle">找到两份文档：11000001 就是 “Gladiator is a historical film”。签名可能碰撞，所以最终还要回表核实</text>
+</svg>
+<figcaption>图 6-12　GiST 签名树（对应原书图 6.2）</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 签名长度</div>
+  <p>默认签名长度是 124 字节，建索引时可以修改，最大 2024 字节。签名越长，扫描索引时误判（false positive）越少，但索引也越大。</p>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 6.17 · 在 tsvector 词素上创建 GiST 索引">
+<pre>
+CREATE INDEX idx_movie_lexemes_gist
+ON omdb.movies
+USING GIST (lexemes);
+
+-- 删掉 GIN 索引，确保实验时 Postgres 选择 GiST
+DROP INDEX omdb.idx_movie_lexemes_gin;
+</pre>
+</div>
+<div class="code out"><pre>
+ Index Scan using idx_movie_lexemes_gist on movies
+   (actual time=0.077..0.363 rows=3 loops=1)
+   Index Cond: (lexemes @@ to_tsquery('historical & fight'::text))
+ Planning Time: 0.985 ms
+ Execution Time: 0.395 ms
+</pre></div>
+
+<p>
+  GiST 的执行计划看起来比 GIN 简单（直接 Index Scan），但 GIN 反而<strong>快了一倍多</strong>（0.150 ms vs 0.395 ms）。
+  原因之一：GiST 找到签名匹配的文档后，还得回表确认词素真的存在 —— 不同词素可能在同一位上为 1，造成<strong>签名碰撞</strong>。把签名长度从默认的 124 字节加大，可以减少碰撞。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="全文搜索中 GIN 与 GiST 的取舍">
+  <rect class="bx-g" x="20" y="20" width="350" height="170" rx="12"/>
+  <text class="ttl on-g" x="195" y="46" text-anchor="middle">GIN ★ 首选</text>
+  <text class="sm" x="36" y="74">存的是真实的词素</text>
+  <text class="sm on-g" x="36" y="100">✓ 查询快，匹配文档多时尤其明显</text>
+  <text class="sm on-r" x="36" y="124">✗ 结构复杂，建索引和更新更慢</text>
+  <text class="sm on-r" x="36" y="148">✗ 占空间更多</text>
+  <text class="sm" x="36" y="176">适合：读多写少，要求查询快</text>
+
+  <rect class="bx-b" x="390" y="20" width="350" height="170" rx="12"/>
+  <text class="ttl on-b" x="565" y="46" text-anchor="middle">GiST</text>
+  <text class="sm" x="406" y="74">存的是位签名（有损）</text>
+  <text class="sm on-g" x="406" y="100">✓ 占空间小</text>
+  <text class="sm on-g" x="406" y="124">✓ 建索引和更新更快</text>
+  <text class="sm on-r" x="406" y="148">✗ 签名碰撞，需要回表核实，查询慢一些</text>
+  <text class="sm" x="406" y="176">适合：写入频繁，或在意索引大小</text>
+</svg>
+<figcaption>图 6-13　GIN vs GiST：查询速度与维护成本的取舍</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#128161; 需要更强的搜索？</div>
+  <p>如果 Postgres 核心的全文搜索还不够，可以看看 <a href="https://github.com/paradedb/paradedb/tree/main/pg_search">pg_search</a> 扩展，它提供了现代搜索引擎广泛使用的 BM25 相关度评分算法等高级功能。第 8 章还会用生成式 AI 进一步提升这个电影推荐服务的搜索能力。</p>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 内置了全文搜索，适合需要分析、查询文本内容的应用。</li>
+  <li>和其他全文搜索引擎一样，它对文档做<strong>分词</strong>和<strong>规范化</strong>，生成 <code>tsvector</code> 词素；查询也被规范化成 <code>tsquery</code>，用 <code>@@</code> 匹配。</li>
+  <li>全文搜索<strong>配置</strong>决定用哪个字典；生成列要显式指定配置。</li>
+  <li><code>plainto_tsquery</code> / <code>to_tsquery</code> / <code>websearch_to_tsquery</code> 构造查询；<code>ts_rank</code> + <code>setweight</code> 排序；<code>ts_headline</code> 高亮。</li>
+  <li><strong>GIN</strong> 和 <strong>GiST</strong> 是加速全文搜索的两种主要索引：GIN 查得快，GiST 小而易维护。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用 <code>ts_debug</code> 分析一句含邮箱和网址的话，比如 <code>'Contact me at a@b.com or https://postgresql.org'</code>，看看分别被识别成什么类型。</li>
+    <li>对比 <code>plainto_tsquery</code>、<code>phraseto_tsquery</code>、<code>websearch_to_tsquery</code> 处理 <code>'the lion king'</code> 和 <code>'"lion king" -witch'</code> 的结果。</li>
+    <li>把清单 6.11 里的 <code>ts_rank</code> 换成 <code>ts_rank_cd</code>，用 <code>'space &amp; station'</code> 搜索，观察排序有什么变化。</li>
+    <li>给 <code>ts_rank</code> 传入自定义权重 <code>'{0.1, 0.2, 0.1, 1.0}'</code>（降低简介 B 的权重），再搜一次 ghosts。</li>
+    <li>分别建 GIN 和 GiST 索引，用 <code>pg_relation_size</code> 比较两者大小。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

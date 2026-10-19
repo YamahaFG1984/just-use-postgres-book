@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 7 章 · Postgres 扩展 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="7">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 7 章 · 第三部分：扩展与生态</span>
+<h1>Postgres 扩展</h1>
+<p class="lede">
+  扩展是 Postgres 如此流行的主要原因之一。事实上，“Just use Postgres”这句口号很大程度上就是因为它丰富的扩展生态 ——
+  扩展让数据库能做的事远远超出前几章的范围。这一章快速巡览扩展生态，并动手用一个 Postgres 标准发行版自带的扩展。
+  后面四章会分别深入 pgvector、TimescaleDB、PostGIS 和 pgmq。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>了解 Postgres 可扩展性的由来，以及支撑它的三大技术基础</li>
+    <li>知道扩展的安装分两步：装到服务器上、在数据库里启用</li>
+    <li>会用 <code>pg_available_extensions</code>、<code>CREATE EXTENSION</code>、<code>DROP EXTENSION</code></li>
+    <li>用 pgcrypto 安全地存储和校验密码</li>
+    <li>对开发者常用的五类扩展有一张“地图”，并了解 Postgres 兼容方案</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="roots">Postgres 可扩展性的根源</h2>
+
+<p>
+  Postgres 起源于加州大学伯克利分校的研究项目，由图灵奖得主 Michael Stonebraker 领导。
+  在 2017 年的图灵奖访谈中，他讲了一个故事，解释为什么可扩展性是 Postgres 的立身之本：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="Postgres 可扩展性的由来">
+  <text class="ttl" x="20" y="22">20 世纪 80 年代初的研究论文</text>
+  <rect class="bx" x="20" y="34" width="150" height="90" rx="8"/>
+  <text class="sm" x="32" y="56">论文 A：</text><text class="sm" x="32" y="74">关系数据库理论上</text><text class="sm" x="32" y="92">很棒，但做地理数据</text><text class="sm" x="32" y="110">根本不行……</text>
+  <rect class="bx" x="182" y="34" width="150" height="90" rx="8"/>
+  <text class="sm" x="194" y="56">论文 B：</text><text class="sm" x="194" y="74">……做 X 场景</text><text class="sm" x="194" y="92">也不太行，于是我们</text><text class="sm" x="194" y="110">发明了一个补丁……</text>
+  <rect class="bx-d" x="344" y="34" width="90" height="90" rx="8"/>
+  <text class="ttl" x="389" y="84" text-anchor="middle">……</text>
+
+  <path class="ln-a" d="M440 79 H490" marker-end="url(#ar-a)"/>
+  <rect class="bx-a" x="494" y="20" width="246" height="118" rx="12"/>
+  <text class="ttl on-a" x="617" y="46" text-anchor="middle">Stonebraker 的结论</text>
+  <text class="sm" x="617" y="70" text-anchor="middle">与其一个个场景打补丁，</text>
+  <text class="sm" x="617" y="88" text-anchor="middle">不如让数据库本身<tspan class="b">可以被扩展</tspan>：</text>
+  <text class="sm" x="617" y="110" text-anchor="middle">“让用户能扩展数据类型、</text>
+  <text class="sm" x="617" y="126" text-anchor="middle">运算符和访问方法”</text>
+
+  <path class="ln-a" d="M617 140 V170" marker-end="url(#ar-a)"/>
+  <rect class="bx-g" x="20" y="174" width="720" height="50" rx="10"/>
+  <text class="ttl on-g" x="380" y="196" text-anchor="middle">40 年后：上百个扩展，向量、时序、地理、队列、分析……</text>
+  <text class="sm" x="380" y="214" text-anchor="middle">核心保守稳定，创新发生在扩展生态里</text>
+</svg>
+<figcaption>图 7-1　可扩展性是 Postgres 从第一天起就定下的设计目标</figcaption>
+</figure>
+
+<p>
+  80 年代初有几十篇研究论文都在说类似的事：关系数据库理论上很好，但在某个场景下效果不好，甚至完全不能用；然后论文介绍自己发明了什么来解决。
+  Stonebraker 由此看清：当时的关系数据库在商业数据处理之外表现不佳（对地理信息管理系统完全不适用），
+  应该有更好的办法让数据库适应特定场景，而不是去执行各种论文开出的一长串药方。
+  于是他的团队开始构建 Postgres，把<strong>可扩展性</strong>定为主要需求之一。从那以后，这项能力不断演进，让 Postgres 能适应今天的各种新场景。
+</p>
+
+<h2 id="start">开始使用扩展</h2>
+
+<p>Postgres 有几百个扩展，用途五花八门。如果核心 Postgres 缺少你需要的功能，很可能已经有扩展实现了。生态之所以这么丰富，是因为 Postgres 在设计上提供了三大基础：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="扩展的三大技术基础：系统目录、钩子、动态加载">
+  <rect class="bx-a" x="220" y="20" width="320" height="250" rx="14"/>
+  <text class="ttl on-a" x="380" y="46" text-anchor="middle">Postgres 数据库引擎</text>
+
+  <rect class="bx-b" x="240" y="62" width="280" height="56" rx="8"/>
+  <text class="ttl on-b" x="380" y="84" text-anchor="middle">系统目录（catalog）</text>
+  <text class="sm" x="380" y="104" text-anchor="middle">pg_type · pg_proc · pg_operator · pg_am …</text>
+
+  <rect class="bx" x="240" y="130" width="280" height="76" rx="8"/>
+  <text class="ttl" x="380" y="152" text-anchor="middle">查询处理流程</text>
+  <text class="sm" x="270" y="176" text-anchor="middle">认证</text>
+  <text class="sm" x="330" y="176" text-anchor="middle">解析</text>
+  <text class="sm" x="390" y="176" text-anchor="middle">规划</text>
+  <text class="sm" x="450" y="176" text-anchor="middle">执行</text>
+  <circle class="dot-p" cx="270" cy="192" r="5"/><circle class="dot-p" cx="390" cy="192" r="5"/><circle class="dot-p" cx="450" cy="192" r="5"/>
+  <path class="ln" d="M290 172 H310 M350 172 H370 M410 172 H430"/>
+
+  <rect class="bx-g" x="240" y="218" width="280" height="40" rx="8"/>
+  <text class="sm on-g b" x="380" y="243" text-anchor="middle">运行时动态加载共享库（.so）</text>
+
+  <rect class="bx-b" x="20" y="62" width="180" height="56" rx="8"/>
+  <text class="sm b" x="110" y="84" text-anchor="middle">① 目录驱动</text>
+  <text class="sm" x="110" y="104" text-anchor="middle">往目录里注册新类型、函数</text>
+  <path class="ln-b" d="M202 90 H236" marker-end="url(#ar-b)"/>
+
+  <rect class="bx-p" x="20" y="146" width="180" height="56" rx="8"/>
+  <text class="sm b" x="110" y="168" text-anchor="middle">② 钩子（hook）</text>
+  <text class="sm" x="110" y="188" text-anchor="middle">在预留的点插入自己的逻辑</text>
+  <path class="ln-p" d="M202 180 L264 192" marker-end="url(#ar-p)"/>
+
+  <rect class="bx-g" x="20" y="218" width="180" height="40" rx="8"/>
+  <text class="sm b" x="110" y="243" text-anchor="middle">③ 动态加载</text>
+  <path class="ln-g" d="M202 238 H236" marker-end="url(#ar-g)"/>
+
+  <rect class="bx" x="560" y="62" width="180" height="196" rx="10"/>
+  <text class="ttl" x="650" y="86" text-anchor="middle">一个扩展里有</text>
+  <text class="sm" x="576" y="112">• SQL 脚本：建类型、函数、</text>
+  <text class="sm" x="576" y="130">  运算符、索引方法……</text>
+  <text class="sm" x="576" y="156">• PL/pgSQL 逻辑</text>
+  <text class="sm" x="576" y="180">• C / Rust 编译的共享库</text>
+  <text class="sm" x="576" y="198">  （需要时才动态加载，</text>
+  <text class="sm" x="576" y="216">  不用重新编译数据库）</text>
+  <text class="sm" x="576" y="242">• 控制文件：名字、版本</text>
+</svg>
+<figcaption>图 7-2　扩展通过三种机制“插进”Postgres</figcaption>
+</figure>
+
+<ul>
+  <li><strong>目录驱动的操作</strong>：Postgres 把表、列、数据类型、函数等对象的信息存在<strong>系统目录（system catalog）</strong>里。它们和普通表差不多，只是存的是数据库内部的元数据。扩展可以读写系统目录，从而给 Postgres 添加新的数据类型和函数。</li>
+  <li><strong>数据库钩子</strong>：Postgres 代码里预留了一些钩子点，扩展可以在那里注入自定义逻辑，就像回调函数或事件监听器。比如扩展可以拦截查询规划、执行、认证等环节的钩子，处理特定事件或修改数据库行为。</li>
+  <li><strong>动态加载扩展逻辑</strong>：扩展可以用纯 SQL、PL/pgSQL 这类过程语言，或者 C、Rust 这类编译语言来写。SQL 和 PL/pgSQL 由数据库引擎直接解释，不需要外部库；编译语言写的扩展则在运行时动态加载共享库，<strong>不需要重新编译数据库引擎</strong>。</li>
+</ul>
+
+<p>使用扩展前，要先把它<strong>装到数据库服务器上</strong>，再在某个数据库（用 <code>CREATE DATABASE</code> 建的那种）里<strong>启用</strong>它：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="扩展安装的两个步骤：安装到服务器，在数据库中启用">
+  <text class="ttl on-b" x="20" y="22">第一步：让服务器上有这个扩展</text>
+  <rect class="bx-b" x="20" y="34" width="140" height="58" rx="8"/><text class="sm b" x="90" y="56" text-anchor="middle">随发行版自带</text><text class="sm" x="90" y="76" text-anchor="middle">pgcrypto 等 45 个</text>
+  <rect class="bx" x="170" y="34" width="140" height="58" rx="8"/><text class="sm b" x="240" y="56" text-anchor="middle">扩展仓库</text><text class="sm" x="240" y="76" text-anchor="middle">如 PGXN</text>
+  <rect class="bx" x="320" y="34" width="140" height="58" rx="8"/><text class="sm b" x="390" y="56" text-anchor="middle">预构建容器镜像</text><text class="sm" x="390" y="76" text-anchor="middle">第 8–11 章用这个</text>
+  <rect class="bx" x="470" y="34" width="130" height="58" rx="8"/><text class="sm b" x="535" y="56" text-anchor="middle">包管理器</text><text class="sm" x="535" y="76" text-anchor="middle">APT · DNF/YUM</text>
+  <rect class="bx" x="610" y="34" width="130" height="58" rx="8"/><text class="sm b" x="675" y="56" text-anchor="middle">二进制 / 源码</text><text class="sm" x="675" y="76" text-anchor="middle">自己编译</text>
+
+  <path class="ln-b" d="M380 96 V122" marker-end="url(#ar-b)"/>
+  <rect class="bx-a" x="20" y="126" width="720" height="150" rx="14"/>
+  <text class="ttl on-a" x="36" y="150">Postgres 服务器 · pg_available_extensions 列出可用的扩展</text>
+
+  <rect class="bx-g" x="40" y="166" width="210" height="96" rx="10"/>
+  <text class="ttl on-g" x="145" y="188" text-anchor="middle">数据库 postgres</text>
+  <text class="mono" x="145" y="212" text-anchor="middle">CREATE EXTENSION pgcrypto;</text>
+  <text class="sm on-g" x="145" y="236" text-anchor="middle">✓ 已启用：plpgsql、pgcrypto</text>
+  <text class="sm" x="145" y="252" text-anchor="middle">pg_extension / \dx 可查</text>
+
+  <rect class="bx" x="275" y="166" width="210" height="96" rx="10"/>
+  <text class="ttl" x="380" y="188" text-anchor="middle">数据库 coffee_chain</text>
+  <text class="sm" x="380" y="214" text-anchor="middle">没执行 CREATE EXTENSION</text>
+  <text class="sm on-r" x="380" y="236" text-anchor="middle">✗ 这里用不了 crypt()</text>
+
+  <rect class="bx-d" x="510" y="166" width="210" height="96" rx="10"/>
+  <text class="ttl on-a" x="615" y="188" text-anchor="middle">第二步</text>
+  <text class="sm" x="615" y="212" text-anchor="middle">在<tspan class="b">每个</tspan>要用的数据库里</text>
+  <text class="sm" x="615" y="230" text-anchor="middle">分别执行一次</text>
+  <text class="mono" x="615" y="252" text-anchor="middle">CREATE EXTENSION</text>
+</svg>
+<figcaption>图 7-3　安装扩展的两步：服务器级“可用”，数据库级“启用”</figcaption>
+</figure>
+
+<p>
+  有些扩展用得太普遍、太重要了，直接随标准 Postgres 发行版一起分发，存在专门的目录里，需要时直接启用即可。其他扩展可以通过以下途径装到服务器上：
+</p>
+
+<ul>
+  <li><strong>扩展仓库</strong>：很多扩展可以在 <a href="https://pgxn.org">PGXN</a> 这类仓库里找到并安装。</li>
+  <li><strong>预构建容器镜像</strong>：很多扩展作者提供了“标准 Postgres + 该扩展”的 Docker 镜像，部署很快。</li>
+  <li><strong>Linux 包管理器</strong>：热门扩展通常能用 APT（Debian/Ubuntu）或 DNF/YUM（RedHat/CentOS）安装。</li>
+  <li><strong>二进制或源码</strong>：都不行的话，就按维护者的说明从源码编译；有些提供方也会为特定操作系统提供二进制包。</li>
+</ul>
+
+<h3>查看可用的扩展</h3>
+
+<p><code>pg_available_extensions</code> 视图记录了服务器上可用的扩展。第 1 章的容器里什么都没加，也自带了 45 个：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*) FROM pg_available_extensions;
+-- 45
+
+\x on
+SELECT * FROM pg_available_extensions
+ORDER BY name
+LIMIT 5;
+</pre></div>
+<div class="code out"><pre>
+-[ RECORD 1 ]-----+-------------------------------------------------
+name              | amcheck
+default_version   | 1.4
+installed_version |
+comment           | functions for verifying relation integrity
+-[ RECORD 2 ]-----+-------------------------------------------------
+name              | autoinc
+default_version   | 1.0
+installed_version |
+comment           | functions for autoincrementing fields
+-[ RECORD 3 ]-----+-------------------------------------------------
+name              | bloom
+default_version   | 1.0
+installed_version |
+comment           | bloom access method - signature file-based index
+-[ RECORD 4 ]-----+-------------------------------------------------
+name              | btree_gin
+default_version   | 1.3
+installed_version |
+comment           | support for indexing common datatypes in GIN
+-[ RECORD 5 ]-----+-------------------------------------------------
+name              | btree_gist
+default_version   | 1.7
+installed_version |
+comment           | support for indexing common datatypes in GiST
+</pre></div>
+
+<ul>
+  <li><code>default_version</code>：服务器上可用的版本，不特别指定时就装这个版本。</li>
+  <li><code>installed_version</code>：<strong>当前连接的数据库</strong>里已启用的版本。为空表示服务器上有，但这个数据库还没启用。</li>
+</ul>
+
+<p>我们连的是 postgres 数据库（<code>\c</code> 可以确认）。看看这里已经启用了哪些：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM pg_available_extensions
+WHERE installed_version IS NOT NULL;
+</pre></div>
+<div class="code out"><pre>
+  name   | default_version | installed_version |        comment
+---------+-----------------+-------------------+------------------------------
+ plpgsql | 1.0             | 1.0               | PL/pgSQL procedural language
+(1 row)
+</pre></div>
+
+<p>只有 plpgsql —— 第 2 章写函数用的就是它。原来 PL/pgSQL 本身也是一个扩展！</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 查看已启用的扩展</div>
+  <p>查询 <code>pg_extension</code> 视图，或在 psql 里执行 <code>\dx</code>。</p>
+</div>
+
+<h3>安装和使用扩展：pgcrypto</h3>
+
+<p>
+  后面几章会用 Docker 镜像来完成第一步（把扩展装到服务器上）。这里先练习第二步：启用一个随发行版自带的扩展 <strong>pgcrypto</strong>。
+  它提供各种加密函数，让我们能在数据库里安全地存储和处理敏感数据。
+</p>
+
+<h4>启用 pgcrypto</h4>
+
+<div class="code" data-lang="sql" data-file="清单 7.1 · 查看 pgcrypto 扩展的版本">
+<pre>
+SELECT name, default_version, installed_version
+FROM pg_available_extensions
+WHERE name = 'pgcrypto';
+</pre>
+</div>
+<div class="code out"><pre>
+   name   | default_version | installed_version
+----------+-----------------+-------------------
+ pgcrypto | 1.3             |
+(1 row)
+</pre></div>
+
+<p>服务器上有 1.3 版，但当前数据库还没启用。启用只需一条命令：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION pgcrypto;
+</pre></div>
+
+<p>再执行清单 7.1，<code>installed_version</code> 变成了 1.3。<code>pg_extension</code> 视图只记录当前数据库已启用的扩展：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT extname, extversion FROM pg_extension;
+</pre></div>
+<div class="code out"><pre>
+ extname  | extversion
+----------+------------
+ plpgsql  | 1.0
+ pgcrypto | 1.3
+(2 rows)
+</pre></div>
+
+<h4>用 pgcrypto 安全存储密码</h4>
+
+<p>应用把用户名和密码哈希存在 accounts 表里：</p>
+
+<div class="code" data-lang="sql" data-file="清单 7.2 · 创建 accounts 表">
+<pre>
+CREATE TABLE accounts (
+    id SERIAL PRIMARY KEY,
+    username TEXT NOT NULL,
+    password_hash TEXT NOT NULL
+);
+</pre>
+</div>
+
+<p>新用户注册时：</p>
+
+<div class="code" data-lang="sql" data-file="清单 7.3 · 为新用户加密密码">
+<pre>
+INSERT INTO accounts (username, password_hash)
+VALUES ('ahamilton', crypt('SuperSecret123', gen_salt('bf')));
+</pre>
+</div>
+
+<ul>
+  <li><code>gen_salt('bf')</code>：用 Blowfish（bf）算法生成一个随机<strong>盐（salt）</strong>。每个新密码都要生成一个新的盐。为什么不用一个固定的盐？因为固定盐一旦泄露，攻击者可以一次性尝试破解所有密码；用随机盐，泄露一个盐只影响一个密码。</li>
+  <li><code>crypt(密码, 盐)</code>：把原始密码和盐组合起来算出安全的哈希。因为盐是随机的，就算两个人密码相同，哈希也不同。<strong>盐本身也存在哈希值里</strong>，以便以后验证。</li>
+</ul>
+
+<p>就算攻击者拿到了数据库，也看不到真实密码：</p>
+
+<div class="code out"><pre>
+ id | username  |                        password_hash
+----+-----------+--------------------------------------------------------------
+  1 | ahamilton | $2a$06$NzaPtzIucejO/LVefQRHuOAmW90LGKZf..l70dv48.vO9p/kSx/Qi
+(1 row)
+</pre></div>
+
+<p>第二天用户回来登录，输入用户名和密码，应用执行：</p>
+
+<div class="code" data-lang="sql" data-file="清单 7.4 · 用 pgcrypto 验证用户">
+<pre>
+SELECT username FROM accounts
+WHERE username = 'ahamilton'
+AND password_hash = crypt('SuperSecret123', password_hash);
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="加盐哈希：注册时生成随机盐并计算哈希；登录时从存储的哈希中取出盐重新计算并比较">
+  <text class="ttl on-b" x="20" y="22">注册</text>
+  <rect class="bx" x="20" y="34" width="150" height="40" rx="8"/><text class="mono" x="95" y="59" text-anchor="middle">SuperSecret123</text>
+  <rect class="bx-p" x="20" y="84" width="150" height="40" rx="8"/><text class="mono" x="95" y="102" text-anchor="middle">gen_salt('bf')</text><text class="sm" x="95" y="118" text-anchor="middle">随机盐 NzaPtz…</text>
+  <path class="ln" d="M172 54 Q210 54 230 76" marker-end="url(#ar)"/>
+  <path class="ln" d="M172 104 Q210 104 230 88" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="234" y="60" width="110" height="44" rx="8"/><text class="mono on-a" x="289" y="87" text-anchor="middle">crypt()</text>
+  <path class="ln-a" d="M346 82 H380" marker-end="url(#ar-a)"/>
+  <rect class="bx-g" x="384" y="50" width="356" height="64" rx="8"/>
+  <text class="mono" x="396" y="74"><tspan class="on-p">$2a$06$</tspan><tspan class="on-p b">NzaPtzIucejO/LVefQRHuO</tspan>AmW90LGKZf…</text>
+  <text class="sm" x="396" y="96">算法 · 成本 · <tspan class="on-p b">盐</tspan> · 哈希 —— 都存在 password_hash 一列里</text>
+
+  <text class="ttl on-g" x="20" y="160">登录</text>
+  <rect class="bx" x="20" y="172" width="150" height="40" rx="8"/><text class="mono" x="95" y="197" text-anchor="middle">用户输入的密码</text>
+  <rect class="bx-g" x="20" y="222" width="150" height="40" rx="8"/><text class="sm" x="95" y="240" text-anchor="middle">存储的 password_hash</text><text class="sm" x="95" y="255" text-anchor="middle">（从中取出盐）</text>
+  <path class="ln" d="M172 192 Q210 192 230 214" marker-end="url(#ar)"/>
+  <path class="ln" d="M172 242 Q210 242 230 226" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="234" y="198" width="110" height="44" rx="8"/><text class="mono on-a" x="289" y="225" text-anchor="middle">crypt()</text>
+  <path class="ln-a" d="M346 220 H380" marker-end="url(#ar-a)"/>
+  <rect class="bx" x="384" y="198" width="160" height="44" rx="8"/><text class="sm" x="464" y="225" text-anchor="middle">新算出的哈希</text>
+  <text class="ttl" x="566" y="226" text-anchor="middle">=</text>
+  <rect class="bx-g" x="590" y="182" width="150" height="34" rx="8"/><text class="sm on-g" x="665" y="204" text-anchor="middle">相等 → 登录成功</text>
+  <rect class="bx-r" x="590" y="224" width="150" height="34" rx="8"/><text class="sm on-r" x="665" y="246" text-anchor="middle">不等 → 0 rows</text>
+</svg>
+<figcaption>图 7-4　加盐哈希：数据库里永远不存明文密码</figcaption>
+</figure>
+
+<p>
+  这次把用户输入的原始密码和<strong>已存储的 password_hash</strong> 一起传给 crypt：函数从存储的哈希里取出盐，用它对输入的密码再算一次哈希。
+  算出来的和存的一样，就返回用户名，登录成功。如果用户把密码输成 SuperSecret1243，哈希对不上，返回空结果（0 rows），应用就可以提示密码错误。
+</p>
+
+<h4>停用 pgcrypto</h4>
+
+<p>不需要某个扩展时，用 <code>DROP EXTENSION</code> 在当前数据库里停用它：</p>
+
+<div class="code" data-lang="sql"><pre>
+DROP EXTENSION pgcrypto;
+
+SELECT extname, extversion FROM pg_extension;
+-- 只剩 plpgsql
+</pre></div>
+
+<p>没了 pgcrypto，再用 crypt 验证用户就会报错：</p>
+
+<div class="code out"><pre>
+ERROR: function crypt(unknown, text) does not exist
+LINE 3: AND password_hash = crypt('SuperSecret123', password_hash);
+                            ^
+HINT: No function matches the given name and argument types.
+You might need to add explicit type casts.
+</pre></div>
+
+<p>改主意了？再 <code>CREATE EXTENSION pgcrypto;</code> 就行。</p>
+
+<div class="box warn">
+  <div class="t">&#9888; DROP EXTENSION 会连带删除</div>
+  <p>扩展创建的类型、函数、运算符都会随 <code>DROP EXTENSION</code> 一起删除。如果你的表用了扩展提供的类型（比如第 8 章 pgvector 的 <code>vector</code> 列），删除扩展会失败，加上 <code>CASCADE</code> 则会<strong>连那些列一起删掉</strong>。生产环境务必谨慎。</p>
+</div>
+
+<h2 id="essentials">开发者必备的扩展</h2>
+
+<p>扩展没有官方分类，但我们可以按自己的标准分成五组，帮你扩充工具箱：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 430" role="img" aria-label="开发者常用扩展的五个类别">
+  <rect class="bx-a" x="290" y="190" width="180" height="52" rx="12"/>
+  <text class="ttl on-a" x="380" y="213" text-anchor="middle">Postgres</text>
+  <text class="sm" x="380" y="231" text-anchor="middle">+ 扩展生态</text>
+
+  <rect class="bx-g" x="20" y="20" width="350" height="150" rx="12"/>
+  <text class="ttl on-g" x="36" y="44">① 超越关系型</text>
+  <text class="mono" x="36" y="70">pgvector · pgai · pgvectorscale</text><text class="sm" x="290" y="70">AI · 第 8 章</text>
+  <text class="mono" x="36" y="92">TimescaleDB</text><text class="sm" x="290" y="92">时序 · 第 9 章</text>
+  <text class="mono" x="36" y="114">PostGIS</text><text class="sm" x="290" y="114">地理 · 第 10 章</text>
+  <text class="mono" x="36" y="136">pgmq</text><text class="sm" x="290" y="136">队列 · 第 11 章</text>
+  <text class="mono" x="36" y="158">pg_duckdb</text><text class="sm" x="290" y="158">分析（列存）</text>
+
+  <rect class="bx-p" x="390" y="20" width="350" height="150" rx="12"/>
+  <text class="ttl on-p" x="406" y="44">② 编程与过程语言</text>
+  <text class="mono" x="406" y="70">PLV8</text><text class="sm" x="520" y="70">用 JavaScript 写数据库函数</text>
+  <text class="sm" x="520" y="88">（可配合 PgCompute 客户端库）</text>
+  <text class="mono" x="406" y="112">PL/Java · PL/Python</text>
+  <text class="mono" x="406" y="132">PL/Rust · PL/dotnet · PL/PHP</text>
+  <text class="mono" x="406" y="152">PL/Perl · PL/R · PL/Haskell</text>
+
+  <rect class="bx-b" x="20" y="262" width="230" height="150" rx="12"/>
+  <text class="ttl on-b" x="36" y="286">③ 连接器与外部数据包装器</text>
+  <text class="mono" x="36" y="312">file_fdw</text><text class="sm" x="120" y="312">查文件</text>
+  <text class="mono" x="36" y="336">postgres_fdw</text>
+  <text class="mono" x="36" y="354">mysql_fdw · oracle_fdw</text>
+  <text class="mono" x="36" y="372">sqlite_fdw</text>
+  <text class="mono" x="36" y="396">redis_fdw · kafka_fdw …</text>
+
+  <rect class="bx" x="265" y="262" width="230" height="150" rx="12"/>
+  <text class="ttl" x="281" y="286">④ 查询与性能优化</text>
+  <text class="mono" x="281" y="312">pg_stat_statements</text>
+  <text class="sm" x="281" y="330">统计所有 SQL 的执行情况</text>
+  <text class="mono" x="281" y="354">auto_explain</text>
+  <text class="sm" x="281" y="372">自动记录慢查询的执行计划</text>
+  <text class="mono" x="281" y="396">hypopg</text><text class="sm" x="340" y="396">假想索引</text>
+
+  <rect class="bx-r" x="510" y="262" width="230" height="150" rx="12"/>
+  <text class="ttl on-r" x="526" y="286">⑤ 工具与实用程序</text>
+  <text class="mono" x="526" y="312">pg_cron</text><text class="sm" x="600" y="312">定时任务</text>
+  <text class="mono" x="526" y="336">PostgreSQL Anonymizer</text>
+  <text class="sm" x="526" y="354">敏感数据脱敏</text>
+  <text class="mono" x="526" y="378">pgaudit</text><text class="sm" x="600" y="378">审计日志</text>
+  <text class="mono" x="526" y="400">pg_partman</text><text class="sm" x="612" y="400">分区管理</text>
+
+  <path class="ln" d="M330 188 L250 172"/><path class="ln" d="M430 188 L510 172"/>
+  <path class="ln" d="M320 244 L180 260"/><path class="ln" d="M380 244 V260"/><path class="ln" d="M440 244 L580 260"/>
+</svg>
+<figcaption>图 7-5　开发者常用扩展地图（对应原书封二、封三的扩展清单）</figcaption>
+</figure>
+
+<h3>① 超越关系型</h3>
+
+<p>前几章已经看到，核心 Postgres 支持 JSON 和全文搜索，但那只是冰山一角，大部分非关系型能力来自扩展：</p>
+
+<ul>
+  <li><strong>pgvector、pgai、pgvectorscale</strong> 让 Postgres 支持生成式 AI 和其他 AI/ML 工作负载，实际上把它变成了<strong>向量数据库</strong>。pgai 能直接在 Postgres 里生成嵌入、调用大模型、跑完整的 RAG 流程；pgvectorscale 通过 StreamingDiskANN 索引、统计二值量化等优化，让大规模向量搜索更省钱、更快。第 8 章详细讲。</li>
+  <li><strong>TimescaleDB</strong>：轻松存储和分析海量时序和事件数据。第 9 章。</li>
+  <li><strong>PostGIS</strong>：把 Postgres 变成能存储、索引、查询地理空间数据的数据库。第 10 章。</li>
+  <li><strong>pgmq</strong>：把 Postgres 当作轻量级消息队列，持久化并投递消息和事件。第 11 章。</li>
+  <li><strong>pg_duckdb</strong>：嵌入 DuckDB 的列式向量化存储引擎，为 Postgres 提供高性能分析能力。</li>
+</ul>
+
+<h3>② 编程与过程语言</h3>
+
+<p>第 2 章用 PL/pgSQL 写了函数，但你不必成为 PL/pgSQL 专家。大多数情况下都能找到扩展，让你用自己熟悉的语言写数据库函数：</p>
+
+<ul>
+  <li><strong>PLV8</strong> 把 V8 JavaScript 引擎嵌进 Postgres，可以用 JavaScript 写数据库逻辑、从 SQL 调用。配合 PgCompute 客户端库，还能绕过 SQL，从应用直接在数据库上执行 JavaScript 函数。</li>
+  <li><strong>PL/Java、PL/Python、PL/Rust</strong> 等分别让你用 Java、Python、Rust 写函数、过程和触发器。</li>
+</ul>
+
+<div class="code" data-lang="sql"><pre>
+-- 示意：用 PLV8 写一个 JavaScript 函数（需要先安装 plv8 扩展）
+CREATE EXTENSION plv8;
+
+CREATE FUNCTION js_upper(s text) RETURNS text AS $$
+    return s.toUpperCase();
+$$ LANGUAGE plv8;
+
+SELECT js_upper('just use postgres');   -- JUST USE POSTGRES
+</pre></div>
+
+<h3>③ 连接器与外部数据包装器（FDW）</h3>
+
+<p>
+  这类扩展让 Postgres 连接外部数据源，用标准 SQL 透明地查询远程数据，就像查本地的表一样。Postgres 由此成为一个<strong>统一的数据层</strong>，甚至能从本身不支持 SQL 的数据源拉数据：
+</p>
+
+<ul>
+  <li><strong>file_fdw</strong>：查询文件系统里的数据。</li>
+  <li><strong>postgres_fdw、mysql_fdw、oracle_fdw、sqlite_fdw</strong>：连接并查询远程 Postgres、MySQL、Oracle、SQLite。</li>
+  <li><strong>redis_fdw、parquet_s3_fdw、kafka_fdw</strong>：从 Redis、S3、Kafka 这些非 SQL 数据源获取数据。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="外部数据包装器让 Postgres 成为统一数据层">
+  <rect class="bx-p" x="20" y="74" width="140" height="52" rx="10"/>
+  <text class="ttl on-p" x="90" y="98" text-anchor="middle">应用</text>
+  <text class="sm" x="90" y="116" text-anchor="middle">只写 SQL</text>
+  <path class="ln-p" d="M162 100 H210" marker-end="url(#ar-p)"/>
+  <rect class="bx-a" x="214" y="40" width="200" height="120" rx="12"/>
+  <text class="ttl on-a" x="314" y="66" text-anchor="middle">Postgres</text>
+  <text class="sm" x="314" y="88" text-anchor="middle">本地表</text>
+  <text class="sm" x="314" y="106" text-anchor="middle">+ 外部表（foreign table）</text>
+  <text class="mono" x="314" y="132" text-anchor="middle">SELECT … JOIN …</text>
+  <text class="sm" x="314" y="150" text-anchor="middle">跨数据源</text>
+  <path class="ln-b" d="M416 60 L500 36" marker-end="url(#ar-b)"/>
+  <path class="ln-b" d="M416 86 L500 78" marker-end="url(#ar-b)"/>
+  <path class="ln-b" d="M416 112 L500 120" marker-end="url(#ar-b)"/>
+  <path class="ln-b" d="M416 140 L500 162" marker-end="url(#ar-b)"/>
+  <rect class="bx-b" x="504" y="20" width="236" height="32" rx="6"/><text class="sm" x="514" y="41">mysql_fdw · oracle_fdw · sqlite_fdw</text>
+  <rect class="bx-b" x="504" y="62" width="236" height="32" rx="6"/><text class="sm" x="514" y="83">postgres_fdw → 另一台 Postgres</text>
+  <rect class="bx-b" x="504" y="104" width="236" height="32" rx="6"/><text class="sm" x="514" y="125">redis_fdw · kafka_fdw · parquet_s3_fdw</text>
+  <rect class="bx-b" x="504" y="146" width="236" height="32" rx="6"/><text class="sm" x="514" y="167">file_fdw → CSV 等文件</text>
+</svg>
+<figcaption>图 7-6　FDW：外部数据看起来就像本地的表</figcaption>
+</figure>
+
+<h3>④ 查询与性能优化</h3>
+
+<ul>
+  <li><strong>pg_stat_statements</strong>：跟踪 Postgres 执行过的所有 SQL 语句的规划和执行统计（附录 A 会用到）。</li>
+  <li><strong>auto_explain</strong>：自动记录慢查询的执行计划，不用手动跑 <code>EXPLAIN ANALYZE</code> 就能诊断性能问题。</li>
+  <li><strong>hypopg</strong>：支持<strong>假想索引</strong>，不用真的建索引就能测试不同的索引策略。</li>
+</ul>
+
+<h3>⑤ 工具与实用程序</h3>
+
+<ul>
+  <li><strong>pg_cron</strong>：运行在 Postgres 内部的 cron 定时调度器，自动执行例行任务（比如第 2 章提到的定时刷新物化视图）。</li>
+  <li><strong>PostgreSQL Anonymizer</strong>：用动态脱敏、假名化等技术对个人和敏感数据做匿名或遮蔽。</li>
+  <li><strong>pgaudit</strong>：通过 Postgres 的标准日志功能提供详细的会话级和对象级审计日志。</li>
+  <li><strong>pg_partman</strong>：简化基于时间和基于数字的表分区的创建和管理（第 11 章讲分区时会提到）。</li>
+</ul>
+
+<p>
+  这份清单远不完整，但足以说明扩展把数据库的边界推得多远。这一切得益于 Postgres 的可扩展设计：
+  <strong>相对保守的核心引擎</strong> + <strong>让它始终站在创新前沿的扩展生态</strong>，两者达成了恰到好处的平衡。
+</p>
+
+<h2 id="compatible">Postgres 兼容方案</h2>
+
+<p>
+  Postgres 发展得太快，以至于它的通信协议、功能、源代码被很多<strong>不属于扩展</strong>的方案所采用。
+  这些“Postgres 兼容方案”提供了 Postgres 本身和任何扩展都没有的能力。
+</p>
+
+<p>
+  它们通常针对某一类很难或无法用扩展解决的问题：可能 Postgres 没有提供需要的钩子，也可能方案的架构和 Postgres 差别太大，做成扩展不现实。
+  于是要么<strong>从零构建</strong>，支持 Postgres 的<strong>线协议</strong>和部分功能；要么<strong>基于 Postgres 源码</strong>做修改。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 什么是线协议（wire-level protocol）</div>
+  <p>Postgres 线协议定义了 Postgres 客户端和服务器之间通信用的消息格式和命令。应用发出的每一条 SQL 命令都按这个协议传输和处理。支持线协议，意味着 psql、各语言的 Postgres 驱动、ORM 可以直接连上去。</p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="从扩展到兼容数据库的谱系">
+  <path class="ln-d" d="M40 40 H720" marker-end="url(#ar)"/>
+  <text class="sm" x="40" y="30">与 Postgres 共享得越多</text>
+  <text class="sm" x="720" y="30" text-anchor="end">架构差异越大</text>
+
+  <rect class="bx-a" x="20" y="56" width="230" height="180" rx="12"/>
+  <text class="ttl on-a" x="135" y="80" text-anchor="middle">扩展</text>
+  <text class="sm" x="135" y="102" text-anchor="middle">运行在原版 Postgres 里</text>
+  <text class="sm" x="36" y="132">pgvector · PostGIS</text>
+  <text class="sm" x="36" y="152">TimescaleDB · pgmq …</text>
+  <text class="sm" x="36" y="186">首选：能用扩展解决的</text>
+  <text class="sm" x="36" y="204">就用扩展</text>
+
+  <rect class="bx-b" x="265" y="56" width="230" height="180" rx="12"/>
+  <text class="ttl on-b" x="380" y="80" text-anchor="middle">基于 Postgres 源码改造</text>
+  <text class="sm" x="380" y="102" text-anchor="middle">复用大部分源码，改存储层等</text>
+  <text class="sm" x="281" y="132">Neon（Serverless）</text>
+  <text class="sm" x="281" y="152">YugabyteDB（分布式）</text>
+  <text class="sm" x="281" y="186">现有 Postgres 应用基本</text>
+  <text class="sm" x="281" y="204">不用改就能跑</text>
+
+  <rect class="bx-p" x="510" y="56" width="230" height="180" rx="12"/>
+  <text class="ttl on-p" x="625" y="80" text-anchor="middle">从零构建 + 兼容协议</text>
+  <text class="sm" x="625" y="102" text-anchor="middle">支持线协议、DML/DDL 语法</text>
+  <text class="sm" x="625" y="118" text-anchor="middle">和部分功能</text>
+  <text class="sm" x="526" y="146">Google Spanner</text>
+  <text class="sm" x="526" y="166">CockroachDB（分布式）</text>
+  <text class="sm" x="526" y="196">可复用部分 Postgres</text>
+  <text class="sm" x="526" y="214">工具和框架</text>
+</svg>
+<figcaption>图 7-7　Postgres 兼容方案的谱系</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Google Spanner</strong> 和 <strong>CockroachDB</strong> 是从零构建的分布式 Postgres 兼容数据库，支持 Postgres 线协议、DML 和 DDL 语法以及部分 Postgres 功能。因此可以复用一部分现有的 Postgres 第三方工具和框架，同时构建可扩展、高可用的应用。</li>
+  <li><strong>Neon</strong>（Serverless 数据库）和 <strong>YugabyteDB</strong>（分布式数据库）基于 Postgres 源码构建，在存储层做了修改和增强。它们复用了大部分源码，现有的 Postgres 应用可以原样运行，或者只需很少的迁移工作；大多数 Postgres 库、工具、框架也都能继续用。</li>
+</ul>
+
+<p>所以，如果某个问题用 Postgres 和扩展都解决不了，可以看看兼容方案 —— 它们可能正好有你需要的，同时你的 Postgres 技能依然能派上用场。</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>可扩展性是 Postgres 最初的主要设计需求之一。</li>
+  <li>Postgres 通过<strong>目录驱动的操作</strong>、<strong>数据库钩子</strong>和<strong>动态加载外部逻辑</strong>实现可扩展。</li>
+  <li>扩展可以通过扩展仓库、包管理器、预构建容器镜像安装，或从源码构建；标准发行版自带几十个扩展。</li>
+  <li>安装分两步：装到服务器（<code>pg_available_extensions</code> 可见），再用 <code>CREATE EXTENSION</code> 在每个数据库里启用（<code>pg_extension</code> / <code>\dx</code> 可见）。</li>
+  <li>开发者可以用大量扩展超越关系型负载、查询远程数据源、简化查询优化等。</li>
+  <li>Postgres 兼容方案解决扩展难以解决的特定问题：要么支持线协议和部分功能，要么基于 Postgres 源码修改。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>列出你的容器里全部 45 个可用扩展，挑三个你没听说过的，看看 comment 写的是做什么的。</li>
+    <li>在第 2 章的 coffee_chain 数据库里启用 pgcrypto，用 <code>crypt</code> + <code>gen_salt('bf')</code> 改造 <code>customers.accounts</code> 的 <code>passwd_hash</code>（原来存的是不安全的 MD5）。</li>
+    <li>用 <code>gen_random_bytes(16)</code> 和 <code>encode(…, 'hex')</code> 生成一个随机 API 密钥。</li>
+    <li>启用随发行版自带的 <code>pg_stat_statements</code>（提示：需要先在 <code>shared_preload_libraries</code> 里配置并重启），跑几条查询后查看 <code>pg_stat_statements</code> 视图。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

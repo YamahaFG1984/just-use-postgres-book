@@ -1,0 +1,802 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 1 章 · 认识 Postgres — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="1">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 1 章</span>
+<h1>认识 Postgres</h1>
+<p class="lede">
+  PostgreSQL（大家通常简称 Postgres）是增长最快的数据库之一。
+  这一章先回答“它为什么这么火”“‘就用 Postgres’到底是什么意思”，
+  然后带你在 10 分钟内用 Docker 跑起一个数据库，用一条 SQL 造出 1000 行数据，再跑几个查询。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>知道 Postgres 流行的三个原因：开源、企业级、可扩展</li>
+    <li>理解“Just use Postgres”这句口号的正确打开方式</li>
+    <li>用 Docker 启动 Postgres，用 <code>psql</code> 连上去</li>
+    <li>用 <code>generate_series</code> 和 <code>random</code> 生成模拟数据</li>
+    <li>写出计数、分组、排序、取前 N 名这几类最常用的查询</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="what">Postgres 是什么</h2>
+
+<p>
+  Postgres 首先是一个<strong>关系型数据库</strong>：数据存在一张张“表”里，用 SQL（结构化查询语言）来读写。
+  它特别擅长 <strong>OLTP</strong>（Online Transaction Processing，联机事务处理）——
+  也就是“大量用户同时发来小请求，每个都要快速、准确地处理”的那类场景。
+  订机票、超市刷卡付款、发一条朋友圈，背后都是 OLTP。
+</p>
+
+<p>
+  OLTP 最看重的是：<strong>就算数据库服务器在操作中途突然崩溃，数据也不能乱</strong>。
+  钱扣了但订单没生成、库存减了但没发货 —— 这种事绝对不能发生。
+</p>
+
+<p>
+  但这些年 Postgres 早已不只是“关系型数据库”。借助丰富的<strong>扩展（extension）</strong>生态，
+  它还能做全文搜索、时间序列、生成式 AI、地理空间、数据分析……
+  这本书就是带你把这些能力一个个亲手试一遍。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="Postgres 以关系型核心为中心，向外延伸出多种工作负载">
+  <rect class="bx-a" x="270" y="120" width="220" height="90" rx="14"/>
+  <text class="ttl on-a" x="380" y="152" text-anchor="middle">Postgres 核心</text>
+  <text class="sm" x="380" y="174" text-anchor="middle">表 · SQL · 事务 · 索引</text>
+  <text class="sm" x="380" y="192" text-anchor="middle">（第 1–4 章）</text>
+
+  <rect class="bx-b" x="30"  y="30" width="190" height="56" rx="10"/>
+  <text class="ttl on-b" x="125" y="54" text-anchor="middle">JSON 文档</text>
+  <text class="sm" x="125" y="74" text-anchor="middle">第 5 章 · JSONB</text>
+
+  <rect class="bx-b" x="285" y="20" width="190" height="56" rx="10"/>
+  <text class="ttl on-b" x="380" y="44" text-anchor="middle">全文搜索</text>
+  <text class="sm" x="380" y="64" text-anchor="middle">第 6 章 · tsvector</text>
+
+  <rect class="bx-g" x="540" y="30" width="190" height="56" rx="10"/>
+  <text class="ttl on-g" x="635" y="54" text-anchor="middle">生成式 AI</text>
+  <text class="sm" x="635" y="74" text-anchor="middle">第 8 章 · pgvector</text>
+
+  <rect class="bx-g" x="30"  y="244" width="190" height="56" rx="10"/>
+  <text class="ttl on-g" x="125" y="268" text-anchor="middle">时间序列</text>
+  <text class="sm" x="125" y="288" text-anchor="middle">第 9 章 · TimescaleDB</text>
+
+  <rect class="bx-g" x="285" y="254" width="190" height="56" rx="10"/>
+  <text class="ttl on-g" x="380" y="278" text-anchor="middle">地理空间</text>
+  <text class="sm" x="380" y="298" text-anchor="middle">第 10 章 · PostGIS</text>
+
+  <rect class="bx-g" x="540" y="244" width="190" height="56" rx="10"/>
+  <text class="ttl on-g" x="635" y="268" text-anchor="middle">消息队列</text>
+  <text class="sm" x="635" y="288" text-anchor="middle">第 11 章 · pgmq</text>
+
+  <path class="ln" d="M220 70 L300 124"/>
+  <path class="ln" d="M380 78 V118"/>
+  <path class="ln" d="M540 70 L460 124"/>
+  <path class="ln" d="M220 262 L300 206"/>
+  <path class="ln" d="M380 212 V252"/>
+  <path class="ln" d="M540 262 L460 206"/>
+
+  <rect class="bx-b" x="610" y="140" width="14" height="14" rx="3"/>
+  <text class="sm" x="630" y="152">内置能力</text>
+  <rect class="bx-g" x="610" y="166" width="14" height="14" rx="3"/>
+  <text class="sm" x="630" y="178">靠扩展实现</text>
+</svg>
+<figcaption>图 1-1　一个关系型核心，加上内置能力和扩展，覆盖多种工作负载 —— 这也是全书的结构</figcaption>
+</figure>
+
+<h2 id="popular">为什么 Postgres 这么流行</h2>
+
+<p>
+  如今的数据库有好几百种。DB-Engines 网站统计了 420 多个数据库系统，Postgres 多年稳居第四；
+  而且从 2013 年至今的趋势看，排前三的 Oracle、MySQL、SQL Server 热度停滞甚至下滑，Postgres 却一路走高。
+  在 Stack Overflow 的年度开发者调查里，Postgres 在 2023、2024、2025 连续三年被评为
+  <strong>最受欢迎、最受喜爱、最想用</strong>的数据库。
+</p>
+
+<p>为什么？主要有三点：</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#127891;</span><h4>开源，社区治理</h4><p>起源于加州大学伯克利分校的研究项目，由图灵奖得主 Michael Stonebraker 领导。1994 年开源，1996 年起由全球开发组维护，没有任何一家厂商能独自控制它。</p></div>
+  <div class="card"><span class="ic">&#127970;</span><h4>企业级可靠</h4><p>35 年打磨。每年一个大版本，但社区坚持“小步改进、不搞大改”，版本间回归少、稳定。再加上大量厂商、云服务和顾问提供商业支持。</p></div>
+  <div class="card"><span class="ic">&#129513;</span><h4>天生可扩展</h4><p>Stonebraker 在最初的设计论文里就写下目标：“让用户能扩展数据类型、运算符和访问方法。”核心保守，创新都发生在扩展生态里。</p></div>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 什么叫“访问方法”</div>
+  <p>
+    “访问方法”（access method）可以粗略理解为<strong>索引的类型</strong>。
+    普通数据库只有 B-tree 等少数几种索引；Postgres 允许扩展自己定义新的索引结构。
+    第 8 章的向量索引 HNSW、第 10 章的空间索引 GiST，都是这种设计的成果。
+  </p>
+</div>
+
+<h2 id="just-use">“Just use Postgres！”到底是什么意思</h2>
+
+<p>
+  随着 Postgres 能做的事越来越多，在技术社区里越来越常听到一句话：“Just use Postgres!”（就用 Postgres！）。
+  它渐渐成了 Postgres 社区的口号。
+</p>
+
+<p>
+  <strong>这是不是说 Postgres 成了瑞士军刀、是你唯一需要的数据库？当然不是。</strong>
+  正确的理解是一个很朴素的建议：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="“就用 Postgres”的决策流程">
+  <rect class="bx" x="20" y="20" width="230" height="64" rx="10"/>
+  <text class="ttl" x="135" y="46" text-anchor="middle">团队已经在用 Postgres</text>
+  <text class="sm" x="135" y="66" text-anchor="middle">来了一个新需求：地理、AI、时序…</text>
+
+  <path class="ln-d" d="M252 52 H300" marker-end="url(#ar)"/>
+
+  <rect class="bx-a" x="304" y="14" width="200" height="76" rx="10"/>
+  <text class="ttl on-a" x="404" y="44" text-anchor="middle">先查查：</text>
+  <text class="lbl" x="404" y="66" text-anchor="middle">Postgres 能搞定吗？</text>
+
+  <path class="ln-g" d="M506 40 H560" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="512" y="32">能</text>
+  <rect class="bx-g" x="564" y="10" width="180" height="62" rx="10"/>
+  <text class="ttl on-g" x="654" y="36" text-anchor="middle">就用 Postgres</text>
+  <text class="sm" x="654" y="56" text-anchor="middle">少学、少运维一个系统</text>
+
+  <path class="ln-r" d="M404 92 V140 H560" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="412" y="126">不太行</text>
+  <rect class="bx-r" x="564" y="110" width="180" height="62" rx="10"/>
+  <text class="ttl on-r" x="654" y="136" text-anchor="middle">没关系</text>
+  <text class="sm" x="654" y="156" text-anchor="middle">引入更合适的专用数据库</text>
+
+  <rect class="bx-d" x="20" y="200" width="724" height="52" rx="10"/>
+  <text class="lbl" x="382" y="222" text-anchor="middle">关键不在于“只能用 Postgres”，而在于：在往技术栈里塞第二个数据库之前，</text>
+  <text class="lbl" x="382" y="240" text-anchor="middle">先认真确认一下手头的 Postgres 能不能解决。附录 B 会讲哪些场景不适合 Postgres。</text>
+</svg>
+<figcaption>图 1-2　“Just use Postgres”是一个经验之谈，而不是教条</figcaption>
+</figure>
+
+<p>
+  如果发现 Postgres 就能胜任，你就省掉了“在生产环境里学习并运维两套甚至更多数据库系统”的成本。
+  如果发现不行，那就换一个更合适的。选择权永远在你。
+  这本书的目标，就是让你亲眼看到 Postgres 的全部潜力，从而做出更好的判断。
+</p>
+
+<h2 id="docker">用 Docker 启动 Postgres</h2>
+
+<p>
+  Postgres 85% 以上的代码是用 C 写的，官方为 Windows 和各种类 Unix 系统都提供了安装包
+  （见 <a href="https://www.postgresql.org/download/">postgresql.org/download</a>）。
+  但本书统一使用 <strong>Docker</strong>：一条命令、一分钟以内就能拉起一个数据库容器，
+  不用折腾各个操作系统的安装程序，用完还能随时停掉、删掉，不会在你的电脑里留下痕迹。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="本书的部署方式：在终端里通过 docker exec 进入容器，用 psql 连接 Postgres">
+  <text class="ttl" x="30" y="30">你的电脑（宿主机）</text>
+  <rect class="bx-d" x="20" y="40" width="720" height="236" rx="14"/>
+
+  <rect class="bx" x="44" y="80" width="170" height="130" rx="10"/>
+  <text class="ttl" x="129" y="104" text-anchor="middle">终端</text>
+  <text class="sm" x="129" y="122" text-anchor="middle">PowerShell / iTerm / Terminal</text>
+  <rect class="bx-d" x="60" y="136" width="138" height="56" rx="6"/>
+  <text class="mono" x="72" y="158">SELECT id</text>
+  <text class="mono" x="72" y="178">FROM trades…</text>
+
+  <path class="ln-a" d="M216 145 H300" marker-end="url(#ar-a)"/>
+  <text class="sm" x="222" y="136">docker exec</text>
+
+  <rect class="bx-b" x="300" y="60" width="420" height="170" rx="12"/>
+  <text class="ttl on-b" x="316" y="84">Postgres Docker 容器</text>
+
+  <rect class="bx" x="320" y="110" width="110" height="70" rx="8"/>
+  <text class="ttl" x="375" y="140" text-anchor="middle">psql</text>
+  <text class="sm" x="375" y="160" text-anchor="middle">命令行客户端</text>
+
+  <path class="ln-a" d="M432 145 H476" marker-end="url(#ar-a)"/>
+
+  <rect class="bx-a" x="480" y="100" width="220" height="110" rx="10"/>
+  <text class="ttl on-a" x="590" y="124" text-anchor="middle">Postgres 实例</text>
+  <rect class="bx" x="498" y="138" width="88" height="54" rx="6"/>
+  <text class="lbl" x="542" y="170" text-anchor="middle">表</text>
+  <rect class="bx" x="596" y="138" width="88" height="54" rx="6"/>
+  <text class="lbl" x="640" y="170" text-anchor="middle">索引</text>
+
+  <rect class="bx-g" x="480" y="240" width="220" height="28" rx="6"/>
+  <text class="sm on-g" x="590" y="258" text-anchor="middle">postgres-volume（数据卷，数据持久化）</text>
+  <path class="ln-g" d="M590 212 V238"/>
+</svg>
+<figcaption>图 1-3　本书使用 Postgres 的方式：终端 → 容器里的 psql → Postgres 实例</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Postgres Docker 容器</strong>：第 1–7 章使用官方镜像（标准发行版）；从第 8 章起，会换用带有额外扩展的镜像，比如带 pgvector 的、带 TimescaleDB 的。</li>
+  <li><strong>Postgres 实例</strong>：真正运行在容器里的数据库。它其实由好几个进程组成（监听连接、处理请求、后台维护等），图里为了简单没画出来。</li>
+  <li><strong>psql</strong>：Postgres 自带的轻量命令行工具，容器里已经有了，你不用在电脑上额外安装任何东西。</li>
+  <li><strong>终端</strong>：你电脑上的命令行程序，用来启动容器、再通过 psql 连进数据库。</li>
+</ul>
+
+<h3>第一步：确认 Docker 可用</h3>
+
+<div class="code" data-lang="bash">
+<pre>
+docker version
+</pre>
+</div>
+
+<p>如果这条命令报错，说明还没装 Docker。新手推荐安装 <a href="https://docs.docker.com/desktop/">Docker Desktop</a>，各大系统都有。</p>
+
+<h3>第二步：启动容器</h3>
+
+<p>macOS / Linux 用户运行：</p>
+
+<div class="code" data-lang="bash" data-file="清单 1.1 · 在 Unix 上启动 Postgres 容器">
+<pre>
+docker volume create postgres-volume
+
+docker run --name postgres \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password \
+    -p 5432:5432 \
+    -v postgres-volume:/var/lib/postgresql/data \
+    -d postgres:17.2
+</pre>
+</div>
+
+<p>Windows 用户在 PowerShell 里运行（如果用的是 CMD，把每行末尾的反引号 <code>`</code> 换成 <code>^</code>）：</p>
+
+<div class="code" data-lang="powershell" data-file="清单 1.2 · 在 Windows 上启动 Postgres 容器">
+<pre>
+docker volume create postgres-volume
+
+docker run --name postgres `
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password `
+    -p 5432:5432 `
+    -v postgres-volume:/var/lib/postgresql/data `
+    -d postgres:17.2
+</pre>
+</div>
+
+<p>这条命令有点长，我们拆开看每一部分在干什么：</p>
+
+<div class="tw"><table>
+<tr><th>片段</th><th>含义</th></tr>
+<tr><td><code>docker volume create postgres-volume</code></td><td>先建一个由 Docker 管理的<strong>数据卷</strong>，名叫 postgres-volume</td></tr>
+<tr><td><code>--name postgres</code></td><td>给容器起名叫 postgres，后面的命令都用这个名字找它</td></tr>
+<tr><td><code>-e POSTGRES_USER=postgres</code><br><code>-e POSTGRES_PASSWORD=password</code></td><td>设置默认用户名和密码（环境变量）</td></tr>
+<tr><td><code>-p 5432:5432</code></td><td>把容器里的 5432 端口（Postgres 默认端口）映射到你电脑上，外部程序就能连进来</td></tr>
+<tr><td><code>-v postgres-volume:/var/lib/postgresql/data</code></td><td>把数据卷挂到容器里 Postgres 存放数据文件的目录。<strong>即使删掉容器重建，数据也还在</strong></td></tr>
+<tr><td><code>-d</code></td><td>后台运行，不占用当前终端窗口</td></tr>
+<tr><td><code>postgres:17.2</code></td><td>使用 Docker Hub 官方镜像的 17.2 版本。建议和书保持一致，这样输出结果能对得上</td></tr>
+</table></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 只适合开发环境</div>
+  <p>这种部署方式（弱密码、默认配置）适合学习和开发。真要用到生产环境，务必先研究安全配置和其他最佳实践。</p>
+</div>
+
+<h3>第三步：确认启动成功</h3>
+
+<p>第一次运行需要从 Docker Hub 下载镜像，大约一分钟。用下面的命令查看状态：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+docker container ls -f name=postgres
+</pre>
+</div>
+
+<div class="code out">
+<pre>
+IMAGE                 STATUS                    PORTS                       NAMES
+postgres:17.2         Up About a minute         0.0.0.0:5432->5432/tcp      postgres
+</pre>
+</div>
+
+<p>STATUS 显示 <code>Up</code> 就说明容器跑起来了。再看一眼数据库日志做最后确认：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+docker logs postgres
+</pre>
+</div>
+
+<div class="code out">
+<pre>
+listening on IPv4 address "0.0.0.0", port 5432
+listening on IPv6 address "::", port 5432
+...
+database system is ready to accept connections
+</pre>
+</div>
+
+<p>看到 <code>ready to accept connections</code>（准备好接受连接了），就大功告成。</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 启动失败怎么办</div>
+  <p>把报错信息原样复制去搜索。Docker 用的人非常多，绝大多数错误都能很快找到解决办法。最常见的是 5432 端口已被本机另一个 Postgres 占用。</p>
+</div>
+
+<h2 id="psql">用 psql 连接数据库</h2>
+
+<p>
+  你当然可以用任何喜欢的图形化 SQL 工具，或者写段程序来连接数据库。
+  但如果手头什么工具都没有，容器里自带的 <strong>psql</strong> 就是最快的选择：
+</p>
+
+<div class="code" data-lang="bash" data-file="清单 1.3 · 用 psql 连接">
+<pre>
+docker exec -it postgres psql -U postgres
+</pre>
+</div>
+
+<p>
+  <code>docker exec -it postgres</code> 以交互模式进入名为 postgres 的容器，
+  然后在容器里执行 <code>psql -U postgres</code>，以 postgres 用户连接数据库。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么没让我输密码</div>
+  <p>
+    因为你是在<strong>容器内部</strong>通过本地 Unix 套接字连接的。Postgres 官方镜像把这种本机连接配置成“受信任”的，不需要密码。
+    如果从容器外部（比如你电脑上的图形工具）通过 5432 端口连接，就需要输入前面设置的 <code>password</code>。
+  </p>
+</div>
+
+<p>连接成功后，你会看到这样的提示符：</p>
+
+<div class="code out">
+<pre>
+psql (17.2 (Debian 17.2-1.pgdg120+1))
+Type "help" for help.
+postgres=#
+</pre>
+</div>
+
+<h3>psql 的元命令</h3>
+
+<p>
+  除了标准 SQL，psql 还支持一批以反斜杠 <code>\</code> 开头的<strong>元命令</strong>（meta-command），
+  用来查看连接信息、列出数据库对象、从文件导入数据等。它们是 psql 自己的命令，不是 SQL。
+</p>
+
+<div class="tw"><table>
+<tr><th>元命令</th><th>作用</th></tr>
+<tr><td><code>\?</code></td><td>列出所有元命令（按 <code>q</code> 退出列表）</td></tr>
+<tr><td><code>\conninfo</code></td><td>显示当前连接的信息</td></tr>
+<tr><td><code>\d</code></td><td>列出当前数据库里的表、视图和序列</td></tr>
+<tr><td><code>\d 表名</code></td><td>查看某张表的结构</td></tr>
+<tr><td><code>\l</code></td><td>列出所有数据库（第 2 章会用）</td></tr>
+<tr><td><code>\q</code></td><td>退出 psql</td></tr>
+</table></div>
+
+<div class="code" data-lang="sql">
+<pre>
+\conninfo
+</pre>
+</div>
+
+<div class="code out">
+<pre>
+You are connected to database "postgres" as user "postgres" via socket in
+"/var/run/postgresql" at port "5432".
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#9733; “数据库”这个词的两层意思</div>
+  <p>
+    上面说“你连接到了名为 postgres 的数据库”。这里的“数据库”指的是<strong>一组数据库对象（表、视图、索引…）的命名集合</strong>，
+    而不是整个 Postgres 服务器。一台 Postgres 服务器里可以有很多个这样的“数据库”。
+    名叫 postgres 的这个是初始化时默认创建的。第 2 章会用 <code>CREATE DATABASE</code> 创建新的。
+  </p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="一台 Postgres 服务器包含多个数据库，每个数据库包含表、视图、索引">
+  <rect class="bx-a" x="20" y="20" width="720" height="172" rx="14"/>
+  <text class="ttl on-a" x="38" y="44">Postgres 服务器（实例）· 你用 docker run 启动的那个</text>
+
+  <rect class="bx-b" x="40" y="60" width="210" height="116" rx="10"/>
+  <text class="ttl on-b" x="56" y="82">数据库 postgres</text>
+  <text class="sm" x="56" y="100">默认创建 · 本章在这里练习</text>
+  <rect class="bx" x="56" y="112" width="80" height="26" rx="5"/><text class="sm" x="96" y="129" text-anchor="middle">trades 表</text>
+  <rect class="bx" x="144" y="112" width="90" height="26" rx="5"/><text class="sm" x="189" y="129" text-anchor="middle">索引…</text>
+  <rect class="bx" x="56" y="144" width="80" height="24" rx="5"/><text class="sm" x="96" y="160" text-anchor="middle">视图…</text>
+
+  <rect class="bx" x="275" y="60" width="210" height="116" rx="10"/>
+  <text class="ttl" x="291" y="82">数据库 coffee_chain</text>
+  <text class="sm" x="291" y="100">第 2 章创建</text>
+  <rect class="bx" x="291" y="112" width="80" height="26" rx="5"/><text class="sm" x="331" y="129" text-anchor="middle">表…</text>
+
+  <rect class="bx-d" x="510" y="60" width="210" height="116" rx="10"/>
+  <text class="ttl" x="526" y="82">更多数据库…</text>
+  <text class="sm" x="526" y="100">CREATE DATABASE xxx;</text>
+</svg>
+<figcaption>图 1-4　服务器 ⊃ 数据库 ⊃ 表 / 视图 / 索引</figcaption>
+</figure>
+
+<p>试试 <code>\d</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+\d
+</pre></div>
+<div class="code out"><pre>
+Did not find any relations.
+</pre></div>
+
+<p>新数据库里空空如也，一张表也没有（relation，“关系”，就是表、视图这类对象的统称）。下面来造点数据。</p>
+
+<h2 id="mock">生成模拟数据</h2>
+
+<p>
+  学数据库，最先要解决的就是“没有数据可玩”。后面的章节会教你导入现成的数据集；
+  这一章我们先用 Postgres 的内置函数，<strong>纯靠一条 SQL</strong> 生成模拟数据。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 说明</div>
+  <p>这种造数据的方式算不上 Postgres 的“最佳实践”，但在命令行里随手造一批测试数据时非常方便。</p>
+</div>
+
+<h3>先建一张表</h3>
+
+<p>我们模拟一个简化版的股票交易所，用一张 <code>trades</code> 表记录每笔交易：</p>
+
+<div class="code" data-lang="sql" data-file="清单 1.4 · 创建示例表">
+<pre>
+CREATE TABLE trades(
+    id bigint,                -- 交易编号
+    buyer_id integer,         -- 买家编号
+    symbol text,              -- 股票代码
+    order_quantity integer,   -- 买入数量
+    bid_price numeric(5,2),   -- 出价：最多 5 位数字，其中 2 位小数
+    order_time timestamp      -- 下单时间
+);
+</pre>
+</div>
+
+<p>再执行 <code>\d</code>，就能看到它了：</p>
+
+<div class="code out"><pre>
+         List of relations
+ Schema | Name   | Type  | Owner
+--------+--------+-------+----------
+ public | trades | table | postgres
+</pre></div>
+
+<p>用 <code>SELECT count(*) FROM trades;</code> 数一下行数，结果是 0。接下来要往里面填数据。</p>
+
+<h3>generate_series：生成一列连续的数</h3>
+
+<p><code>generate_series</code> 函数按指定范围生成一串值（整数或时间戳都行）：</p>
+
+<div class="code" data-lang="text"><pre>
+generate_series(start integer, stop integer [, step integer]) → setof integer
+</pre></div>
+
+<p>从 <code>start</code> 到 <code>stop</code>（两端都包含），<code>step</code> 是步长，可选，默认 1。返回的是“一组行”（setof）。</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT generate_series(1,5) AS id;
+</pre></div>
+<div class="code out"><pre>
+ id
+----
+  1
+  2
+  3
+  4
+  5
+(5 rows)
+</pre></div>
+
+<p>
+  <code>AS id</code> 给这一列起了个别名。默认的列名就叫 <code>generate_series</code>，不太好看。
+  有了 5 行，我们就可以给每一行再“算”出其他列的值。
+</p>
+
+<h3>random：随机买家</h3>
+
+<div class="code" data-lang="sql" data-file="清单 1.5 · 生成随机买家">
+<pre>
+SELECT id, random(1,10) AS buyer_id
+FROM generate_series(1,5) AS id;
+</pre>
+</div>
+<div class="code out"><pre>
+ id | buyer_id
+----+----------
+  1 |        5
+  2 |        6
+  3 |        1
+  4 |        6
+  5 |       10
+(5 rows)
+</pre></div>
+
+<p>
+  这里 <code>generate_series</code> 写在了 <code>FROM</code> 后面，被当成一张“临时表”来用。
+  对它的每一行，<code>random(1,10)</code> 都会算出一个 1 到 10 之间（含两端）的随机整数。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 版本差异</div>
+  <p>
+    <code>random(min, max)</code> 这种两个参数的写法是 <strong>Postgres 17 新增的</strong>。
+    旧版本请用 <code>floor(random() * (max - min + 1) + min)</code> 代替。
+  </p>
+</div>
+
+<h3>从数组里随机挑：随机股票代码</h3>
+
+<p>假设交易所只允许交易苹果（AAPL）、福特（F）和 DoorDash（DASH）三只股票：</p>
+
+<div class="code" data-lang="sql" data-file="清单 1.6 · 生成随机股票代码">
+<pre>
+SELECT id,
+(array['AAPL','F','DASH'])[random(1,3)] AS symbol
+FROM generate_series(1,5) AS id;
+</pre>
+</div>
+<div class="code out"><pre>
+ id | symbol
+----+--------
+  1 | AAPL
+  2 | DASH
+  3 | F
+  4 | DASH
+  5 | F
+(5 rows)
+</pre></div>
+
+<p>
+  <code>array['AAPL','F','DASH']</code> 构造了一个文本数组，<code>[random(1,3)]</code> 随机取其中一个元素。
+  注意 Postgres 的<strong>数组下标从 1 开始</strong>，不是 0。
+</p>
+
+<h3>合起来：一条语句插入 1000 笔交易</h3>
+
+<p>按同样的思路给每一列都“算”一个值，再把 <code>SELECT</code> 的结果直接 <code>INSERT</code> 进表里：</p>
+
+<div class="code" data-lang="sql" data-file="清单 1.7 · 插入 1000 笔模拟交易">
+<pre>
+INSERT INTO trades (id, buyer_id, symbol,
+    order_quantity, bid_price, order_time)
+SELECT
+    id,
+    random(1,10) as buyer_id,
+    (array['AAPL','F','DASH'])[random(1,3)] as symbol,
+    random(1,20) as order_quantity,
+    round(random(10.00,20.00), 2) as bid_price,
+    now() as order_time
+FROM generate_series(1,1000) AS id;
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="INSERT ... SELECT 的工作方式：generate_series 生成 1000 行骨架，每列由函数算出值，再插入 trades 表">
+  <rect class="bx-b" x="20" y="40" width="120" height="220" rx="10"/>
+  <text class="ttl on-b" x="80" y="30" text-anchor="middle">generate_series</text>
+  <text class="mono" x="80" y="72" text-anchor="middle">1</text>
+  <text class="mono" x="80" y="100" text-anchor="middle">2</text>
+  <text class="mono" x="80" y="128" text-anchor="middle">3</text>
+  <text class="mono" x="80" y="160" text-anchor="middle">⋮</text>
+  <text class="mono" x="80" y="196" text-anchor="middle">1000</text>
+  <text class="sm" x="80" y="240" text-anchor="middle">行的“骨架”</text>
+
+  <path class="ln-b" d="M142 150 H186" marker-end="url(#ar-b)"/>
+
+  <rect class="bx" x="190" y="40" width="330" height="220" rx="10"/>
+  <text class="ttl" x="355" y="30" text-anchor="middle">SELECT：对每一行算出各列的值</text>
+  <text class="mono" x="206" y="72">id</text><text class="sm" x="330" y="72">← 序列本身</text>
+  <text class="mono" x="206" y="100">random(1,10)</text><text class="sm" x="330" y="100">← buyer_id</text>
+  <text class="mono" x="206" y="128">array[…][random(1,3)]</text><text class="sm" x="380" y="128">← symbol</text>
+  <text class="mono" x="206" y="156">random(1,20)</text><text class="sm" x="330" y="156">← order_quantity</text>
+  <text class="mono" x="206" y="184">round(random(10,20),2)</text><text class="sm" x="384" y="184">← bid_price</text>
+  <text class="mono" x="206" y="212">now()</text><text class="sm" x="330" y="212">← order_time</text>
+
+  <path class="ln-a" d="M522 150 H566" marker-end="url(#ar-a)"/>
+  <text class="sm" x="526" y="142">INSERT</text>
+
+  <rect class="bx-a" x="570" y="40" width="170" height="220" rx="10"/>
+  <text class="ttl on-a" x="655" y="30" text-anchor="middle">trades 表</text>
+  <rect class="cell-h" x="584" y="54" width="142" height="22"/>
+  <text class="sm" x="592" y="69">id · buyer · symbol …</text>
+  <rect class="cell" x="584" y="76" width="142" height="22"/><text class="sm" x="592" y="91">1 · 3 · F · 18 …</text>
+  <rect class="cell" x="584" y="98" width="142" height="22"/><text class="sm" x="592" y="113">2 · 9 · AAPL · 19 …</text>
+  <rect class="cell" x="584" y="120" width="142" height="22"/><text class="sm" x="592" y="135">3 · 7 · F · 3 …</text>
+  <rect class="cell" x="584" y="142" width="142" height="22"/><text class="sm" x="592" y="157">⋮</text>
+  <text class="sm on-a" x="655" y="240" text-anchor="middle">共 1000 行</text>
+</svg>
+<figcaption>图 1-5　<code>INSERT … SELECT</code>：先生成行骨架，再给每一列“算”出值，最后整批插入</figcaption>
+</figure>
+
+<p>来看看前 5 行：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT id, buyer_id, symbol, order_quantity as quantity,
+    bid_price, order_time
+FROM trades
+LIMIT 5;
+</pre></div>
+<div class="code out"><pre>
+ id | buyer_id | symbol | quantity | bid_price |         order_time
+----+----------+--------+----------+-----------+---------------------------
+  1 |        3 | F      |       18 |     12.92 | 2024-08-02 02:13:36.266052
+  2 |        9 | AAPL   |       19 |     19.91 | 2024-08-02 02:13:36.266052
+  3 |        7 | F      |        3 |     17.61 | 2024-08-02 02:13:36.266052
+  4 |       10 | F      |        1 |     19.55 | 2024-08-02 02:13:36.266052
+  5 |        9 | AAPL   |       15 |     12.25 | 2024-08-02 02:13:36.266052
+(5 rows)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 你的结果会不一样</div>
+  <p>因为用了 <code>random</code> 和 <code>now</code>，你看到的数字和时间一定和书上不同，这很正常。后面所有的统计结果也是如此。</p>
+</div>
+
+<h2 id="queries">跑几个基本查询</h2>
+
+<p>
+  SQL 是 Postgres 的“母语”。即使你在项目里用 ORM（对象关系映射框架），ORM 最后也是生成 SQL 发给数据库。
+  所以会读、会写 SQL 永远有用 —— 总有一天你要调试或优化 ORM 生成的语句。
+</p>
+
+<h3>计数：count(*)</h3>
+
+<p>最常见的需求之一：“满足某个条件的记录有多少条？”比如苹果股票一共成交了多少笔：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*) FROM trades WHERE symbol = 'AAPL';
+</pre></div>
+<div class="code out"><pre>
+ count
+-------
+   305
+(1 row)
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 关于 * 的好习惯</div>
+  <p>
+    一般来说应该避免 <code>SELECT *</code>：只取应用真正需要的列，能节省内存、CPU 和网络带宽。
+    但 <code>count(*)</code> 是例外 —— Postgres 对它有专门优化，它只数行数，根本不去读列里的数据。放心用。
+  </p>
+</div>
+
+<h3>分组统计：最热门的股票</h3>
+
+<div class="code" data-lang="sql" data-file="清单 1.8 · 按成交笔数找出最热门的股票">
+<pre>
+SELECT symbol, count(*) AS total_volume
+FROM trades
+GROUP BY symbol
+ORDER BY total_volume DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+ symbol | total_volume
+--------+--------------
+ DASH   |          351
+ F      |          344
+ AAPL   |          305
+(3 rows)
+</pre></div>
+
+<p><code>GROUP BY</code> 是初学者最需要建立直觉的子句。它的工作方式就像“分拣”：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="GROUP BY 把相同 symbol 的行归成一组，再对每组计数">
+  <text class="ttl" x="20" y="24">① 原始行（乱序）</text>
+  <rect class="cell-b" x="20" y="36" width="110" height="26"/><text class="mono" x="32" y="54">AAPL</text>
+  <rect class="cell-g" x="20" y="62" width="110" height="26"/><text class="mono" x="32" y="80">F</text>
+  <rect class="cell-p" x="20" y="88" width="110" height="26"/><text class="mono" x="32" y="106">DASH</text>
+  <rect class="cell-g" x="20" y="114" width="110" height="26"/><text class="mono" x="32" y="132">F</text>
+  <rect class="cell-b" x="20" y="140" width="110" height="26"/><text class="mono" x="32" y="158">AAPL</text>
+  <rect class="cell-p" x="20" y="166" width="110" height="26"/><text class="mono" x="32" y="184">DASH</text>
+  <rect class="cell-p" x="20" y="192" width="110" height="26"/><text class="mono" x="32" y="210">DASH</text>
+  <text class="sm" x="75" y="240" text-anchor="middle">… 共 1000 行</text>
+
+  <path class="ln-a" d="M140 130 H220" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="180" y="106" text-anchor="middle">GROUP BY</text>
+  <text class="sm on-a" x="180" y="120" text-anchor="middle">symbol</text>
+
+  <text class="ttl" x="230" y="24">② 按 symbol 分成三堆</text>
+  <rect class="bx-p" x="230" y="36" width="150" height="70" rx="8"/>
+  <text class="mono on-p" x="244" y="58">DASH</text><text class="sm" x="244" y="80">351 行</text>
+  <rect class="bx-g" x="230" y="114" width="150" height="70" rx="8"/>
+  <text class="mono on-g" x="244" y="136">F</text><text class="sm" x="244" y="158">344 行</text>
+  <rect class="bx-b" x="230" y="192" width="150" height="70" rx="8"/>
+  <text class="mono on-b" x="244" y="214">AAPL</text><text class="sm" x="244" y="236">305 行</text>
+
+  <path class="ln-a" d="M390 150 H460" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="396" y="140">count(*)</text>
+
+  <text class="ttl" x="470" y="24">③ 每堆压成一行 + 排序</text>
+  <rect class="cell-h" x="470" y="64" width="270" height="28"/>
+  <text class="b" x="484" y="83">symbol</text><text class="b" x="620" y="83">total_volume</text>
+  <rect class="cell" x="470" y="92" width="270" height="28"/><text class="mono" x="484" y="111">DASH</text><text class="mono" x="620" y="111">351</text>
+  <rect class="cell" x="470" y="120" width="270" height="28"/><text class="mono" x="484" y="139">F</text><text class="mono" x="620" y="139">344</text>
+  <rect class="cell" x="470" y="148" width="270" height="28"/><text class="mono" x="484" y="167">AAPL</text><text class="mono" x="620" y="167">305</text>
+  <text class="sm" x="605" y="202" text-anchor="middle">ORDER BY total_volume DESC</text>
+  <text class="sm" x="605" y="220" text-anchor="middle">（DESC = 从大到小）</text>
+</svg>
+<figcaption>图 1-6　<code>GROUP BY</code> 先“分堆”，聚合函数再把每一堆压成一行</figcaption>
+</figure>
+
+<h3>取前 N 名：花钱最多的三位买家</h3>
+
+<p>另一个常见任务：找出最有价值的客户。每笔交易的金额是 <code>bid_price * order_quantity</code>，按买家加总、排序、取前三：</p>
+
+<div class="code" data-lang="sql" data-file="清单 1.9 · 找出花钱最多的三位买家">
+<pre>
+SELECT buyer_id, sum(bid_price * order_quantity) AS total_value
+FROM trades
+GROUP BY buyer_id
+ORDER BY total_value DESC
+LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+ buyer_id | total_value
+----------+-------------
+        8 |    18260.73
+        9 |    17295.22
+        2 |    17133.51
+(3 rows)
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; SQL 子句的执行顺序</div>
+  <p>
+    SQL 的书写顺序是 <code>SELECT … FROM … WHERE … GROUP BY … ORDER BY … LIMIT</code>，
+    但数据库<strong>逻辑上</strong>的执行顺序是：
+    <code>FROM</code>（取哪张表）→ <code>WHERE</code>（过滤行）→ <code>GROUP BY</code>（分组）→
+    <code>SELECT</code>（算出输出列）→ <code>ORDER BY</code>（排序）→ <code>LIMIT</code>（截断）。
+    这就是为什么 <code>ORDER BY</code> 能用 <code>SELECT</code> 里起的别名 <code>total_value</code>。
+  </p>
+</div>
+
+<p>
+  你还可以继续练习：算每只股票的平均价格、找最近的交易、找每只股票的最高出价……
+  用几分钟前生成的这批数据，靠简单的 SQL 就能做很多事。下一章我们正式深入。
+</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 是最流行、增长最快的数据库之一，靠的是<strong>开源</strong>、<strong>企业级可靠</strong>和<strong>可扩展</strong>。</li>
+  <li>“Just use Postgres”的意思是：在引入新数据库之前，先确认 Postgres 能不能搞定。</li>
+  <li>Postgres 用 C 编写，支持 Windows 和各种类 Unix 系统；用 Docker 一分钟就能启动。</li>
+  <li><code>psql</code> 是自带的命令行客户端，<code>\</code> 开头的是它的元命令。</li>
+  <li><code>generate_series</code> + <code>random</code> + <code>INSERT … SELECT</code> 能快速生成模拟数据。</li>
+  <li>SQL 是 Postgres 的母语，<code>count</code>、<code>GROUP BY</code>、<code>ORDER BY</code>、<code>LIMIT</code> 能解决大量业务问题。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>写一条查询，算出每只股票的<strong>平均出价</strong>（提示：<code>avg(bid_price)</code>），并保留两位小数（<code>round(…, 2)</code>）。</li>
+    <li>找出<strong>每只股票的最高出价</strong>（<code>max</code>）以及最低出价（<code>min</code>）。</li>
+    <li>用 <code>generate_series</code> 的第三个参数生成 0 到 100 之间所有 5 的倍数。</li>
+    <li>改造清单 1.7：让 <code>order_time</code> 分布在过去 30 天内（提示：<code>now() - random(0,30) * interval '1 day'</code>），然后统计每天的成交笔数。</li>
+    <li>退出 psql（<code>\q</code>），执行 <code>docker stop postgres</code> 和 <code>docker start postgres</code>，重新连接后确认 1000 行数据还在 —— 这就是数据卷的作用。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

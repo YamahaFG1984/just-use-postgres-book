@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>附录 A · 五个优化技巧 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="12">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">附录 A</span>
+<h1>五个优化技巧</h1>
+<p class="lede">
+  这本书的每一章都是一份动手指南：启动容器、加载数据、亲眼看到某项能力的效果。作者有意不在正文里塞太多细节、最佳实践和陷阱 ——
+  一来太多太早会劝退人，二来你和 Postgres 的旅程不该止于这本书。但有五条查询优化技巧实在值得单独一说，能帮你写出更高效的代码、设计更好的方案。
+</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#128269;</span><h4>① 精通 EXPLAIN</h4><p>先看懂执行计划，再动手优化。</p></div>
+  <div class="card"><span class="ic">&#9878;</span><h4>② 知道何时建索引</h4><p>EXPLAIN、索引不足、过度索引。</p></div>
+  <div class="card"><span class="ic">&#128279;</span><h4>③ 用连接池</h4><p>别让每个请求都新建一个进程。</p></div>
+  <div class="card"><span class="ic">&#127919;</span><h4>④ 只查需要的</h4><p>告别习惯性的 SELECT *。</p></div>
+  <div class="card"><span class="ic">&#9881;</span><h4>⑤ 用好数据库的计算能力</h4><p>排序、分组、聚合交给 Postgres。</p></div>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="explain">A.1 精通 EXPLAIN</h2>
+
+<p>全书大多用这样的写法分析执行计划：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT ...
+</pre></div>
+
+<p><code>analyze</code> 让 Postgres 真正执行计划，显示实际耗时等统计；<code>costs off</code> 去掉每一步的估算代价和预计行数，让输出更紧凑。比如第 5 章的一条查询：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"type": "custom"}';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (actual time=1.501..1.502 rows=1 loops=1)
+   -> Seq Scan on order_items (actual time=0.033..1.446 rows=563 loops=1)
+         Filter: (pizza @> '{"type": "custom"}'::jsonb)
+         Rows Removed by Filter: 2375
+ Planning Time: 0.287 ms
+ Execution Time: 1.551 ms
+</pre></div>
+
+<p>两个参数都去掉，就只有估算代价（costs 默认为 true），没有实际耗时（因为没执行）：</p>
+
+<div class="code out"><pre>
+ Aggregate (cost=139.13..139.14 rows=1 width=8)
+   -> Seq Scan on order_items (cost=0.00..137.72 rows=563 width=0)
+         Filter: (pizza @> '{"type": "custom"}'::jsonb)
+</pre></div>
+
+<p>
+  书里用 <code>(analyze, costs off)</code> 只是因为它足够说明问题，<strong>并不是最佳实践</strong>。优化一条慢查询时，更好的做法是<strong>保留估算代价</strong>、并加上<strong>内存缓冲区</strong>信息：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, buffers on)
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"type": "custom"}';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (cost=139.13..139.14 rows=1 width=8)
+           (actual time=1.713..1.714 rows=1 loops=1)
+   Buffers: shared hit=101
+   -> Seq Scan on order_items (cost=0.00..137.72 rows=563 width=0)
+                              (actual time=0.034..1.624 rows=563 loops=1)
+         Filter: (pizza @> '{"type": "custom"}'::jsonb)
+         Rows Removed by Filter: 2375
+         Buffers: shared hit=101
+ Planning Time: 0.378 ms
+ Execution Time: 1.757 ms
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="如何解读 EXPLAIN (analyze, buffers) 的输出：估算与实际对比、缓冲区命中">
+  <rect class="bx" x="20" y="20" width="720" height="70" rx="10"/>
+  <text class="mono" x="36" y="46">Seq Scan on order_items <tspan class="on-b b">(cost=0.00..137.72 rows=563 width=0)</tspan></text>
+  <text class="mono" x="36" y="70">                        <tspan class="on-g b">(actual time=0.034..1.624 rows=563 loops=1)</tspan></text>
+
+  <rect class="bx-b" x="20" y="108" width="230" height="146" rx="10"/>
+  <text class="ttl on-b" x="135" y="132" text-anchor="middle">估算（cost / rows）</text>
+  <text class="sm" x="36" y="156">规划器在规划阶段比较多个</text>
+  <text class="sm" x="36" y="174">计划时依据的就是这些估算</text>
+  <text class="sm" x="36" y="204">cost 是相对单位，不是毫秒；</text>
+  <text class="sm" x="36" y="222">两个数分别是启动代价和</text>
+  <text class="sm" x="36" y="240">返回全部行的总代价</text>
+
+  <rect class="bx-g" x="265" y="108" width="230" height="146" rx="10"/>
+  <text class="ttl on-g" x="380" y="132" text-anchor="middle">实际（actual）</text>
+  <text class="sm" x="281" y="156">真实的耗时和行数</text>
+  <text class="sm" x="281" y="186"><tspan class="b">估算 rows 和实际 rows 差很多</tspan></text>
+  <text class="sm" x="281" y="204">→ 统计信息过时（试试 ANALYZE）</text>
+  <text class="sm" x="281" y="222">  或查询本身需要优化</text>
+  <text class="sm" x="281" y="240">本例 563 vs 563，估得很准</text>
+
+  <rect class="bx-a" x="510" y="108" width="230" height="146" rx="10"/>
+  <text class="ttl on-a" x="625" y="132" text-anchor="middle">Buffers</text>
+  <text class="mono" x="526" y="158">shared hit=101</text>
+  <text class="sm" x="526" y="178">101 个页都在内存里命中</text>
+  <text class="mono" x="526" y="204">shared hit=3 read=4</text>
+  <text class="sm" x="526" y="224">有 4 页要从磁盘读</text>
+  <text class="sm" x="526" y="244">命中率低 → 先考虑加内存</text>
+</svg>
+<figcaption>图 A-1　读一条完整的执行计划节点：估算 vs 实际，以及内存命中</figcaption>
+</figure>
+
+<ul>
+  <li><strong>同时有估算和实际</strong>，就能看出 Postgres 估得准不准。规划阶段 Postgres 是按<em>估算</em>代价在多个计划里挑的；如果选中的计划估算和实际差得很远，可能是统计信息没跟上，也可能是查询本身需要优化。</li>
+  <li><strong>Buffers</strong> 显示执行时有多少数据要从磁盘取。<code>shared hit=101</code> 表示处理的所有行都来自内存（缓存在 101 个缓冲区里），完全没碰磁盘。如果命中率低、大量时间花在磁盘 I/O 上，也许给数据库服务器加点内存就够了，用不着别的优化手段。</li>
+</ul>
+
+<div class="box tip">
+  <div class="t">&#128161; Postgres 18 的变化</div>
+  <p>从 Postgres 18 开始，<code>EXPLAIN ANALYZE</code> 默认就包含缓冲区信息，不用再显式加 <code>buffers on</code>。</p>
+</div>
+
+<div class="box key">
+  <div class="t">&#9733; 一句话</div>
+  <p>熟练使用 EXPLAIN、读懂执行计划。在弄清 Postgres 做了什么、为什么这样执行之前，<strong>不要过早优化，也不要凭感觉猜</strong>。</p>
+</div>
+
+<h2 id="indexes">A.2 知道何时使用索引</h2>
+
+<p>
+  书里几乎每一章都有一节专门讲某种索引。为什么这么重视？因为一旦理解了索引怎么工作、什么时候用，你和数据库的关系就彻底变了：数据库不再是黑盒，你会更愿意深入它的内部。
+  在自己的应用里，决定是否建索引就是你的责任了。记住三个词：<strong>EXPLAIN</strong>、<strong>索引不足</strong>、<strong>过度索引</strong>。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="索引策略的平衡：索引不足与过度索引之间">
+  <path class="ln" d="M110 160 L650 120" style="stroke-width:5"/>
+  <path class="fill-a" d="M370 140 L350 190 L390 190 Z" style="fill:var(--line-2)"/>
+  <rect class="bx-r" x="60" y="110" width="140" height="44" rx="8"/>
+  <text class="sm b on-r" x="130" y="130" text-anchor="middle">索引不足</text>
+  <text class="sm" x="130" y="146" text-anchor="middle">慢查询全表扫描</text>
+  <rect class="bx-r" x="570" y="64" width="160" height="50" rx="8"/>
+  <text class="sm b on-r" x="650" y="84" text-anchor="middle">过度索引</text>
+  <text class="sm" x="650" y="102" text-anchor="middle">写入放大、占资源、规划慢</text>
+  <rect class="bx-g" x="300" y="200" width="160" height="32" rx="8"/>
+  <text class="sm b on-g" x="380" y="221" text-anchor="middle">平衡点：因场景而异</text>
+
+  <rect class="bx-b" x="20" y="16" width="250" height="70" rx="10"/>
+  <text class="ttl on-b" x="36" y="40">先 EXPLAIN</text>
+  <text class="sm" x="36" y="60">先生成并看懂计划，再决定建不建。</text>
+  <text class="sm" x="36" y="76">不要猜 —— 也许根本不需要索引</text>
+  <text class="sm" x="290" y="40">索引不足：好解决的问题，往往比升级机器便宜得多</text>
+  <text class="sm" x="290" y="58">过度索引：每加一个索引，所有写入都要多维护一份</text>
+</svg>
+<figcaption>图 A-2　索引策略是一门平衡的艺术</figcaption>
+</figure>
+
+<h3>EXPLAIN</h3>
+
+<p>规则很简单：<strong>建索引之前，先生成并看懂执行计划</strong>。不要猜，先分析。它可能告诉你根本不需要索引。</p>
+
+<h3>索引不足（underindexing）</h3>
+
+<p>
+  查询慢只是因为<strong>缺了本该有的索引</strong>。说实话，这是个让人愉快的问题。如果执行计划显示一条慢查询在大数据集上全表扫描，<strong>别急着换一台 CPU 更多、内存更大的机器</strong>，先考虑加个索引。
+  更大的机器意味着高得多的成本，而在索引不足的情况下加个索引，成本往往可以忽略不计。比如找出所有自定义配方的披萨：
+</p>
+
+<div class="code out"><pre>
+ Aggregate (cost=139.13..139.14 rows=1 width=8) (actual time=1.516..1.518 rows=1 loops=1)
+   Buffers: shared hit=101
+   -> Seq Scan on order_items (cost=0.00..137.72 rows=563 width=0)
+                              (actual time=0.037..1.454 rows=563 loops=1)
+         Filter: (pizza @> '{"type": "custom"}'::jsonb)
+         Rows Removed by Filter: 2375
+         Buffers: shared hit=101
+ Execution Time: 1.565 ms
+</pre></div>
+
+<p>全表扫描，不过数据都在内存里。应用经常按类型过滤披萨，订单量还会持续增长，建索引是合理的。先确认现有的索引：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'pizzeria' AND tablename = 'order_items';
+-- order_items_pkey | CREATE UNIQUE INDEX order_items_pkey
+--                  | ON pizzeria.order_items USING btree (order_id, order_item_id)
+</pre></div>
+
+<p>只有 (order_id, order_item_id) 上的复合 B-tree，显然用不来按 JSON 结构过滤 —— 这就是表级的“索引不足”。第 5 章的解决办法是在 pizza 列上建 GIN：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX idx_pizza_orders_gin
+ON pizzeria.order_items USING GIN(pizza);
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (cost=125.34..125.35 rows=1 width=8) (actual time=0.926..0.927 rows=1 loops=1)
+   Buffers: shared hit=107
+   -> Bitmap Heap Scan on order_items (cost=15.90..123.93 rows=563 width=0)
+                                      (actual time=0.160..0.869 rows=563 loops=1)
+         Recheck Cond: (pizza @> '{"type": "custom"}'::jsonb)
+         Heap Blocks: exact=101
+         -> Bitmap Index Scan on idx_pizza_orders_gin (cost=0.00..15.75 rows=563 width=0)
+                                                      (actual time=0.126..0.126 rows=563 loops=1)
+               Index Cond: (pizza @> '{"type": "custom"}'::jsonb)
+               Buffers: shared hit=6
+ Execution Time: 0.996 ms
+</pre></div>
+
+<h3>过度索引（overindexing）</h3>
+
+<p>反过来，索引太多会弊大于利。索引对查询性能那么有效，很容易让人想给每一列都建一个，但这是有代价的：</p>
+
+<ul>
+  <li>索引是一种数据结构，要占<strong>存储和内存</strong>。索引越多，需要的资源越多。</li>
+  <li>每次往表里插入新记录，每个索引都要更新；修改记录时也可能要更新。表上索引一多，Postgres 就得把它们全部维护好，导致<strong>写入放大</strong>，拖慢 INSERT、UPDATE、DELETE。</li>
+  <li><strong>规划阶段</strong>也有开销：索引越多，Postgres 挑选最佳计划时要考虑的就越多。</li>
+</ul>
+
+<p>
+  所以要有<strong>索引策略</strong>：不要为了优化又一条查询就加一个新索引，而是分析一张表上常见查询的执行计划，看能否用<strong>有限的几个</strong>索引让它们都跑得快。
+  比如 pizza 列上那个 GIN 索引，除了按类型过滤，还能加速按 JSON 里其他字段过滤的查询。统计“大号三重奶酪”披萨：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, buffers on)
+SELECT count(*)
+FROM pizzeria.order_items
+WHERE pizza @> '{"size": "large"}' AND pizza @> '{"type": "three cheese"}';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (cost=131.04..131.05 rows=1 width=8) (actual time=0.661..0.662 rows=1 loops=1)
+   -> Bitmap Heap Scan on order_items (cost=22.54..130.67 rows=147 width=0)
+                                      (actual time=0.328..0.642 rows=153 loops=1)
+         Recheck Cond: ((pizza @> '{"size": "large"}'::jsonb)
+                        AND (pizza @> '{"type": "three cheese"}'::jsonb))
+         -> Bitmap Index Scan on idx_pizza_orders_gin ...
+ Execution Time: 0.722 ms
+</pre></div>
+
+<p>条件变了，数据库还是复用了同一个索引。总之，索引策略要追求<strong>平衡</strong>：太少导致索引不足，太多导致过度索引，合适的点在中间，而且因场景而异。</p>
+
+<h2 id="pooling">A.3 使用连接池</h2>
+
+<p>全书都用 psql 连接容器里的 Postgres：</p>
+
+<div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U postgres
+# 没写端口，默认连 5432，等价于：
+docker exec -it postgres psql -U postgres -p 5432
+</pre></div>
+
+<p>
+  Postgres 启动时会运行一个叫 <strong>postmaster</strong> 的特殊进程，监听 5432 端口。psql 一连上来，postmaster 就<strong>新起一个操作系统进程</strong>专门服务这个会话；会话关闭时，这个进程也随之结束，不会留给之后连接的客户端复用。
+</p>
+
+<p>
+  如果应用并发执行查询，每个查询都新开一个连接、执行、再关闭，Postgres 就得为每个并发查询新建一个 OS 进程、执行、再结束进程。
+  创建进程虽然是轻量操作（在 Unix 上尤其如此），但积少成多会增加查询总耗时，也让 Postgres 和操作系统多做很多工作。<strong>连接池</strong>能复用已经打开的连接，大幅减少这种开销。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 360" role="img" aria-label="无连接池、客户端连接池、服务端连接池的对比">
+  <text class="ttl on-r" x="20" y="22">没有连接池：每个查询 = 新连接 = 新进程</text>
+  <rect class="bx-p" x="20" y="34" width="120" height="70" rx="8"/><text class="sm b on-p" x="80" y="74" text-anchor="middle">应用</text>
+  <path class="ln-r" d="M142 50 H290" marker-end="url(#ar-r)"/><path class="ln-r" d="M142 70 H290" marker-end="url(#ar-r)"/><path class="ln-r" d="M142 90 H290" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="216" y="44" text-anchor="middle">连接 → 查 → 断开 ×N</text>
+  <rect class="bx-a" x="294" y="30" width="200" height="80" rx="10"/>
+  <text class="sm b on-a" x="394" y="50" text-anchor="middle">Postgres · postmaster</text>
+  <rect class="cell-r" x="306" y="60" width="40" height="18"/><rect class="cell-r" x="352" y="60" width="40" height="18"/><rect class="cell-r" x="398" y="60" width="40" height="18"/><rect class="cell-r" x="444" y="60" width="40" height="18"/>
+  <text class="sm" x="394" y="100" text-anchor="middle">进程：起了又杀，杀了又起</text>
+
+  <text class="ttl on-g" x="20" y="146">客户端连接池：应用内的库或框架管理一组长连接</text>
+  <rect class="bx-p" x="20" y="158" width="190" height="80" rx="8"/><text class="sm b on-p" x="115" y="178" text-anchor="middle">应用</text>
+  <rect class="bx-g" x="34" y="188" width="162" height="40" rx="6"/><text class="sm" x="115" y="212" text-anchor="middle">连接池（借 → 用 → 还）</text>
+  <path class="ln-g" d="M212 182 H290" marker-end="url(#ar-g)"/><path class="ln-g" d="M212 198 H290" marker-end="url(#ar-g)"/><path class="ln-g" d="M212 214 H290" marker-end="url(#ar-g)"/>
+  <rect class="bx-a" x="294" y="160" width="200" height="76" rx="10"/>
+  <text class="sm b on-a" x="394" y="180" text-anchor="middle">Postgres</text>
+  <rect class="cell-g" x="330" y="192" width="40" height="18"/><rect class="cell-g" x="376" y="192" width="40" height="18"/><rect class="cell-g" x="422" y="192" width="40" height="18"/>
+  <text class="sm" x="394" y="228" text-anchor="middle">固定的几个进程，反复复用</text>
+
+  <rect class="bx" x="530" y="34" width="210" height="200" rx="10"/>
+  <text class="ttl" x="546" y="58">连接池的好处</text>
+  <text class="sm" x="546" y="84">• 省掉每次建/断连接的开销</text>
+  <text class="sm" x="546" y="106">• 池大小 = 能同时跑多少查询，</text>
+  <text class="sm" x="546" y="124">  把 CPU、内存控制在范围内</text>
+  <text class="sm" x="546" y="150">客户端连接池例子：</text>
+  <text class="sm" x="546" y="168">  Java 的 HikariCP、各语言</text>
+  <text class="sm" x="546" y="186">  驱动或 ORM 自带的连接池</text>
+
+  <text class="ttl on-b" x="20" y="276">服务端连接池：多个应用 / 微服务共享一个池</text>
+  <rect class="bx-p" x="20" y="288" width="70" height="30" rx="6"/><text class="sm" x="55" y="308" text-anchor="middle">服务 A</text>
+  <rect class="bx-p" x="20" y="322" width="70" height="30" rx="6"/><text class="sm" x="55" y="342" text-anchor="middle">服务 B</text>
+  <rect class="bx-p" x="96" y="305" width="70" height="30" rx="6"/><text class="sm" x="131" y="325" text-anchor="middle">服务 C</text>
+  <path class="ln-b" d="M168 320 H226" marker-end="url(#ar-b)"/>
+  <rect class="bx-b" x="230" y="296" width="150" height="48" rx="8"/><text class="sm b on-b" x="305" y="316" text-anchor="middle">PgBouncer / Pgpool</text><text class="sm" x="305" y="334" text-anchor="middle">/ Odyssey</text>
+  <path class="ln-b" d="M382 320 H440" marker-end="url(#ar-b)"/>
+  <rect class="bx-a" x="444" y="296" width="120" height="48" rx="8"/><text class="sm b on-a" x="504" y="324" text-anchor="middle">Postgres</text>
+  <text class="sm" x="580" y="312">各服务的客户端池加起来</text>
+  <text class="sm" x="580" y="330">可能压垮数据库，</text>
+  <text class="sm" x="580" y="348">由中间层统一收敛</text>
+</svg>
+<figcaption>图 A-3　连接池让连接（和背后的进程）可以复用</figcaption>
+</figure>
+
+<ul>
+  <li><strong>客户端连接池</strong>：由某种语言的库或框架为应用管理连接。应用要执行查询时不直接连数据库，而是从池里<strong>借</strong>一个连接，执行完再<strong>还</strong>回去。池不会关闭归还的连接，而是留着给下一个请求复用。池的最大连接数可以配置，从而控制能同时向数据库发多少查询。</li>
+  <li><strong>服务端（数据库端）连接池</strong>：适合数据库被多个应用或微服务访问的情况。即使每个应用都有自己的客户端池，加起来也会给数据库很大压力 —— 它要维护的连接数（OS 进程数）等于所有客户端池的总和。Postgres 没有内置连接池，也不需要：生态里有很多久经考验的选择，比如 <strong>Pgpool</strong>、<strong>PgBouncer</strong>、<strong>Odyssey</strong>。托管的 Postgres 服务通常已经自带服务端连接池。</li>
+</ul>
+
+<div class="box tip">
+  <div class="t">&#128161; 看看底层发生了什么</div>
+  <p>想亲眼看到 Postgres 怎样为每个新连接起一个专门的 OS 进程、连接池又如何优化这件事，可以看仓库 <code>postgres_internals_videos.md</code> 里的视频：<a href="https://www.youtube.com/watch?v=Vq34xPYZwXg">“Database Connection Pooling: Why It Matters? Essential OS-Level Insights”</a>。</p>
+</div>
+
+<p>不管用客户端池、服务端池还是两者都用，都能省掉为每个请求开关连接的开销，同时控制能并发执行的查询数，让 CPU、内存等资源保持在需要的范围内。</p>
+
+<h2 id="select">A.4 只查询真正需要的</h2>
+
+<h3>一般情况</h3>
+
+<p>
+  如果应用里有一条 <code>SELECT * FROM tableA WHERE …</code>，先想想 <code>*</code> 是不是真的必要。它让 Postgres 取出满足条件的行的<strong>所有</strong>列。
+  表里只有几列、而且都是 int、timestamp、point 这种定长基础类型时，用不用 <code>*</code> 差别不大；但如果表有几十列，或者有 text、vector、jsonb、polygon 这种<strong>变长</strong>类型，就该只取应用真正要用的列。
+</p>
+
+<p>假设表有 15 列，某个业务操作只用其中 5 列，但应用还是 <code>SELECT *</code>（可能图方便，也可能 ORM 默认就取所有列）。多取的 10 列可不是免费的：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="多余列在整条链路上的成本：取值、序列化、网络传输、反序列化">
+  <rect class="bx-a" x="20" y="30" width="150" height="90" rx="10"/>
+  <text class="ttl on-a" x="95" y="54" text-anchor="middle">① Postgres</text>
+  <text class="sm" x="95" y="76" text-anchor="middle">从表结构里取出</text>
+  <text class="sm" x="95" y="94" text-anchor="middle">10 列的值，复制进</text>
+  <text class="sm" x="95" y="112" text-anchor="middle">结果集</text>
+  <path class="ln" d="M172 75 H206" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="210" y="30" width="150" height="90" rx="10"/>
+  <text class="ttl on-b" x="285" y="54" text-anchor="middle">② 序列化</text>
+  <text class="sm" x="285" y="76" text-anchor="middle">切成网络包</text>
+  <text class="sm" x="285" y="94" text-anchor="middle">变长列（text/jsonb）</text>
+  <text class="sm" x="285" y="112" text-anchor="middle">可能是 KB 甚至 MB</text>
+  <path class="ln" d="M362 75 H396" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="400" y="30" width="150" height="90" rx="10"/>
+  <text class="ttl on-p" x="475" y="54" text-anchor="middle">③ 网络</text>
+  <text class="sm" x="475" y="76" text-anchor="middle">经过一个个路由器</text>
+  <text class="sm" x="475" y="94" text-anchor="middle">送到应用服务器</text>
+  <path class="ln" d="M552 75 H586" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="590" y="30" width="150" height="90" rx="10"/>
+  <text class="ttl on-g" x="665" y="54" text-anchor="middle">④ 应用</text>
+  <text class="sm" x="665" y="76" text-anchor="middle">接收、反序列化、</text>
+  <text class="sm" x="665" y="94" text-anchor="middle">转成对象……</text>
+  <text class="sm on-r b" x="665" y="112" text-anchor="middle">然后扔掉</text>
+
+  <text class="ttl" x="20" y="164">浪费是乘出来的</text>
+  <rect class="bx" x="20" y="176" width="140" height="56" rx="8"/><text class="mono" x="90" y="202" text-anchor="middle">10 行</text><text class="sm" x="90" y="222" text-anchor="middle">每次返回</text>
+  <text class="ttl" x="176" y="210" text-anchor="middle">×</text>
+  <rect class="bx" x="192" y="176" width="140" height="56" rx="8"/><text class="mono" x="262" y="202" text-anchor="middle">10 列</text><text class="sm" x="262" y="222" text-anchor="middle">用不上的</text>
+  <text class="ttl" x="348" y="210" text-anchor="middle">×</text>
+  <rect class="bx" x="364" y="176" width="140" height="56" rx="8"/><text class="mono" x="434" y="202" text-anchor="middle">100 次/秒</text><text class="sm" x="434" y="222" text-anchor="middle">调用频率</text>
+  <text class="ttl" x="520" y="210" text-anchor="middle">=</text>
+  <rect class="bx-r" x="536" y="176" width="204" height="56" rx="8"/><text class="mono on-r b" x="638" y="202" text-anchor="middle">10,000 个值/秒</text><text class="sm" x="638" y="222" text-anchor="middle">被取出、传输、丢弃</text>
+  <text class="sm" x="380" y="266" text-anchor="middle">而这还只是一个业务操作。每个操作都 SELECT *，就是在整条技术栈上白白燃烧 CPU、内存和带宽</text>
+</svg>
+<figcaption>图 A-4　多取的列，成本贯穿整条链路</figcaption>
+</figure>
+
+<ol>
+  <li>Postgres 要从表结构里取出这 10 列的值，把副本加进结果集 —— 每一行都要这样。返回 1 行就有 10 个多余的值，10 行就是 100 个。</li>
+  <li>结果集要序列化，切成小的网络包，经过一个个路由器从数据库传到应用服务器。都是 byte 类型的话只多传 100 字节；但只要有一列是 text、jsonb 这类变长类型，多余数据轻松达到 KB 甚至 MB 级别。</li>
+  <li>应用要接收这些网络包、反序列化成结果集，可能还要转换成编程语言或框架用的对象结构 —— 为这 100 个没用的值消耗计算和内存，白忙一场。</li>
+</ol>
+
+<p>
+  偶尔执行一次不会有人注意到。但每秒执行 100 次呢？就是 100 次 × 10 行 × 10 列 = 每秒 10,000 个值被取出、传输、丢弃。
+  所以要养成习惯：<strong>业务操作真正需要什么就只查什么</strong>。15 列里只要 5 列，就明确写 <code>SELECT col1, col2, col3, col4, col5 FROM tableA</code>。用 ORM 的话，留意它自动生成的 SQL，必要时调整，确保只取真正需要的。
+</p>
+
+<h3>count(*) 是个例外</h3>
+
+<p>Postgres 对 <code>count(*)</code> 有专门优化：执行 <code>SELECT count(*) FROM tableA WHERE …</code> 时，它只数行数，不取任何列的值。这也是全书一直用 count(*) 的原因：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze)
+SELECT count(*)
+FROM pizzeria.order_items;
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (cost=91.69..91.70 rows=1 width=8) (actual time=0.721..0.723 rows=1 loops=1)
+   -> Index Only Scan using order_items_pkey on order_items
+        (cost=0.28..84.35 rows=2938 <b>width=0</b>) (actual time=0.091..0.532 rows=2938 loops=1)
+         Heap Fetches: 0
+ Execution Time: 0.771 ms
+</pre></div>
+
+<p>Index Only Scan 数出 2938 行，但每行的大小是 0（<code>width=0</code>）—— 没有读任何列的值。换成 <code>count(order_item_id)</code>：</p>
+
+<div class="code out"><pre>
+ Aggregate (cost=91.69..91.70 rows=1 width=8) (actual time=0.884..0.885 rows=1 loops=1)
+   -> Index Only Scan using order_items_pkey on order_items
+        (cost=0.28..84.35 rows=2938 <b>width=4</b>) (actual time=0.031..0.534 rows=2938 loops=1)
+         Heap Fetches: 0
+ Execution Time: 0.933 ms
+</pre></div>
+
+<p>这次每行 4 字节（<code>width=4</code>）—— order_item_id 是 INT 类型，Postgres 开始读取这一列的值了。</p>
+
+<div class="box note">
+  <div class="t">&#9432; count(列) 和 count(*) 的语义也不同</div>
+  <p><code>count(列)</code> 只统计该列<strong>不为 NULL</strong> 的行，<code>count(*)</code> 统计所有行。想数行数就用 count(*)，既正确又更快。</p>
+</div>
+
+<h2 id="compute">A.5 用好数据库的计算能力</h2>
+
+<p>
+  Postgres 不只是一个把数据放进去、再取出来的存储容器，它是一个<strong>强大的计算平台</strong>。全书都在展示：它能用内置函数、CTE、窗口函数等轻松地排序、分组、聚合和处理数据，还能用自定义函数、存储过程、触发器运行你自己的业务逻辑。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="在应用层计算与在数据库里计算的对比">
+  <text class="ttl on-r" x="190" y="22" text-anchor="middle">在应用层算</text>
+  <rect class="bx-a" x="20" y="36" width="120" height="120" rx="10"/><text class="sm b on-a" x="80" y="100" text-anchor="middle">Postgres</text>
+  <path class="ln-r" d="M142 70 H230" marker-end="url(#ar-r)" style="stroke-width:6"/>
+  <path class="ln-r" d="M142 96 H230" marker-end="url(#ar-r)" style="stroke-width:6"/>
+  <path class="ln-r" d="M142 122 H230" marker-end="url(#ar-r)" style="stroke-width:6"/>
+  <text class="sm on-r" x="186" y="150" text-anchor="middle">搬运全部原始行</text>
+  <rect class="bx-p" x="234" y="36" width="126" height="120" rx="10"/><text class="sm b on-p" x="297" y="76" text-anchor="middle">应用</text>
+  <text class="sm" x="297" y="98" text-anchor="middle">自己排序</text><text class="sm" x="297" y="116" text-anchor="middle">自己分组</text><text class="sm" x="297" y="134" text-anchor="middle">自己聚合</text>
+
+  <text class="ttl on-g" x="570" y="22" text-anchor="middle">在数据库里算</text>
+  <rect class="bx-a" x="400" y="36" width="190" height="120" rx="10"/><text class="sm b on-a" x="495" y="62" text-anchor="middle">Postgres</text>
+  <text class="mono" x="495" y="86" text-anchor="middle">ORDER BY · GROUP BY</text>
+  <text class="mono" x="495" y="106" text-anchor="middle">SUM · 窗口函数 · CTE</text>
+  <text class="mono" x="495" y="126" text-anchor="middle">函数 · 存储过程 · 触发器</text>
+  <path class="ln-g" d="M592 96 H646" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="619" y="150" text-anchor="middle">只传结果</text>
+  <rect class="bx-p" x="650" y="36" width="90" height="120" rx="10"/><text class="sm b on-p" x="695" y="100" text-anchor="middle">应用</text>
+
+  <text class="sm" x="380" y="190" text-anchor="middle">数据库就在数据旁边，计算离数据越近，要搬运的数据就越少</text>
+  <text class="sm" x="380" y="210" text-anchor="middle">交给数据库的越多，应用的逻辑越简洁，整条技术栈的资源利用越高效</text>
+</svg>
+<figcaption>图 A-5　让计算靠近数据</figcaption>
+</figure>
+
+<ul>
+  <li>要排序？用 <code>ORDER BY</code>，别把数据取到应用里再排。</li>
+  <li>要按条件分组？多半用不着自己写逻辑，<code>GROUP BY</code> 就能搞定。</li>
+  <li>要执行一个严重依赖 Postgres 里数据的计算密集或数据密集的业务操作？考虑写一个完全在数据库里运行的函数或存储过程（回顾第 2 章的银行计息例子）。</li>
+</ul>
+
+<p>能交给数据库的越多，应用这边要处理的就越少，逻辑可能更清晰，整个技术栈的资源利用也更高效。</p>
+
+<h2 id="summary">小结</h2>
+
+<div class="tw"><table>
+<tr><th>技巧</th><th>一句话</th><th>相关章节</th></tr>
+<tr><td>精通 EXPLAIN</td><td>先看懂计划，比较估算与实际，留意 Buffers；不要凭感觉优化</td><td>第 4 章</td></tr>
+<tr><td>知道何时用索引</td><td>EXPLAIN → 发现索引不足就补；警惕过度索引，用少数索引覆盖常见查询</td><td>第 4–6、8–10 章</td></tr>
+<tr><td>用连接池</td><td>每个连接是一个 OS 进程；客户端池 + 服务端池（PgBouncer 等）复用连接、限制并发</td><td>—</td></tr>
+<tr><td>只查需要的</td><td>避免 SELECT *，尤其有变长列时；count(*) 是例外</td><td>第 1 章</td></tr>
+<tr><td>用好计算能力</td><td>排序、分组、聚合、复杂逻辑尽量交给数据库</td><td>第 2、3 章</td></tr>
+</table></div>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>挑本书任意一条查询，分别用 <code>EXPLAIN</code>、<code>EXPLAIN ANALYZE</code>、<code>EXPLAIN (analyze, buffers on)</code> 执行，逐项对照图 A-1 解读输出。</li>
+    <li>对 <code>game.player_stats</code>（第 4 章）执行 <code>SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE schemaname = 'game';</code>，找出从来没被用过的索引 —— 它们就是过度索引的候选。</li>
+    <li>对第 8 章的 <code>omdb.movies</code> 比较 <code>SELECT *</code> 和 <code>SELECT id, name</code> 的 <code>EXPLAIN (analyze)</code> 输出中的 width，体会 1024 维向量列有多“重”。</li>
+    <li>用你熟悉的语言写一个小程序，分别用“每次新建连接”和“连接池”执行 1000 次简单查询，比较总耗时。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

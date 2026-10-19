@@ -1,0 +1,1113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 3 章 · 现代 SQL — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="3">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 3 章</span>
+<h1>现代 SQL</h1>
+<p class="lede">
+  SQL 诞生于 20 世纪 70 年代初，比第一台个人电脑 Altair 还早。但它和人类语言一样，一直在进化。
+  大多数人熟悉的仍是 1992 年的 SQL-92 标准，而在那之后，SQL 已经长出了很多让查询更短、更好读、更强大的新能力。
+  这一章我们以一个音乐流媒体服务为例，学习其中最实用的三样：<strong>CTE</strong>、<strong>递归查询</strong>和<strong>窗口函数</strong>。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>知道“现代 SQL”指什么，为什么值得学</li>
+    <li>用 <code>WITH</code>（CTE）把复杂查询拆成一步步可读的小块，包括修改数据的 CTE</li>
+    <li>用 <code>WITH RECURSIVE</code> 遍历层级、链式数据</li>
+    <li>用 <code>OVER (PARTITION BY … ORDER BY …)</code> 计算分组总计、累计值和排名</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="modern">什么是现代 SQL</h2>
+
+<p>
+  “现代 SQL”（modern SQL）这个说法是数据库专家 Markus Winand 提出的，他的网站 <a href="https://modern-sql.com/">modern-sql.com</a> 专门推广 SQL-92 之后加入标准的新能力。他这样描述：
+</p>
+
+<div class="box key">
+  <div class="t">&#10077; Markus Winand</div>
+  <p>从 1999 年起，SQL 就不再局限于关系模型了。那时 ISO/IEC 9075（“SQL 标准”）加入了数组、对象和递归查询。如今 SQL 标准的篇幅已经是 SQL-92 的五倍。换句话说：<strong>关系型 SQL 只占现代 SQL 的 20% 左右。</strong></p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="SQL 标准的演进时间线">
+  <path class="ln-a" d="M40 90 H730" marker-end="url(#ar-a)"/>
+  <circle class="dot" cx="80" cy="90" r="7"/>
+  <text class="ttl" x="80" y="66" text-anchor="middle">1970s</text>
+  <text class="sm" x="80" y="118" text-anchor="middle">SQL 诞生</text>
+
+  <circle class="dot-b" cx="220" cy="90" r="8"/>
+  <text class="ttl on-b" x="220" y="66" text-anchor="middle">SQL-92</text>
+  <text class="sm" x="220" y="118" text-anchor="middle">完善关系模型</text>
+  <text class="sm" x="220" y="134" text-anchor="middle">多数人停在这里</text>
+
+  <circle class="dot-a" cx="360" cy="90" r="8"/>
+  <text class="ttl on-a" x="360" y="66" text-anchor="middle">SQL:1999</text>
+  <text class="sm" x="360" y="118" text-anchor="middle">递归查询 · 数组</text>
+  <text class="sm" x="360" y="134" text-anchor="middle">CTE（WITH）</text>
+
+  <circle class="dot-a" cx="490" cy="90" r="8"/>
+  <text class="ttl on-a" x="490" y="66" text-anchor="middle">SQL:2003</text>
+  <text class="sm" x="490" y="118" text-anchor="middle">窗口函数</text>
+  <text class="sm" x="490" y="134" text-anchor="middle">MERGE</text>
+
+  <circle class="dot-a" cx="610" cy="90" r="8"/>
+  <text class="ttl on-a" x="610" y="66" text-anchor="middle">SQL:2016</text>
+  <text class="sm" x="610" y="118" text-anchor="middle">JSON（第 5 章）</text>
+
+  <circle class="dot-a" cx="700" cy="90" r="8"/>
+  <text class="ttl on-a" x="700" y="66" text-anchor="middle">SQL:2023</text>
+  <text class="sm" x="700" y="118" text-anchor="middle">属性图查询</text>
+
+  <rect class="bx-a" x="300" y="152" width="440" height="32" rx="8"/>
+  <text class="sm on-a" x="520" y="173" text-anchor="middle">“现代 SQL”：SQL-92 之后加入的能力</text>
+  <rect class="bx-b" x="40" y="152" width="240" height="32" rx="8"/>
+  <text class="sm on-b" x="160" y="173" text-anchor="middle">“经典 SQL”</text>
+</svg>
+<figcaption>图 3-1　SQL 的演进：现代 SQL 指 SQL-92 之后的部分</figcaption>
+</figure>
+
+<p>现代 SQL 带来的能力大致分两类：</p>
+
+<ul>
+  <li><strong>非结构化数据的类型</strong>：关系模型要求数据结构规整、拆成原子单元、互相关联（规范化）。但今天的 SQL 数据库支持数组、JSON、自定义复合类型，可以高效地存储和处理不那么规整的数据。</li>
+  <li><strong>应对现代工作负载的能力</strong>：SQL 一向以啰嗦著称，复杂查询尤甚。CTE 和窗口函数让复杂运算变得简洁可读；递归查询和属性图让层级、树形、图结构的处理变得简单。</li>
+</ul>
+
+<p>既然这么好，为什么还没进入每个开发者的工具箱？至少有两个原因：</p>
+
+<ul>
+  <li><strong>知识的惯性</strong>：很多人多年前学会了 SQL-92，查询虽然啰嗦、低效，但任务也能完成，于是一直沿用老办法。</li>
+  <li><strong>ORM 框架</strong>：有些开发者完全依赖 ORM 生成 SQL。但 ORM 是为通用场景设计的，它未必知道在你的场景里应该用高效的窗口函数，而不是笨重的自连接。</li>
+</ul>
+
+<p>第 5、6 章还会继续学习现代 SQL 处理半结构化数据和文本的能力。</p>
+
+<h2 id="dataset">加载音乐流媒体数据集</h2>
+
+<p>本章的例子是一个音乐流媒体服务：用户可以收听喜欢的歌曲和歌手。数据库结构很简单，三张表：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 256" role="img" aria-label="音乐流媒体服务的数据库结构：users、songs、plays 三张表">
+  <rect class="bx-b" x="20" y="20" width="200" height="104" rx="10"/>
+  <text class="ttl on-b" x="120" y="42" text-anchor="middle">streaming.users</text>
+  <text class="mono" x="34" y="66">id</text><text class="sm" x="150" y="66">int · 主键</text>
+  <text class="mono" x="34" y="88">name</text><text class="sm" x="150" y="88">text</text>
+  <text class="mono" x="34" y="110">location</text><text class="sm" x="150" y="110">text</text>
+
+  <rect class="bx-b" x="20" y="140" width="200" height="104" rx="10"/>
+  <text class="ttl on-b" x="120" y="162" text-anchor="middle">streaming.songs</text>
+  <text class="mono" x="34" y="186">id</text><text class="sm" x="150" y="186">int · 主键</text>
+  <text class="mono" x="34" y="208">title</text><text class="sm" x="150" y="208">text</text>
+  <text class="mono" x="34" y="230">duration</text><text class="sm" x="150" y="230">int · 秒</text>
+
+  <rect class="bx-a" x="340" y="30" width="400" height="190" rx="10"/>
+  <text class="ttl on-a" x="540" y="54" text-anchor="middle">streaming.plays（每次播放一行）</text>
+  <text class="mono" x="356" y="80">id</text><text class="sm" x="510" y="80">bigint · 本次播放的 ID</text>
+  <text class="mono" x="356" y="102">user_id</text><text class="sm" x="510" y="102">int → users.id</text>
+  <text class="mono" x="356" y="124">song_id</text><text class="sm" x="510" y="124">int → songs.id</text>
+  <text class="mono" x="356" y="146">play_start_time</text><text class="sm" x="510" y="146">timestamp · 开始时间</text>
+  <text class="mono" x="356" y="168">play_duration</text><text class="sm" x="510" y="168">int · 实际听了几秒</text>
+  <text class="mono" x="356" y="190">played_after</text><text class="sm" x="510" y="190">bigint → 上一次播放的 id</text>
+  <text class="sm" x="510" y="208">（连续播放链；第一首为 NULL）</text>
+
+  <path class="ln-b" d="M338 102 H222" marker-end="url(#ar-b)"/>
+  <path class="ln-b" d="M338 124 Q280 124 280 170 Q280 190 224 190" marker-end="url(#ar-b)"/>
+  <path class="ln-a" d="M740 190 Q756 190 756 140 Q756 80 742 80" marker-end="url(#ar-a)"/>
+</svg>
+<figcaption>图 3-2　音乐服务的数据库结构</figcaption>
+</figure>
+
+<p>
+  <code>plays</code> 表是重点：每当用户播放一首歌，就新增一行。
+  <code>play_duration</code> 记录用户实际听了多久（如果等于歌曲的 <code>duration</code>，说明听完了）；
+  <code>played_after</code> 记录“这首歌是紧接着哪次播放之后放的”，用来追踪不间断连续播放的歌曲序列 —— 递归查询那一节会用到。
+</p>
+
+<p>用第 1 章启动的 Postgres 容器，按下面的步骤加载数据：</p>
+
+<ol class="steps">
+  <li>克隆本书的代码仓库：
+    <div class="code" data-lang="bash"><pre>
+git clone https://github.com/dmagda/just-use-postgres-book
+</pre></div></li>
+  <li>把数据集复制进容器：
+    <div class="code" data-lang="bash"><pre>
+cd just-use-postgres-book/
+docker cp data/streaming/. postgres:/home/.
+</pre></div></li>
+  <li>用 psql 的 <code>\i</code> 元命令执行复制进去的 SQL 脚本（先建表，再导数据）：
+    <div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U postgres -c "\i /home/streaming_ddl.sql"
+docker exec -it postgres psql -U postgres -c "\i /home/streaming_data.sql"
+</pre></div></li>
+  <li>连接 Postgres，检查建好的表：
+    <div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U postgres
+\dt streaming.*
+</pre></div>
+    <div class="code out"><pre>
+          List of relations
+  Schema   | Name  | Type  |  Owner
+-----------+-------+-------+----------
+ streaming | plays | table | postgres
+ streaming | songs | table | postgres
+ streaming | users | table | postgres
+(3 rows)
+</pre></div></li>
+</ol>
+
+<h2 id="cte">公用表表达式（CTE）</h2>
+
+<p>
+  <strong>CTE</strong>（Common Table Expression，公用表表达式）能把又长又复杂的查询拆成一个个更小、更好管理的部分。
+  它用 <code>WITH</code> 子句定义：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+WITH cte_name AS (
+    auxiliary_statement     -- 辅助语句
+)
+primary_statement           -- 主语句
+</pre></div>
+
+<p>
+  <code>WITH</code> 定义了一个有名字的 CTE。辅助语句可以是普通的 <code>SELECT</code>，也可以是 <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>/<code>MERGE</code>；
+  它的执行结果可供后面的主语句使用。你可以把 CTE 想象成<strong>只在这条查询里存在的临时表或视图</strong>。
+</p>
+
+<h3>用 CTE 查询数据</h3>
+
+<p>需求：统计某段时间内最受欢迎的歌曲 —— 也就是被<strong>完整听完</strong>次数最多的歌。</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.1 · 统计最受欢迎的歌曲">
+<pre>
+WITH plays_cte AS (
+    SELECT s.title, s.duration
+    FROM streaming.plays p
+    JOIN streaming.songs s ON p.song_id = s.id
+    WHERE p.play_start_time::DATE BETWEEN '2024-09-15' AND '2024-09-16'
+      AND p.play_duration = s.duration          -- 听完了
+)
+SELECT title, COUNT(*) AS play_count
+FROM plays_cte
+GROUP BY title
+ORDER BY play_count DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+ title  | play_count
+--------+------------
+ Song D |          4
+ Song A |          3
+ Song G |          2
+(3 rows)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; <code>::DATE</code> 是什么</div>
+  <p><code>值::类型</code> 是 Postgres 的类型转换简写，等价于标准写法 <code>CAST(值 AS 类型)</code>。这里把时间戳转成日期，丢掉时分秒，方便按日期比较。</p>
+</div>
+
+<div class="box deep">
+  <div class="t">&#9670; Postgres 会“折叠”CTE</div>
+  <p>
+    根据查询的复杂度，Postgres 可能把 CTE 合并（fold）进主语句，或者把整个查询改写成更高效的形式。
+    比如清单 3.1 用 CTE 只是为了教学，其实写成一条 <code>SELECT</code> 也行 —— Postgres 能识别出来并自动优化。
+    可以用 <code>EXPLAIN ANALYZE</code> 看执行计划来验证（第 4 章详细讲 EXPLAIN）。
+  </p>
+</div>
+
+<p>写得清楚的 CTE 也很好改。现在要找<strong>最不受欢迎</strong>的歌曲（推荐算法决定增删推荐时有用）：把条件改成“听了不到一半就切走”，再取最短的三首：</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.2 · 找出最不受欢迎的歌曲">
+<pre>
+WITH plays_cte AS (
+    SELECT s.title, s.duration, p.play_duration
+    FROM streaming.plays p
+    JOIN streaming.songs s ON p.song_id = s.id
+    WHERE p.play_start_time::DATE BETWEEN '2024-09-15' AND '2024-09-16'
+      AND p.play_duration < (s.duration / 2)    -- 没听到一半
+)
+SELECT title, MIN(play_duration) AS min_play_duration
+FROM plays_cte
+GROUP BY title
+ORDER BY min_play_duration ASC LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+ title  | min_play_duration
+--------+-------------------
+ Song E |                32
+ Song F |                78
+ Song J |                91
+(3 rows)
+</pre></div>
+
+<h3>一个查询里用多个 CTE</h3>
+
+<p>
+  一条查询可以定义多个 CTE，用逗号分隔，<strong>后面的 CTE 可以引用前面的</strong>。
+  上一个查询对刚发布的新歌有点不公平：也许只有一个人没听完。我们改成：至少有三个不同用户都没听完，才算“不受欢迎”。
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.3 · 至少三位用户都不感兴趣的歌曲">
+<pre>
+WITH plays_cte AS (
+    SELECT s.title, s.duration, p.play_duration, p.user_id
+    FROM streaming.plays p
+    JOIN streaming.songs s ON p.song_id = s.id
+    WHERE p.play_start_time::DATE BETWEEN '2024-09-15' AND '2024-09-16'
+      AND p.play_duration < (s.duration / 2)
+),
+user_play_counts AS (
+    SELECT title, duration, COUNT(DISTINCT user_id) AS user_count,
+      MIN(play_duration) AS min_play_duration,
+      COUNT(*) AS total_play_count
+    FROM plays_cte
+    GROUP BY title, duration
+)
+SELECT title, duration, min_play_duration, total_play_count
+FROM user_play_counts
+WHERE user_count >= 3
+ORDER BY min_play_duration ASC
+LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+ title  | duration | min_play_duration | total_play_count
+--------+----------+-------------------+------------------
+ Song E |      150 |                32 |                3
+(1 row)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="多个 CTE 像流水线一样逐步加工数据">
+  <rect class="bx" x="20" y="60" width="120" height="80" rx="10"/>
+  <text class="ttl" x="80" y="92" text-anchor="middle">plays</text>
+  <text class="ttl" x="80" y="114" text-anchor="middle">+ songs</text>
+
+  <path class="ln" d="M142 100 H176" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="180" y="40" width="170" height="120" rx="10"/>
+  <text class="ttl on-b" x="265" y="64" text-anchor="middle">plays_cte</text>
+  <text class="sm" x="265" y="88" text-anchor="middle">JOIN 两张表</text>
+  <text class="sm" x="265" y="106" text-anchor="middle">过滤日期</text>
+  <text class="sm" x="265" y="124" text-anchor="middle">只留“没听到一半”的</text>
+  <text class="sm on-b" x="265" y="148" text-anchor="middle">9 行</text>
+
+  <path class="ln" d="M352 100 H386" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="390" y="40" width="170" height="120" rx="10"/>
+  <text class="ttl on-p" x="475" y="64" text-anchor="middle">user_play_counts</text>
+  <text class="sm" x="475" y="88" text-anchor="middle">按歌曲分组</text>
+  <text class="sm" x="475" y="106" text-anchor="middle">数不同用户数</text>
+  <text class="sm" x="475" y="124" text-anchor="middle">最短收听时长</text>
+  <text class="sm on-p" x="475" y="148" text-anchor="middle">6 行（6 首歌）</text>
+
+  <path class="ln" d="M562 100 H596" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="600" y="40" width="140" height="120" rx="10"/>
+  <text class="ttl on-a" x="670" y="64" text-anchor="middle">主语句</text>
+  <text class="sm" x="670" y="88" text-anchor="middle">user_count ≥ 3</text>
+  <text class="sm" x="670" y="106" text-anchor="middle">排序</text>
+  <text class="sm" x="670" y="124" text-anchor="middle">取前 3</text>
+  <text class="sm on-a" x="670" y="148" text-anchor="middle">1 行</text>
+
+  <text class="sm" x="380" y="188" text-anchor="middle">每一步只做一件事，从上往下读就能理解 —— 这就是 CTE 的价值</text>
+</svg>
+<figcaption>图 3-3　多个 CTE 组成一条数据加工流水线</figcaption>
+</figure>
+
+<h4>写成三步，执行就要三遍吗？</h4>
+
+<p>
+  看起来 Postgres 要执行三个独立的 <code>SELECT</code>。改成子查询或者一条大 <code>SELECT</code> 会不会更快？答案是：<strong>看情况</strong>，要比较执行计划才知道。
+  但有一点可以肯定：<strong>Postgres 并不一定按你写的方式执行查询</strong>。SQL 只是描述“我想要什么结果”，具体怎么做由数据库决定。
+  在清单 3.3 前面加上 <code>EXPLAIN (analyze, costs off, timing off)</code> 再执行：
+</p>
+
+<div class="code out"><pre>
+                              QUERY PLAN
+-------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   -> Sort (actual rows=1 loops=1)
+         Sort Key: user_play_counts.min_play_duration
+         -> Subquery Scan on user_play_counts (actual rows=1 loops=1)
+               -> GroupAggregate (actual rows=1 loops=1)
+                     Group Key: s.title, s.duration
+                     Filter: (count(DISTINCT p.user_id) >= 3)
+                     Rows Removed by Filter: 5
+                     -> Sort (actual rows=9 loops=1)
+                           Sort Key: s.title, s.duration, p.user_id
+                           -> Hash Join (actual rows=9 loops=1)
+                                 Hash Cond: (s.id = p.song_id)
+                                 Join Filter: (p.play_duration < (s.duration / 2))
+                                 Rows Removed by Join Filter: 27
+                                 -> Seq Scan on songs s (actual rows=10 loops=1)
+                                 -> Hash (actual rows=36 loops=1)
+                                       -> Seq Scan on plays p (actual rows=36 loops=1)
+                                             Filter: (... BETWEEN 2024-09-15 AND 2024-09-16)
+</pre></div>
+
+<p>执行计划要<strong>从下往上、从里往外</strong>读：</p>
+
+<ul>
+  <li><strong>Hash Join 阶段</strong>：连接 plays 和 songs，只保留满足条件的行。注意 <code>plays_cte</code> 根本没有单独出现 —— 它被折叠进了 <code>user_play_counts</code>。</li>
+  <li><strong>GroupAggregate 阶段</strong>：没有二级索引，所以先排序、再分组，并应用“至少三位用户”的过滤。</li>
+  <li><strong>Subquery Scan 阶段</strong>：遍历 <code>user_play_counts</code> 的结果，排序取前几名。</li>
+</ul>
+
+<p>
+  整个过程中 plays 和 songs 表都只扫描了一遍。所以选择子查询还是 CTE 时，<strong>选让你和团队读起来更清楚的那个</strong>。
+  多数情况下 Postgres 都能高效地把 CTE 折叠起来，你既得到可读性，又不损失性能。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 物化（MATERIALIZED）</div>
+  <p>
+    如果一个 CTE 被主语句或后续 CTE <strong>引用了不止一次</strong>，Postgres 会把它<strong>物化</strong>：只计算一次，把结果存起来供多次引用。
+    你也可以强制物化：<code>WITH cte_name AS MATERIALIZED (…)</code>；
+    反过来，<code>NOT MATERIALIZED</code> 要求每次引用都重新计算。
+  </p>
+</div>
+
+<h3>用 CTE 修改数据</h3>
+
+<p>
+  CTE 里也可以放 <code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code>、<code>MERGE</code>，把新增、修改或删除的记录交给主语句继续处理。
+  比如：用户正在听歌，服务更新播放时长，然后立刻判断这首歌的排名是否该上升：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.4 · 修改数据的 CTE">
+<pre>
+WITH updated_play AS (
+    UPDATE streaming.plays
+    SET play_duration = 200
+    WHERE id = 30
+    RETURNING song_id, play_duration       -- 把改后的值交给主语句
+)
+SELECT s.title, s.duration,
+       CASE
+            WHEN up.play_duration = s.duration THEN 'Moved Up the Rank'
+            ELSE 'Rank Not Changed'
+       END AS rank_change_status
+FROM updated_play up
+JOIN streaming.songs s ON s.id = up.song_id;
+</pre>
+</div>
+<div class="code out"><pre>
+ title  | duration | rank_change_status
+--------+----------+--------------------
+ Song A |      200 | Moved Up the Rank
+(1 row)
+</pre></div>
+
+<ul>
+  <li>CTE 把第 30 次播放的时长改成 200 秒。如果正好是整首歌的时长，说明听完了，排名可能上升。</li>
+  <li><code>RETURNING</code> 子句把 <code>song_id</code> 和更新后的 <code>play_duration</code> 返回给主语句（要返回所有列，写 <code>RETURNING *</code>）。</li>
+  <li><code>CASE WHEN … THEN … ELSE … END</code> 是 SQL 里的“if-else”。</li>
+</ul>
+
+<div class="box warn">
+  <div class="t">&#9888; 修改数据的 CTE 两个特别之处</div>
+  <ul>
+    <li><strong>即使主语句没引用它，它也会执行。</strong>而 <code>SELECT</code> 型的 CTE 只有被引用时才会计算。</li>
+    <li><strong>同一查询里的多个 CTE 是“同时”执行的</strong>，基于同一份数据快照 —— 一个 CTE 做的修改，其他 CTE 看不到。</li>
+  </ul>
+</div>
+
+<p>验证第二点。先看第 12 次播放的现状：<code>song_id</code> 为 3，已经听了 118 秒。然后在一个 CTE 里改它，另一个 CTE 里读它：</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.5 · 修改型和查询型 CTE 并发执行">
+<pre>
+WITH updated_play AS (
+    UPDATE streaming.plays
+    SET play_duration = 150
+    WHERE id = 12
+    RETURNING song_id, play_duration
+),
+current_play_duration AS (
+    SELECT song_id, (play_duration = 150) as is_change_visible_to_cte
+    FROM streaming.plays           -- 直接读表
+    WHERE id = 12
+)
+SELECT is_change_visible_to_cte,
+    (play_duration = 150) as is_change_visible_to_primary
+FROM updated_play up
+JOIN current_play_duration cp ON up.song_id = cp.song_id;
+</pre>
+</div>
+<div class="code out"><pre>
+ is_change_visible_to_cte | is_change_visible_to_primary
+--------------------------+------------------------------
+ f                        | t
+(1 row)
+</pre></div>
+
+<p>
+  第二个 CTE 看不到修改（<code>f</code> = false），因为两个 CTE 在同一份快照上并发执行。
+  想让它看到，就让它<strong>直接读取 updated_play</strong>，而不是读表：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.6 · 修改型和查询型 CTE 顺序执行">
+<pre>
+WITH updated_play AS (
+    UPDATE streaming.plays
+    SET play_duration = 160
+    WHERE id = 12
+    RETURNING id, song_id, play_duration
+),
+current_play_duration AS (
+    SELECT song_id, (play_duration = 160) as is_change_visible_to_cte
+    FROM updated_play              -- 改成读 CTE 的结果
+    WHERE id = 12
+)
+SELECT is_change_visible_to_cte,
+    (play_duration = 160) as is_change_visible_to_primary
+FROM updated_play up
+JOIN current_play_duration cp ON up.song_id = cp.song_id;
+</pre>
+</div>
+<div class="code out"><pre>
+ is_change_visible_to_cte | is_change_visible_to_primary
+--------------------------+------------------------------
+ t                        | t
+(1 row)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="修改型 CTE 与其他 CTE 共享同一个数据快照">
+  <text class="ttl on-r" x="190" y="22" text-anchor="middle">清单 3.5：都读表 → 看不到</text>
+  <rect class="bx-d" x="30" y="34" width="320" height="50" rx="8"/>
+  <text class="sm" x="190" y="56" text-anchor="middle">查询开始时的数据快照</text>
+  <text class="mono" x="190" y="74" text-anchor="middle">plays.id=12 → 118 秒</text>
+  <rect class="bx-b" x="30" y="120" width="150" height="56" rx="8"/>
+  <text class="sm b" x="105" y="142" text-anchor="middle">updated_play</text>
+  <text class="sm" x="105" y="162" text-anchor="middle">UPDATE → 150</text>
+  <rect class="bx-r" x="200" y="120" width="150" height="56" rx="8"/>
+  <text class="sm b" x="275" y="142" text-anchor="middle">current_play_duration</text>
+  <text class="sm" x="275" y="162" text-anchor="middle">读到 118 ✗</text>
+  <path class="ln" d="M105 86 V116" marker-end="url(#ar)"/>
+  <path class="ln" d="M275 86 V116" marker-end="url(#ar)"/>
+  <text class="sm" x="190" y="204" text-anchor="middle">两个 CTE 平行地从同一快照出发，</text>
+  <text class="sm" x="190" y="222" text-anchor="middle">彼此看不到对方的修改</text>
+
+  <text class="ttl on-g" x="570" y="22" text-anchor="middle">清单 3.6：读 CTE → 看得到</text>
+  <rect class="bx-d" x="410" y="34" width="320" height="50" rx="8"/>
+  <text class="sm" x="570" y="56" text-anchor="middle">查询开始时的数据快照</text>
+  <text class="mono" x="570" y="74" text-anchor="middle">plays.id=12 → 118 秒</text>
+  <rect class="bx-b" x="490" y="104" width="160" height="50" rx="8"/>
+  <text class="sm b" x="570" y="124" text-anchor="middle">updated_play</text>
+  <text class="sm" x="570" y="143" text-anchor="middle">UPDATE → 160，RETURNING</text>
+  <path class="ln" d="M570 86 V100" marker-end="url(#ar)"/>
+  <path class="ln-g" d="M570 156 V180" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="490" y="184" width="160" height="50" rx="8"/>
+  <text class="sm b" x="570" y="204" text-anchor="middle">current_play_duration</text>
+  <text class="sm" x="570" y="223" text-anchor="middle">FROM updated_play → 160 ✓</text>
+</svg>
+<figcaption>图 3-4　想看到修改，就要直接引用修改型 CTE 的 RETURNING 结果</figcaption>
+</figure>
+
+<h2 id="recursive">递归查询</h2>
+
+<p>递归查询是一种特殊的 CTE，在定义时加上 <code>RECURSIVE</code> 关键字。一般形式如下：</p>
+
+<div class="code" data-lang="sql"><pre>
+WITH RECURSIVE cte_name (column1, column2, columnN)  -- 递归 CTE 定义（列清单可选）
+AS (
+    SELECT columns FROM table1                      -- 非递归项：只执行一次，提供“起点”
+    WHERE condition
+
+    UNION [ALL]
+
+    SELECT columns FROM cte_name                    -- 递归项：引用自己，反复执行
+    WHERE recursive_condition
+)
+SELECT columns FROM cte_name;                       -- 主语句
+</pre></div>
+
+<ul>
+  <li><strong>非递归项</strong>只执行一次，把初始数据放进一个临时的<strong>工作表</strong>，这些数据也会加入最终结果。</li>
+  <li><strong>递归项</strong>以上一步的工作表为输入反复执行，只要还能产出新行（递归条件为真）就继续。</li>
+  <li><code>UNION</code> 会去掉重复行，<code>UNION ALL</code> 保留所有行。</li>
+</ul>
+
+<p>用伪代码表示执行过程（原书清单 3.7）：</p>
+
+<div class="code" data-lang="js" data-file="清单 3.7 · 递归查询执行流程（伪代码）">
+<pre>
+// 第 1 步：执行非递归项（只执行一次）
+non_recursive_result = execute(non_recursive_term);
+
+// 第 2 步：如果用的是 UNION，去重；UNION ALL 则跳过
+if (using UNION)
+    non_recursive_result = remove_duplicates(non_recursive_result);
+
+// 第 3 步：加入最终结果
+final_result.add(non_recursive_result);
+
+// 第 4 步：用它初始化工作表
+working_table = non_recursive_result;
+
+// 第 5 步：只要工作表不为空，就继续执行递归项
+while (working_table is not empty) {
+    // 第 6 步：以当前工作表为输入执行递归项
+    intermediate_table = execute(recursive_term, using=working_table);
+
+    // 第 7 步：UNION 时，去掉中间表内部、以及与最终结果重复的行
+    if (using UNION)
+        intermediate_table =
+            remove_duplicates(intermediate_table, excluding=final_result);
+
+    // 第 8 步：把这一轮的结果加入最终结果
+    final_result.add(intermediate_table);
+
+    // 第 9 步：用这一轮的结果替换工作表，进入下一轮
+    working_table = intermediate_table;
+}
+
+// 第 10 步：返回最终结果
+return final_result;
+</pre>
+</div>
+
+<h3>查询层级数据：连续播放的歌曲序列</h3>
+
+<p>
+  如果用户一首接一首不间断地听歌，每次新播放的 <code>played_after</code> 列就记录上一次播放的 <code>id</code>；
+  序列里的第一首，<code>played_after</code> 是 NULL。这就构成了一条条<strong>链表</strong>，典型的层级结构。数据集里有 13 个序列：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*) FROM streaming.plays WHERE played_after IS NULL;
+-- 13
+</pre></div>
+
+<p>写一个递归查询，找出从第 5 次播放开始的整条播放序列：</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.8 · 找出某次播放之后连续播放的歌曲">
+<pre>
+WITH RECURSIVE play_sequence AS (
+    -- 起点：id = 5 的这次播放
+    SELECT id, user_id, song_id,
+      play_start_time, play_duration, played_after
+    FROM streaming.plays
+    WHERE id = 5
+
+    UNION ALL
+
+    -- 每一轮：找“紧接在上一轮那次播放之后”的播放
+    SELECT p.id, p.user_id, p.song_id, p.play_start_time,
+       p.play_duration, p.played_after
+    FROM streaming.plays p
+    JOIN play_sequence ps ON p.played_after = ps.id
+)
+SELECT user_id, song_id, play_start_time,
+  play_duration as duration, played_after
+FROM play_sequence
+ORDER BY play_start_time;
+</pre>
+</div>
+<div class="code out"><pre>
+ user_id | song_id |   play_start_time   | duration | played_after
+---------+---------+---------------------+----------+--------------
+       1 |       5 | 2024-09-15 01:34:00 |       61 |
+       1 |       6 | 2024-09-15 01:37:30 |      139 |            5
+       1 |       7 | 2024-09-15 01:42:00 |      104 |            6
+       1 |       8 | 2024-09-15 01:45:00 |       99 |            7
+(4 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="递归查询逐轮展开：工作表从 id=5 开始，每轮找到下一首，直到找不到为止">
+  <text class="ttl" x="20" y="22">plays 表里的一条播放链（played_after 指向上一次播放）</text>
+  <rect class="bx-a" x="20" y="36" width="130" height="50" rx="8"/><text class="mono on-a" x="85" y="57" text-anchor="middle">id=5</text><text class="sm" x="85" y="76" text-anchor="middle">after = NULL</text>
+  <rect class="bx" x="200" y="36" width="130" height="50" rx="8"/><text class="mono" x="265" y="57" text-anchor="middle">id=6</text><text class="sm" x="265" y="76" text-anchor="middle">after = 5</text>
+  <rect class="bx" x="380" y="36" width="130" height="50" rx="8"/><text class="mono" x="445" y="57" text-anchor="middle">id=7</text><text class="sm" x="445" y="76" text-anchor="middle">after = 6</text>
+  <rect class="bx" x="560" y="36" width="130" height="50" rx="8"/><text class="mono" x="625" y="57" text-anchor="middle">id=8</text><text class="sm" x="625" y="76" text-anchor="middle">after = 7</text>
+  <path class="ln" d="M196 61 H154" marker-end="url(#ar)"/>
+  <path class="ln" d="M376 61 H334" marker-end="url(#ar)"/>
+  <path class="ln" d="M556 61 H514" marker-end="url(#ar)"/>
+
+  <text class="ttl" x="20" y="124">递归执行过程</text>
+  <rect class="cell-h" x="20" y="134" width="720" height="26"/>
+  <text class="sm b" x="30" y="152">轮次</text><text class="sm b" x="130" y="152">做了什么</text><text class="sm b" x="430" y="152">工作表</text><text class="sm b" x="580" y="152">最终结果</text>
+  <rect class="cell-a" x="20" y="160" width="720" height="26"/>
+  <text class="sm" x="30" y="178">非递归项</text><text class="sm" x="130" y="178">WHERE id = 5</text><text class="mono" x="430" y="178">{5}</text><text class="mono" x="580" y="178">5</text>
+  <rect class="cell" x="20" y="186" width="720" height="26"/>
+  <text class="sm" x="30" y="204">第 1 轮</text><text class="sm" x="130" y="204">找 played_after = 5 的行</text><text class="mono" x="430" y="204">{6}</text><text class="mono" x="580" y="204">5, 6</text>
+  <rect class="cell" x="20" y="212" width="720" height="26"/>
+  <text class="sm" x="30" y="230">第 2 轮</text><text class="sm" x="130" y="230">找 played_after = 6 的行</text><text class="mono" x="430" y="230">{7}</text><text class="mono" x="580" y="230">5, 6, 7</text>
+  <rect class="cell" x="20" y="238" width="720" height="26"/>
+  <text class="sm" x="30" y="256">第 3 轮</text><text class="sm" x="130" y="256">找 played_after = 7 的行</text><text class="mono" x="430" y="256">{8}</text><text class="mono" x="580" y="256">5, 6, 7, 8</text>
+  <rect class="cell-g" x="20" y="264" width="720" height="26"/>
+  <text class="sm" x="30" y="282">第 4 轮</text><text class="sm" x="130" y="282">找 played_after = 8 的行 → 没有</text><text class="mono" x="430" y="282">{ } 空</text><text class="sm on-g" x="580" y="282">停止，返回</text>
+</svg>
+<figcaption>图 3-5　递归查询像“顺藤摸瓜”：每一轮用上一轮的结果去找下一层</figcaption>
+</figure>
+
+<p>稍作修改，还能得到每首歌在序列里的<strong>层级</strong>：在非递归项里加一列 <code>1 as level</code>，在递归项里写 <code>level + 1</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+WITH RECURSIVE play_sequence AS (
+    SELECT id, user_id, song_id, play_start_time,
+    play_duration, played_after, 1 as level
+    FROM streaming.plays
+    WHERE id = 5
+
+    UNION ALL
+
+    SELECT p.id, p.user_id, p.song_id, p.play_start_time,
+    p.play_duration, p.played_after, level + 1
+    FROM streaming.plays p
+    JOIN play_sequence ps ON p.played_after = ps.id
+)
+SELECT user_id, song_id, play_start_time,
+  play_duration as duration, played_after, level
+FROM play_sequence
+ORDER BY play_start_time;
+</pre></div>
+<div class="code out"><pre>
+ user_id | song_id |   play_start_time   | duration | played_after | level
+---------+---------+---------------------+----------+--------------+-------
+       1 |       5 | 2024-09-15 01:34:00 |       61 |              |     1
+       1 |       6 | 2024-09-15 01:37:30 |      139 |            5 |     2
+       1 |       7 | 2024-09-15 01:42:00 |      104 |            6 |     3
+       1 |       8 | 2024-09-15 01:45:00 |       99 |            7 |     4
+(4 rows)
+</pre></div>
+
+<h3>在递归中携带参数</h3>
+
+<p>
+  递归 CTE 名字后面可以跟一个列清单：<code>WITH RECURSIVE cte_name (col1, col2, …)</code>。
+  这些列在每一轮之间传递，既可以是已有列的别名，也可以是在递归过程中<strong>生成、累加或更新</strong>的值。
+  比如计算一个序列的总播放时长：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.9 · 计算一个序列的总播放时长">
+<pre>
+WITH RECURSIVE play_sequence(parent_id, sequence, total_duration) AS (
+    SELECT id, ARRAY[id], play_duration
+    FROM streaming.plays
+    WHERE id = 5
+
+    UNION ALL
+
+    SELECT p.id, ps.sequence || p.id, total_duration + p.play_duration
+    FROM streaming.plays p
+    JOIN play_sequence ps ON p.played_after = ps.parent_id
+)
+SELECT p.song_id, p.play_start_time, p.play_duration,
+  ps.sequence, ps.total_duration
+FROM play_sequence ps
+JOIN streaming.plays p ON ps.parent_id = p.id
+ORDER BY ps.sequence, p.play_start_time;
+</pre>
+</div>
+
+<ul>
+  <li>三个携带列：<code>parent_id</code>（当前播放 id）、<code>sequence</code>（走过的路径）、<code>total_duration</code>（累计时长），按定义顺序赋值。</li>
+  <li>非递归项：<code>sequence</code> 初始化为 <code>ARRAY[id]</code>，<code>total_duration</code> 初始化为本次时长。</li>
+  <li>递归项：<code>ps.sequence || p.id</code> 把当前 id 追加到数组末尾（<code>||</code> 是数组/字符串拼接运算符），时长累加。</li>
+</ul>
+
+<div class="code out"><pre>
+ song_id |   play_start_time   | play_duration | sequence  | total_duration
+---------+---------------------+---------------+-----------+----------------
+       5 | 2024-09-15 01:34:00 |            61 | {5}       |             61
+       6 | 2024-09-15 01:37:30 |           139 | {5,6}     |            200
+       7 | 2024-09-15 01:42:00 |           104 | {5,6,7}   |            304
+       8 | 2024-09-15 01:45:00 |            99 | {5,6,7,8} |            403
+(4 rows)
+</pre></div>
+
+<p>最后一行就是整个序列的总时长：403 秒。想一次拿到<strong>所有</strong>序列？把起点条件 <code>WHERE id = 5</code> 换成 <code>WHERE played_after IS NULL</code>（所有序列的第一首）即可：</p>
+
+<div class="code" data-lang="sql"><pre>
+WITH RECURSIVE play_sequence(parent_id, sequence, total_duration) AS (
+    SELECT id, ARRAY[id], play_duration
+    FROM streaming.plays
+    WHERE played_after is NULL
+
+    UNION ALL
+
+    SELECT p.id, ps.sequence || p.id, total_duration + p.play_duration
+    FROM streaming.plays p
+    JOIN play_sequence ps ON p.played_after = ps.parent_id
+)
+SELECT p.song_id, p.play_start_time, p.play_duration,
+  ps.sequence, ps.total_duration
+FROM play_sequence ps
+JOIN streaming.plays p ON ps.parent_id = p.id
+ORDER BY ps.sequence, p.play_start_time;
+</pre></div>
+<div class="code out"><pre>
+ song_id |   play_start_time   | play_duration | sequence  | total_duration
+---------+---------------------+---------------+-----------+----------------
+       1 | 2024-09-15 12:14:00 |           200 | {1}       |            200
+       2 | 2024-09-15 12:17:00 |           144 | {1,2}     |            344
+       3 | 2024-09-15 12:21:00 |           110 | {1,2,3}   |            454
+       4 | 2024-09-15 12:25:30 |           300 | {1,2,3,4} |            754
+       5 | 2024-09-15 01:34:00 |            61 | {5}       |             61
+       6 | 2024-09-15 01:37:30 |           139 | {5,6}     |            200
+       7 | 2024-09-15 01:42:00 |           104 | {5,6,7}   |            304
+       8 | 2024-09-15 01:45:00 |            99 | {5,6,7,8} |            403
+(truncated output)
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 递归查询的常见用途</div>
+  <p>组织架构图（员工→上级）、商品分类树、评论的楼中楼回复、文件目录、社交网络里的“朋友的朋友”……凡是“一行指向另一行”的结构，都可以用递归查询遍历。</p>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 当心死循环</div>
+  <p>如果数据里有环（A 指向 B，B 又指向 A），<code>UNION ALL</code> 的递归会永远停不下来。可以用 <code>UNION</code> 去重，或者像清单 3.9 那样记录路径数组，并在递归项里加 <code>WHERE NOT p.id = ANY(ps.sequence)</code> 防止重复访问。</p>
+</div>
+
+<h2 id="window">窗口函数</h2>
+
+<p>
+  窗口函数也是现代 SQL 最有效的能力之一。递归查询主要用在层级和树形结构上，而窗口函数的用途广泛得多：
+  排名排序、累计求和、移动平均、前后行对比（lag/lead 分析）等等。
+</p>
+
+<p>
+  窗口函数在一组<strong>彼此相关的行</strong>上做计算。它用 <code>OVER</code> 子句把数据分成若干子集（<strong>窗口</strong>），然后对每个窗口应用函数。最基本的形式：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT function_name(arguments)
+OVER (PARTITION BY columnA)
+FROM table;
+</pre></div>
+
+<p>
+  函数可以是普通聚合函数（<code>SUM()</code>、<code>AVG()</code>…），也可以是专用窗口函数（<code>RANK()</code>、<code>ROW_NUMBER()</code>…）。
+  <code>PARTITION BY columnA</code> 把 columnA 值相同的行放进同一个窗口。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 和 GROUP BY 的根本区别</div>
+  <p>普通聚合配合 <code>GROUP BY</code>，<strong>每组只返回一行</strong>；窗口函数则<strong>保留每一行</strong>，只是在每行旁边附上该行所在窗口的计算结果。</p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="GROUP BY 把每组压成一行，窗口函数保留每一行并附加组内结果">
+  <text class="ttl" x="20" y="22">原始行</text>
+  <rect class="cell-h" x="20" y="32" width="170" height="24"/><text class="sm b" x="28" y="49">song · user · 时长</text>
+  <rect class="cell-b" x="20" y="56" width="170" height="24"/><text class="mono" x="28" y="73">1 · 1 · 200</text>
+  <rect class="cell-b" x="20" y="80" width="170" height="24"/><text class="mono" x="28" y="97">1 · 2 · 200</text>
+  <rect class="cell-b" x="20" y="104" width="170" height="24"/><text class="mono" x="28" y="121">1 · 3 · 400</text>
+  <rect class="cell-g" x="20" y="128" width="170" height="24"/><text class="mono" x="28" y="145">2 · 1 · 144</text>
+  <rect class="cell-g" x="20" y="152" width="170" height="24"/><text class="mono" x="28" y="169">2 · 2 · 206</text>
+  <rect class="cell-g" x="20" y="176" width="170" height="24"/><text class="mono" x="28" y="193">2 · 3 · 304</text>
+
+  <path class="ln" d="M196 90 Q230 70 262 70" marker-end="url(#ar)"/>
+  <text class="ttl" x="270" y="22">GROUP BY song_id</text>
+  <rect class="cell-h" x="270" y="32" width="170" height="24"/><text class="sm b" x="278" y="49">song · SUM</text>
+  <rect class="cell-b" x="270" y="56" width="170" height="24"/><text class="mono" x="278" y="73">1 · 800</text>
+  <rect class="cell-g" x="270" y="80" width="170" height="24"/><text class="mono" x="278" y="97">2 · 654</text>
+  <text class="sm" x="270" y="124">每组压成一行，</text>
+  <text class="sm" x="270" y="140">user 信息丢了</text>
+
+  <path class="ln-a" d="M196 150 Q300 230 500 120" marker-end="url(#ar-a)"/>
+  <text class="ttl on-a" x="510" y="22">SUM() OVER (PARTITION BY song_id)</text>
+  <rect class="cell-h" x="510" y="32" width="230" height="24"/><text class="sm b" x="518" y="49">song · user · 窗口内总时长</text>
+  <rect class="cell-b" x="510" y="56" width="230" height="24"/><text class="mono" x="518" y="73">1 · 1 · <tspan class="on-b b">800</tspan></text>
+  <rect class="cell-b" x="510" y="80" width="230" height="24"/><text class="mono" x="518" y="97">1 · 2 · <tspan class="on-b b">800</tspan></text>
+  <rect class="cell-b" x="510" y="104" width="230" height="24"/><text class="mono" x="518" y="121">1 · 3 · <tspan class="on-b b">800</tspan></text>
+  <rect class="cell-g" x="510" y="128" width="230" height="24"/><text class="mono" x="518" y="145">2 · 1 · <tspan class="on-g b">654</tspan></text>
+  <rect class="cell-g" x="510" y="152" width="230" height="24"/><text class="mono" x="518" y="169">2 · 2 · <tspan class="on-g b">654</tspan></text>
+  <rect class="cell-g" x="510" y="176" width="230" height="24"/><text class="mono" x="518" y="193">2 · 3 · <tspan class="on-g b">654</tspan></text>
+  <text class="sm" x="510" y="222">每一行都保留，</text>
+  <text class="sm" x="510" y="238">旁边附上所在窗口的总和</text>
+  <text class="sm" x="20" y="226">（为了图示简化：每位用户只画一行）</text>
+</svg>
+<figcaption>图 3-6　同样是求和：GROUP BY “压扁”，窗口函数“附加”</figcaption>
+</figure>
+
+<h3>从 GROUP BY 到窗口函数</h3>
+
+<p>先用普通聚合算每首歌的总播放时长：</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.10 · 计算每首歌的总播放时长">
+<pre>
+SELECT song_id, SUM(play_duration) as total_duration
+FROM streaming.plays
+GROUP BY song_id ORDER BY total_duration DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+ song_id | total_duration
+---------+----------------
+       4 |           1200
+       1 |            800
+       7 |            798
+       2 |            654
+       3 |            467
+       9 |            463
+       6 |            451
+       8 |            430
+      10 |            389
+       5 |            268
+(10 rows)
+</pre></div>
+
+<p>
+  新需求：除了每首歌的总时长，还要列出<strong>每一位听过这首歌的用户</strong>。
+  如果把 <code>user_id</code> 也加进 <code>GROUP BY</code>，<code>SUM</code> 就变成按“歌曲+用户”求和，不是我们要的：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT song_id, user_id, SUM(play_duration) as total_duration
+FROM streaming.plays
+GROUP BY (song_id, user_id) ORDER BY song_id;
+</pre></div>
+<div class="code out"><pre>
+ song_id | user_id | total_duration
+---------+---------+----------------
+       1 |       1 |            200
+       1 |       2 |            200
+       1 |       3 |            400
+       2 |       3 |            304
+       2 |       1 |            144
+       2 |       2 |            206
+(truncated output)
+</pre></div>
+
+<p>不用窗口函数的话，只能用<strong>自连接</strong>：先算出每首歌的总时长，再连回原表：</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.11 · 用自连接计算（含用户）">
+<pre>
+SELECT DISTINCT p.song_id,
+       p.user_id,
+       t.total_duration
+FROM streaming.plays p
+JOIN (
+    SELECT song_id,
+           SUM(play_duration) AS total_duration
+    FROM streaming.plays
+    GROUP BY song_id
+) t ON p.song_id = t.song_id
+ORDER BY p.song_id;
+</pre>
+</div>
+<div class="code out"><pre>
+ song_id | user_id | total_duration
+---------+---------+----------------
+       1 |       1 |            800
+       1 |       2 |            800
+       1 |       3 |            800
+       2 |       1 |            654
+       2 |       2 |            654
+       2 |       3 |            654
+(truncated output)
+</pre></div>
+
+<p>结果对了，但每一行都被访问了两次，效率不高，逻辑也不好读。换成窗口函数：</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.12 · 用窗口函数计算（含用户）">
+<pre>
+WITH plays_with_total AS (
+  SELECT
+    song_id, user_id, SUM(play_duration)
+    OVER (PARTITION BY song_id) AS total_duration
+  FROM streaming.plays
+)
+SELECT DISTINCT song_id, user_id, total_duration
+FROM plays_with_total
+ORDER BY song_id, user_id;
+</pre>
+</div>
+
+<p>
+  CTE 里的窗口函数按 <code>song_id</code> 把每行放进对应的窗口，分别计算每个窗口的总时长；
+  主语句再用 <code>SELECT DISTINCT</code> 去掉同一用户多次播放产生的重复行。结果和自连接版本一样。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="记录按 song_id 被分进不同窗口，每个窗口单独计算总和">
+  <rect class="bx-b" x="20" y="30" width="200" height="120" rx="10"/>
+  <text class="ttl on-b" x="120" y="22" text-anchor="middle">song_id = 1 的窗口</text>
+  <text class="mono" x="120" y="62" text-anchor="middle">record 1</text>
+  <text class="mono" x="120" y="86" text-anchor="middle">record 2</text>
+  <text class="mono" x="120" y="110" text-anchor="middle">record 3</text>
+  <text class="ttl on-b" x="120" y="176" text-anchor="middle">total_duration = 800</text>
+
+  <rect class="bx-g" x="280" y="30" width="200" height="120" rx="10"/>
+  <text class="ttl on-g" x="380" y="22" text-anchor="middle">song_id = 2 的窗口</text>
+  <text class="mono" x="380" y="62" text-anchor="middle">record 4</text>
+  <text class="mono" x="380" y="86" text-anchor="middle">record 5</text>
+  <text class="mono" x="380" y="110" text-anchor="middle">record 6</text>
+  <text class="ttl on-g" x="380" y="176" text-anchor="middle">total_duration = 654</text>
+
+  <text class="ttl" x="510" y="94">…</text>
+
+  <rect class="bx-p" x="540" y="30" width="200" height="120" rx="10"/>
+  <text class="ttl on-p" x="640" y="22" text-anchor="middle">song_id = N 的窗口</text>
+  <text class="mono" x="640" y="58" text-anchor="middle">record 20</text>
+  <text class="mono" x="640" y="78" text-anchor="middle">record 30</text>
+  <text class="mono" x="640" y="98" text-anchor="middle">record 40</text>
+  <text class="mono" x="640" y="118" text-anchor="middle">record 41</text>
+  <text class="mono" x="640" y="138" text-anchor="middle">record 50</text>
+  <text class="ttl on-p" x="640" y="176" text-anchor="middle">total_duration = X</text>
+</svg>
+<figcaption>图 3-7　<code>PARTITION BY song_id</code>：按歌曲把记录分进不同窗口（对应原书图 3.2）</figcaption>
+</figure>
+
+<h3>窗口帧与累计值</h3>
+
+<p>
+  在 <code>OVER</code> 里再加 <code>ORDER BY</code>，窗口内的行会被排序并进一步划分成<strong>帧（frame）</strong>。
+  默认情况下，每一行的帧 = “从窗口第一行到当前行（以及和当前行排序值相同的行）”。这样就能算<strong>累计总和（running total）</strong>：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.13 · 计算累计值和总时长">
+<pre>
+SELECT song_id, user_id, play_duration, SUM(play_duration)
+OVER (PARTITION BY song_id ORDER BY user_id) AS total_play_duration
+FROM streaming.plays
+WHERE song_id = 2;
+</pre>
+</div>
+<div class="code out"><pre>
+ song_id | user_id | play_duration | total_play_duration
+---------+---------+---------------+---------------------
+       2 |       1 |           144 |                 144
+       2 |       2 |           206 |                 350
+       2 |       3 |           186 |                 654
+       2 |       3 |           118 |                 654
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="窗口帧逐步扩大，计算累计总和">
+  <text class="ttl" x="200" y="22">song_id = 2 的窗口（按 user_id 排序）</text>
+  <text class="ttl" x="560" y="22">该行的累计总和</text>
+
+  <rect class="cell-b" x="200" y="40" width="300" height="34"/><text class="mono" x="212" y="62">user_id = 1 · 144</text>
+  <rect class="cell-g" x="200" y="74" width="300" height="34"/><text class="mono" x="212" y="96">user_id = 2 · 206</text>
+  <rect class="cell-p" x="200" y="108" width="300" height="34"/><text class="mono" x="212" y="130">user_id = 3 · 186</text>
+  <rect class="cell-p" x="200" y="142" width="300" height="34"/><text class="mono" x="212" y="164">user_id = 3 · 118</text>
+
+  <path class="ln-b" d="M196 44 H188 V71 H196"/>
+  <text class="sm on-b" x="140" y="62" text-anchor="end">帧 1：第 1 行</text>
+  <path class="ln-g" d="M178 44 H170 V105 H178"/>
+  <text class="sm on-g" x="140" y="96" text-anchor="end">帧 2：前 2 行</text>
+  <path class="ln-p" d="M160 44 H152 V173 H160"/>
+  <text class="sm on-p" x="140" y="146" text-anchor="end">帧 3：全部</text>
+  <text class="sm on-p" x="140" y="162" text-anchor="end">（user 3 并列）</text>
+
+  <path class="ln-d" d="M502 57 H550"/><text class="mono on-b" x="560" y="62">144</text>
+  <path class="ln-d" d="M502 91 H550"/><text class="mono on-g" x="560" y="96">144+206 = <tspan class="b">350</tspan></text>
+  <path class="ln-d" d="M502 125 H550"/><text class="mono on-p" x="560" y="130">… +186+118 = <tspan class="b">654</tspan></text>
+  <path class="ln-d" d="M502 159 H550"/><text class="mono on-p" x="560" y="164">654（同一帧）</text>
+
+  <text class="sm" x="380" y="206" text-anchor="middle">默认帧 = 从窗口第一行，到当前行以及与当前行 ORDER BY 值相同的所有行</text>
+</svg>
+<figcaption>图 3-8　加了 ORDER BY 之后，帧逐步扩大；排序值相同的行（user 3）属于同一帧（对应原书图 3.3）</figcaption>
+</figure>
+
+<p>
+  第三位用户听了两次（186 秒和 118 秒），这两行 <code>user_id</code> 相同，属于同一帧，所以累计值都显示 654 —— 这正是这首歌所有用户的总时长。
+  由于 <code>WHERE</code> 已经只保留了 song_id = 2，这里的 <code>PARTITION BY</code> 其实可以省略，结果只会有一个窗口。
+</p>
+
+<h3>排名：RANK()</h3>
+
+<p>
+  任何内置聚合函数（<code>AVG()</code>、<code>MIN()</code>、<code>COUNT()</code>…）都能当窗口函数用。
+  此外 Postgres 还提供了<strong>只能</strong>在窗口模式（带 <code>OVER</code>）下用的专用函数，比如排名、前后行比较。按总播放时长给歌曲排名：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 3.14 · 按总播放时长给歌曲排名">
+<pre>
+SELECT song_id, SUM(play_duration) AS total_play_duration,
+RANK() OVER (ORDER BY SUM(play_duration) DESC) AS song_rank
+FROM streaming.plays
+GROUP BY song_id
+ORDER BY song_rank;
+</pre>
+</div>
+
+<ol>
+  <li><code>GROUP BY song_id</code>：先分组，每首歌一行，算出总时长。</li>
+  <li><code>RANK() OVER (ORDER BY SUM(play_duration) DESC)</code>：分组后的数据送进窗口函数，按总时长降序排名。总时长相同的歌在同一帧，排名相同。</li>
+  <li><code>ORDER BY song_rank</code>：按名次输出，时长最长的排第 1。</li>
+</ol>
+
+<div class="code out"><pre>
+ song_id | total_play_duration | song_rank
+---------+---------------------+-----------
+       4 |                1200 |         1
+       1 |                 800 |         2
+       7 |                 798 |         3
+       2 |                 654 |         4
+       3 |                 467 |         5
+       9 |                 463 |         6
+       6 |                 451 |         7
+       8 |                 430 |         8
+      10 |                 389 |         9
+       5 |                 268 |        10
+(10 rows)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 窗口函数在 GROUP BY 之后执行</div>
+  <p>
+    回忆第 1 章讲的执行顺序：<code>FROM → WHERE → GROUP BY → HAVING → 窗口函数 → SELECT 输出 → ORDER BY → LIMIT</code>。
+    这就是为什么 <code>OVER</code> 里可以写 <code>SUM(play_duration)</code> 这种聚合结果。
+    这里 <code>OVER</code> 没有 <code>PARTITION BY</code>，所以整个结果集是<strong>一个</strong>窗口。
+  </p>
+</div>
+
+<p>常用的专用窗口函数速查：</p>
+
+<div class="tw"><table>
+<tr><th>函数</th><th>作用</th><th>并列时（如 100, 90, 90, 80）</th></tr>
+<tr><td><code>ROW_NUMBER()</code></td><td>按顺序编号</td><td>1, 2, 3, 4（并列也不同号）</td></tr>
+<tr><td><code>RANK()</code></td><td>排名，并列同名次，后面跳号</td><td>1, 2, 2, 4</td></tr>
+<tr><td><code>DENSE_RANK()</code></td><td>排名，并列同名次，不跳号</td><td>1, 2, 2, 3</td></tr>
+<tr><td><code>LAG(col)</code> / <code>LEAD(col)</code></td><td>取前一行 / 后一行的值，做环比、间隔计算</td><td>—</td></tr>
+<tr><td><code>FIRST_VALUE(col)</code> / <code>LAST_VALUE(col)</code></td><td>帧内第一个 / 最后一个值</td><td>—</td></tr>
+<tr><td><code>NTILE(n)</code></td><td>把行均分成 n 个桶，返回桶号</td><td>—</td></tr>
+</table></div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>SQL 虽然已经 50 多岁，但仍在进化。<strong>现代 SQL</strong> 指 SQL-92 之后加入的能力，让 Postgres 能超越经典关系模型。</li>
+  <li><strong>CTE</strong>（<code>WITH</code>）把大查询拆成小块，可读性好，Postgres 通常能把它们优化得和子查询一样快；修改型 CTE 共享同一快照。</li>
+  <li><strong>递归查询</strong>（<code>WITH RECURSIVE</code>）用“起点 + 反复执行的递归项”处理层级和树形结构。</li>
+  <li><strong>窗口函数</strong>（<code>OVER</code>）把数据分成窗口，在保留每一行的前提下做聚合、累计、排名、前后行分析。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用 CTE 找出“听歌总时长最长的用户”，并显示他的名字（需要 join <code>streaming.users</code>）。</li>
+    <li>修改清单 3.9，让结果每个序列只返回<strong>一行</strong>：起始播放 id、歌曲数量、总时长（提示：在主语句里对 <code>sequence[1]</code> 分组）。</li>
+    <li>把清单 3.14 的 <code>RANK()</code> 分别换成 <code>ROW_NUMBER()</code> 和 <code>DENSE_RANK()</code>，人为制造两首总时长相同的歌，比较三者的区别。</li>
+    <li>用 <code>LAG(play_start_time) OVER (PARTITION BY user_id ORDER BY play_start_time)</code> 计算每位用户两次播放之间的时间间隔。</li>
+    <li>用 <code>EXPLAIN</code> 对比清单 3.11（自连接）和清单 3.12（窗口函数）的执行计划，数一数各扫描了 plays 表几次。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

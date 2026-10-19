@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Just Use Postgres 教程 · 一个数据库，够你用很久</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="0">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<div class="hero">
+  <span class="chapter-eyebrow">面向初学者的 11 章 + 2 附录教程</span>
+  <h1>Just Use Postgres！一个数据库，够你用很久</h1>
+  <p class="sub">
+    这套教程根据 Manning 出版的《Just Use Postgres! All the database you need》（Denis Magda 著）及其
+    <a href="https://github.com/dmagda/just-use-postgres-book">配套代码仓库</a>整理而成。
+    原书的知识骨架完整保留 —— 从关系型基础、现代 SQL、索引，到 JSON、全文搜索，再到 pgvector、TimescaleDB、PostGIS 和 pgmq ——
+    并为初学者补充了大量图解、概念解释和动手练习。
+  </p>
+  <p style="margin-top:14px">
+    <span class="pill">PostgreSQL 17</span><span class="pill">Docker</span><span class="pill">psql</span>
+    <span class="pill">现代 SQL</span><span class="pill">B-tree / GIN / GiST / BRIN</span><span class="pill">JSONB</span>
+    <span class="pill">全文搜索</span><span class="pill">pgvector · RAG</span><span class="pill">TimescaleDB</span>
+    <span class="pill">PostGIS</span><span class="pill">pgmq</span>
+  </p>
+</div>
+
+<h2 id="why">为什么是 Postgres？</h2>
+
+<p>
+  PostgreSQL（简称 Postgres）诞生于加州大学伯克利分校的研究项目，开源、由社区治理，已经打磨了 35 年。
+  它首先是一个可靠的<strong>关系型数据库</strong>：用 SQL 读写，擅长处理大量并发的小事务，就算服务器在操作中途崩溃，数据也不会乱。
+</p>
+
+<p>
+  但 Postgres 从设计之初就是<strong>可扩展的</strong>。借助内置能力和几百个扩展，同一个数据库还能存 JSON 文档、做全文搜索、存向量嵌入做语义搜索、分析时序数据、处理地理坐标、充当消息队列……
+  于是社区里流行起一句话：<strong>“Just use Postgres！”</strong> —— 在往技术栈里塞第二个数据库之前，先看看 Postgres 能不能搞定。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="Postgres 以关系型核心为中心，向外延伸到各种工作负载，对应教程的各章">
+  <rect class="bx-a" x="270" y="125" width="220" height="80" rx="14"/>
+  <text class="ttl on-a" x="380" y="155" text-anchor="middle">Postgres 核心</text>
+  <text class="sm" x="380" y="176" text-anchor="middle">表 · SQL · 事务 · 索引</text>
+  <text class="sm" x="380" y="193" text-anchor="middle">第 1–4 章</text>
+
+  <rect class="bx-b" x="30" y="30" width="190" height="56" rx="10"/>
+  <text class="ttl on-b" x="125" y="54" text-anchor="middle">JSON 文档</text>
+  <text class="sm" x="125" y="74" text-anchor="middle">第 5 章 · JSONB + GIN</text>
+  <rect class="bx-b" x="285" y="20" width="190" height="56" rx="10"/>
+  <text class="ttl on-b" x="380" y="44" text-anchor="middle">全文搜索</text>
+  <text class="sm" x="380" y="64" text-anchor="middle">第 6 章 · tsvector</text>
+  <rect class="bx-p" x="540" y="30" width="190" height="56" rx="10"/>
+  <text class="ttl on-p" x="635" y="54" text-anchor="middle">扩展机制</text>
+  <text class="sm" x="635" y="74" text-anchor="middle">第 7 章 · CREATE EXTENSION</text>
+
+  <rect class="bx-g" x="30" y="244" width="160" height="56" rx="10"/>
+  <text class="ttl on-g" x="110" y="268" text-anchor="middle">生成式 AI</text>
+  <text class="sm" x="110" y="288" text-anchor="middle">第 8 章 · pgvector</text>
+  <rect class="bx-g" x="210" y="254" width="160" height="56" rx="10"/>
+  <text class="ttl on-g" x="290" y="278" text-anchor="middle">时间序列</text>
+  <text class="sm" x="290" y="298" text-anchor="middle">第 9 章 · TimescaleDB</text>
+  <rect class="bx-g" x="390" y="254" width="160" height="56" rx="10"/>
+  <text class="ttl on-g" x="470" y="278" text-anchor="middle">地理空间</text>
+  <text class="sm" x="470" y="298" text-anchor="middle">第 10 章 · PostGIS</text>
+  <rect class="bx-g" x="570" y="244" width="160" height="56" rx="10"/>
+  <text class="ttl on-g" x="650" y="268" text-anchor="middle">消息队列</text>
+  <text class="sm" x="650" y="288" text-anchor="middle">第 11 章 · pgmq</text>
+
+  <path class="ln" d="M220 70 L300 130"/><path class="ln" d="M380 78 V123"/><path class="ln" d="M540 70 L460 130"/>
+  <path class="ln" d="M150 242 L300 206"/><path class="ln" d="M300 252 L350 207"/><path class="ln" d="M460 252 L410 207"/><path class="ln" d="M610 242 L460 206"/>
+
+  <rect class="bx-b" x="600" y="140" width="14" height="14" rx="3"/><text class="sm" x="620" y="152">核心内置能力</text>
+  <rect class="bx-g" x="600" y="164" width="14" height="14" rx="3"/><text class="sm" x="620" y="176">靠扩展实现</text>
+</svg>
+<figcaption>图 0-1　一个关系型核心 + 内置能力 + 扩展 = 覆盖多种工作负载，这也是本教程的章节结构</figcaption>
+</figure>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#127891;</span><h4>开源，社区治理</h4><p>没有任何一家厂商能独自控制它，不用担心被锁定。</p></div>
+  <div class="card"><span class="ic">&#127970;</span><h4>企业级可靠</h4><p>每年一个大版本，小步改进；大量厂商和云服务提供支持。</p></div>
+  <div class="card"><span class="ic">&#129513;</span><h4>天生可扩展</h4><p>新的数据类型、运算符、索引方法都能以扩展的形式加进来。</p></div>
+  <div class="card"><span class="ic">&#9733;</span><h4>开发者最爱</h4><p>Stack Overflow 调查中连续三年最受欢迎、最受喜爱、最想用的数据库。</p></div>
+</div>
+
+<h2 id="who">这套教程写给谁</h2>
+
+<ul>
+  <li><strong>会一点 SQL 的应用开发者</strong>：知道怎么建表、插数据、查数据就够了。每一章都从“为什么需要它”讲起，配有图解。</li>
+  <li><strong>用过 Postgres，但只把它当关系库的人</strong>：第 5 章起的每一章都可以单独阅读，挑你感兴趣的场景。</li>
+  <li><strong>正在为新需求选型的工程师和架构师</strong>：每章都展示了 Postgres 在该场景下能做到什么、怎么做，以及要注意什么，帮你判断“是不是真的需要另一个数据库”。</li>
+</ul>
+
+<div class="box note">
+  <div class="t">&#9432; 需要准备什么</div>
+  <p>
+    一台装了 <a href="https://docs.docker.com/desktop/">Docker</a> 的电脑，和一个终端。所有例子都在 Docker 容器里运行，不会在你的电脑上留下痕迹，也不需要另外安装任何数据库客户端（容器里自带 psql）。
+    第 8 章的 RAG 原型需要 Python 和 Ollama，但不运行它也能读懂整章。
+  </p>
+</div>
+
+<h2 id="setup">每一章用什么环境</h2>
+
+<p>前 7 章共用同一个官方 Postgres 容器；从第 8 章开始，每章换一个预装了相应扩展的镜像。它们都映射到 5432 端口，所以<strong>同一时间只运行一个</strong>（每章开头都会提醒你先停掉上一个）。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="每章使用的 Docker 镜像和数据集">
+  <rect class="bx-a" x="20" y="20" width="720" height="110" rx="12"/>
+  <text class="ttl on-a" x="36" y="44">容器 postgres · 镜像 postgres:17.2</text>
+  <rect class="bx" x="36" y="56" width="128" height="62" rx="8"/><text class="sm b" x="100" y="78" text-anchor="middle">第 1 章</text><text class="sm" x="100" y="96" text-anchor="middle">trades</text><text class="sm" x="100" y="110" text-anchor="middle">generate_series 造</text>
+  <rect class="bx" x="172" y="56" width="128" height="62" rx="8"/><text class="sm b" x="236" y="78" text-anchor="middle">第 2 章</text><text class="sm" x="236" y="96" text-anchor="middle">coffee_chain</text><text class="sm" x="236" y="110" text-anchor="middle">手写建表</text>
+  <rect class="bx" x="308" y="56" width="128" height="62" rx="8"/><text class="sm b" x="372" y="78" text-anchor="middle">第 3 章</text><text class="sm" x="372" y="96" text-anchor="middle">data/streaming</text><text class="sm" x="372" y="110" text-anchor="middle">音乐流媒体</text>
+  <rect class="bx" x="444" y="56" width="92" height="62" rx="8"/><text class="sm b" x="490" y="78" text-anchor="middle">第 4 章</text><text class="sm" x="490" y="96" text-anchor="middle">data/gaming</text><text class="sm" x="490" y="110" text-anchor="middle">在线游戏</text>
+  <rect class="bx" x="544" y="56" width="92" height="62" rx="8"/><text class="sm b" x="590" y="78" text-anchor="middle">第 5 章</text><text class="sm" x="590" y="96" text-anchor="middle">data/pizzeria</text><text class="sm" x="590" y="110" text-anchor="middle">披萨订单</text>
+  <rect class="bx" x="644" y="56" width="84" height="62" rx="8"/><text class="sm b" x="686" y="78" text-anchor="middle">第 6–7 章</text><text class="sm" x="686" y="96" text-anchor="middle">data/movie</text><text class="sm" x="686" y="110" text-anchor="middle">电影 · pgcrypto</text>
+
+  <rect class="bx-g" x="20" y="146" width="350" height="76" rx="10"/>
+  <text class="ttl on-g" x="36" y="170">第 8 章 · postgres-pgvector</text>
+  <text class="mono" x="36" y="192">pgvector/pgvector:0.8.0-pg17</text>
+  <text class="sm" x="36" y="212">data/movie_pgvector · 电影推荐（+ ai_samples 笔记本）</text>
+
+  <rect class="bx-g" x="390" y="146" width="350" height="76" rx="10"/>
+  <text class="ttl on-g" x="406" y="170">第 9 章 · postgres-timescale</text>
+  <text class="mono" x="406" y="192">timescale/timescaledb:2.19.2-pg17</text>
+  <text class="sm" x="406" y="212">data/smartwatch · 智能手表心率（140 万条）</text>
+
+  <rect class="bx-g" x="20" y="236" width="350" height="76" rx="10"/>
+  <text class="ttl on-g" x="36" y="260">第 10 章 · postgres-postgis</text>
+  <text class="mono" x="36" y="282">postgis/postgis:17-3.5</text>
+  <text class="sm" x="36" y="302">佛罗里达 OpenStreetMap（osm2pgsql 在线导入）</text>
+
+  <rect class="bx-g" x="390" y="236" width="350" height="76" rx="10"/>
+  <text class="ttl on-g" x="406" y="260">第 11 章 · postgres-pgmq</text>
+  <text class="mono" x="406" y="282">ghcr.io/pgmq/pg17-pgmq:v1.5.1</text>
+  <text class="sm" x="406" y="302">车管所叫号系统（自定义队列可用任意容器）</text>
+</svg>
+<figcaption>图 0-2　各章的容器、镜像与数据集（data/ 目录均在本书代码仓库中）</figcaption>
+</figure>
+
+<p>拿到代码仓库：</p>
+
+<div class="code" data-lang="bash"><pre>
+git clone https://github.com/dmagda/just-use-postgres-book
+cd just-use-postgres-book
+</pre></div>
+
+<p>以后每章加载数据的方式都一样：<code>docker cp</code> 把数据目录复制进容器，再用 psql 的 <code>\i</code> 执行里面的 SQL 脚本。</p>
+
+<h2 id="how">怎么用这套教程</h2>
+
+<ul>
+  <li><strong>Postgres 新手</strong>：先按顺序读第 1–4 章，它们是所有关系型数据库共通的基础。之后可以跳到任何感兴趣的章节。</li>
+  <li><strong>有经验的用户</strong>：随意挑章节。如果打算读第 2–7 章，先扫一眼第 1 章开头启动 Docker 容器的部分 —— 那几章都复用这个容器。</li>
+  <li><strong>亲手敲代码</strong>：每个代码块右上角都有“复制”按钮；浅色底、标着“输出”的块是预期结果（用了随机数的地方，你的结果会不同）。</li>
+  <li><strong>看图</strong>：每章都有大量示意图，帮你在脑子里建立模型 —— 索引长什么样、事务怎么并发、向量为什么能表示“含义”……</li>
+  <li><strong>做练习</strong>：每章末尾的“动手练习”是在原书示例基础上的延伸，做完会理解得更深。</li>
+</ul>
+
+<div class="box key">
+  <div class="t">&#9733; 页面元素说明</div>
+  <ul>
+    <li><span class="term">清单 N.M</span> —— 代码块标题里的编号对应原书和仓库 <code>chapterNN.md</code> 中的清单编号，方便对照。</li>
+    <li><strong>蓝色“说明”框</strong>补充概念，<strong>绿色“提示”框</strong>给出技巧，<strong>红色“注意”框</strong>是常见陷阱，<strong>紫色框</strong>是可以跳过的深入内容。</li>
+    <li>右下角的按钮可以切换深色 / 浅色主题。</li>
+  </ul>
+</div>
+
+<h2 id="toc">全部章节</h2>
+<div id="toc-grid"></div>
+
+<div class="box tip" style="margin-top:32px">
+  <div class="t">&#128161; 一句话总结</div>
+  <p>
+    如果你只记住一件事：<strong>“Just use Postgres”不是说 Postgres 能替代一切，而是说 —— 在往技术栈里加第二个数据库之前，先认真看看 Postgres 能不能胜任。</strong>
+    这套教程剩下的 13 页，就是带你亲眼看看它到底能做多少事。
+  </p>
+</div>
+
+<p style="margin-top:28px;font-size:13px;color:var(--fg-faint)">
+  内容整理自《Just Use Postgres! All the database you need》（Denis Magda，Manning，2026）及其开源代码仓库，仅供学习交流。原书购买：<a href="https://www.manning.com/books/just-use-postgres">manning.com/books/just-use-postgres</a>。
+</p>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

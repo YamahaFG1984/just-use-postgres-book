@@ -1,0 +1,1930 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 2 章 · 标准关系型数据库能力 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="2">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 2 章</span>
+<h1>标准关系型数据库能力</h1>
+<p class="lede">
+  这一章快速巡览所有关系型数据库都具备、Postgres 当然也具备的那些“标准能力”：
+  建库建表、增删改查、约束、事务、连接查询、函数与触发器、视图、角色权限。
+  我们会围绕一个贯穿全章的例子来学：一个服务成千上万商家的<strong>多租户电商 SaaS 平台</strong>。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解“服务器 → 数据库 → 模式（schema）→ 表”这四层结构，以及多租户的三种做法</li>
+    <li>熟练使用 <code>SELECT</code> / <code>INSERT</code> / <code>UPDATE</code> / <code>DELETE</code></li>
+    <li>用约束和外键在数据库层面守住数据的正确性</li>
+    <li>理解隐式事务、显式事务，以及 MVCC 如何让读写互不阻塞</li>
+    <li>会写内连接和左连接</li>
+    <li>用 PL/pgSQL 函数实现购物车，用触发器自动维护订单总额</li>
+    <li>会用普通视图和物化视图，会用角色限制访问</li>
+  </ul>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 前置知识</div>
+  <p>
+    本书假设你懂一点关系型数据库和 SQL 的基础：知道怎么建表、插数据、查数据。
+    如果这些对你来说还很陌生也没关系，先跟着本章把例子跑一遍，看看这些功能长什么样，遇到不懂的再去查资料。
+  </p>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="structure">创建数据库结构</h2>
+
+<p>
+  Postgres 把应用数据存在<strong>表</strong>（table）里。表是行（row）的命名集合，每一行都有同一组列（column）。
+  除了表，Postgres 还提供了两层更高的抽象来组织结构：
+</p>
+
+<ul>
+  <li><strong>模式（schema）</strong>：数据库对象的命名集合，可以理解成编程语言里的<em>命名空间</em>或<em>包</em>。
+      用来把表、视图、函数等归到一个逻辑名下。默认情况下，你创建的所有对象都放在 Postgres 自动创建的 <code>public</code> 模式里。</li>
+  <li><strong>数据库（database）</strong>：最顶层的命名集合，里面包含模式，模式里再包含表等对象。
+      <strong>同一个数据库里不同模式的表可以在一条 SQL 里一起查；但跨数据库的表就不行了</strong>（除非借助第三方方案）。</li>
+</ul>
+
+<div class="box note">
+  <div class="t">&#9432; 什么是“数据库对象”</div>
+  <p>在 Postgres 里，数据库对象指用来存储或操作数据的命名 SQL 对象。表、视图、函数、触发器都是数据库对象。</p>
+</div>
+
+<h3>故事背景：咖啡店和精酿酒馆</h3>
+
+<p>
+  Jake 在美国东海岸开了一家小有名气的连锁咖啡店，想在网上卖咖啡豆和周边，但完全不知道从何下手。
+  他的朋友 Susannah 在西海岸开了一家很火的精酿酒馆，靠我们的电商平台一周就上线了网店 ——
+  注册、建商品目录、开店，支付、物流跟踪、会员管理都是现成的。于是 Jake 也决定用我们的平台。
+</p>
+
+<p>
+  我们的电商平台是一个典型的<strong>多租户（multitenant）SaaS 应用</strong>：
+  多个客户（租户）共享 CPU、存储等资源，从而降低成本；
+  同时又必须保证数据隔离 —— Jake 和 Susannah 虽然是朋友，但彼此的商业数据不能互相看到。
+</p>
+
+<h3>多租户的三种做法</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="多租户的三种实现方式：表级、模式级、数据库级">
+  <!-- 表级 -->
+  <text class="ttl" x="125" y="24" text-anchor="middle">① 表级多租户</text>
+  <rect class="bx" x="20" y="36" width="210" height="180" rx="10"/>
+  <text class="sm" x="34" y="56">一个数据库 · 一套表</text>
+  <rect class="cell-h" x="34" y="66" width="182" height="24"/>
+  <text class="sm b" x="42" y="82">tenant_id</text><text class="sm b" x="120" y="82">product …</text>
+  <rect class="cell-b" x="34" y="90" width="182" height="24"/><text class="mono on-b" x="42" y="107">jake</text><text class="sm" x="120" y="107">Sunrise Blend</text>
+  <rect class="cell-g" x="34" y="114" width="182" height="24"/><text class="mono on-g" x="42" y="131">susannah</text><text class="sm" x="120" y="131">IPA</text>
+  <rect class="cell-b" x="34" y="138" width="182" height="24"/><text class="mono on-b" x="42" y="155">jake</text><text class="sm" x="120" y="155">Mug</text>
+  <rect class="cell-g" x="34" y="162" width="182" height="24"/><text class="mono on-g" x="42" y="179">susannah</text><text class="sm" x="120" y="179">Stout</text>
+  <text class="sm" x="125" y="236" text-anchor="middle">所有租户的数据混在同一张表，</text>
+  <text class="sm" x="125" y="252" text-anchor="middle">用 tenant_id 列区分</text>
+
+  <!-- 模式级 -->
+  <text class="ttl" x="380" y="24" text-anchor="middle">② 模式级多租户</text>
+  <rect class="bx" x="275" y="36" width="210" height="180" rx="10"/>
+  <text class="sm" x="289" y="56">一个数据库 · 每租户一个模式</text>
+  <rect class="bx-b" x="289" y="70" width="182" height="62" rx="8"/>
+  <text class="ttl on-b" x="301" y="90">schema jake</text>
+  <text class="sm" x="301" y="112">catalog · orders …</text>
+  <rect class="bx-g" x="289" y="140" width="182" height="62" rx="8"/>
+  <text class="ttl on-g" x="301" y="160">schema susannah</text>
+  <text class="sm" x="301" y="182">catalog · orders …</text>
+  <text class="sm" x="380" y="236" text-anchor="middle">表结构相同，但各自独立</text>
+  <text class="sm" x="380" y="252" text-anchor="middle">放在不同的命名空间里</text>
+
+  <!-- 数据库级 -->
+  <text class="ttl on-a" x="635" y="24" text-anchor="middle">③ 数据库级多租户 ✓ 本章采用</text>
+  <rect class="bx-a" x="530" y="36" width="210" height="180" rx="10"/>
+  <text class="sm" x="544" y="56">一台服务器 · 每租户一个数据库</text>
+  <rect class="bx-b" x="544" y="70" width="182" height="62" rx="8"/>
+  <text class="ttl on-b" x="556" y="90">database coffee_chain</text>
+  <text class="sm" x="556" y="112">Jake 的全部数据</text>
+  <rect class="bx-g" x="544" y="140" width="182" height="62" rx="8"/>
+  <text class="ttl on-g" x="556" y="160">database brewery</text>
+  <text class="sm" x="556" y="182">Susannah 的全部数据</text>
+  <text class="sm" x="635" y="236" text-anchor="middle">隔离最彻底，用角色控制访问；</text>
+  <text class="sm" x="635" y="252" text-anchor="middle">租户多了还能把库挪到别的服务器</text>
+
+  <path class="ln-d" d="M40 280 H720" marker-end="url(#ar)"/>
+  <text class="sm" x="40" y="274">共享程度高 · 成本低</text>
+  <text class="sm" x="720" y="274" text-anchor="end">隔离程度高</text>
+</svg>
+<figcaption>图 2-1　多租户的三种常见实现：隔离越强，共享越少</figcaption>
+</figure>
+
+<p>
+  我们选择<strong>数据库级多租户</strong>：每个商家一个专属数据库，通过角色和权限（本章最后一节）确保商家只能连自己的库。
+  如果平台规模扩大，还可以轻松地把不同租户的数据库分配到不同的 Postgres 服务器上。
+</p>
+
+<h3>创建数据库</h3>
+
+<ol class="steps">
+  <li>用 psql 连接第 1 章启动的 Postgres（默认连到 <code>postgres</code> 数据库）：
+    <div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U postgres
+</pre></div></li>
+  <li>为咖啡店和精酿酒馆各建一个数据库：
+    <div class="code" data-lang="sql"><pre>
+CREATE DATABASE coffee_chain;
+CREATE DATABASE brewery;
+</pre></div></li>
+  <li>查询系统目录 <code>pg_database</code>，看看现有的全部数据库：
+    <div class="code" data-lang="sql"><pre>
+SELECT datname FROM pg_database;
+</pre></div>
+    <div class="code out"><pre>
+   datname
+--------------
+ postgres
+ coffee_chain
+ template1
+ template0
+ brewery
+(5 rows)
+</pre></div></li>
+</ol>
+
+<div class="box note">
+  <div class="t">&#9432; template0 和 template1 是什么</div>
+  <p>它们是 Postgres 自带的“模板库”。<code>CREATE DATABASE</code> 新建数据库时，其实就是复制一份 template1。一般不用去碰它们。</p>
+</div>
+
+<p>后面我们都以 Jake 的咖啡店为例。用 psql 的 <code>\c</code> 元命令切换到它的数据库：</p>
+
+<div class="code" data-lang="sql"><pre>
+\c coffee_chain
+</pre></div>
+<div class="code out"><pre>
+You are now connected to database "coffee_chain" as user "postgres".
+coffee_chain=#
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 直接连到指定数据库</div>
+  <p>也可以在连接时用 <code>-d</code> 参数指定数据库：<code>docker exec -it postgres psql -U postgres -d coffee_chain</code>。本章后面都这样连。</p>
+</div>
+
+<h3>创建模式</h3>
+
+<p>用 <code>\dn</code> 列出当前数据库里的模式：</p>
+
+<div class="code out"><pre>
+      List of schemas
+  Name  |       Owner
+--------+-------------------
+ public | pg_database_owner
+(1 row)
+</pre></div>
+
+<p>
+  每个新数据库都自带一个 <code>public</code> 模式。如果只用它也完全可以 —— 除非额外的模式能让设计更清晰，否则没必要多建。
+  但我们的电商平台恰好能从中受益：每家网店都需要<strong>商品目录</strong>、<strong>客户账户</strong>、<strong>订单</strong>三大模块，
+  它们在应用层多半是独立的模块或微服务，那么在数据库层也可以一一对应成三个模式：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="应用模块与数据库模式一一对应">
+  <text class="ttl" x="20" y="24">应用层</text>
+  <rect class="bx-p" x="60" y="36" width="190" height="44" rx="8"/><text class="ttl on-p" x="155" y="63" text-anchor="middle">商品模块 / 服务</text>
+  <rect class="bx-p" x="285" y="36" width="190" height="44" rx="8"/><text class="ttl on-p" x="380" y="63" text-anchor="middle">客户模块 / 服务</text>
+  <rect class="bx-p" x="510" y="36" width="190" height="44" rx="8"/><text class="ttl on-p" x="605" y="63" text-anchor="middle">订单模块 / 服务</text>
+
+  <path class="ln-d" d="M155 82 V112" marker-end="url(#ar)"/>
+  <path class="ln-d" d="M380 82 V112" marker-end="url(#ar)"/>
+  <path class="ln-d" d="M605 82 V112" marker-end="url(#ar)"/>
+
+  <rect class="bx-a" x="20" y="100" width="720" height="160" rx="12"/>
+  <text class="ttl on-a" x="34" y="122">数据库 coffee_chain</text>
+
+  <rect class="bx-b" x="60" y="132" width="190" height="114" rx="10"/>
+  <text class="ttl on-b" x="155" y="154" text-anchor="middle">schema products</text>
+  <rect class="bx" x="80" y="166" width="150" height="30" rx="5"/><text class="mono" x="155" y="186" text-anchor="middle">catalog</text>
+  <rect class="bx" x="80" y="204" width="150" height="30" rx="5"/><text class="mono" x="155" y="224" text-anchor="middle">reviews</text>
+
+  <rect class="bx-b" x="285" y="132" width="190" height="114" rx="10"/>
+  <text class="ttl on-b" x="380" y="154" text-anchor="middle">schema customers</text>
+  <rect class="bx" x="305" y="166" width="150" height="30" rx="5"/><text class="mono" x="380" y="186" text-anchor="middle">accounts</text>
+
+  <rect class="bx-b" x="510" y="132" width="190" height="114" rx="10"/>
+  <text class="ttl on-b" x="605" y="154" text-anchor="middle">schema sales</text>
+  <rect class="bx" x="530" y="166" width="150" height="30" rx="5"/><text class="mono" x="605" y="186" text-anchor="middle">orders</text>
+  <rect class="bx" x="530" y="204" width="150" height="30" rx="5"/><text class="mono" x="605" y="224" text-anchor="middle">order_items</text>
+</svg>
+<figcaption>图 2-2　每个应用模块对应一个模式；同一数据库内的模式之间仍可以联合查询</figcaption>
+</figure>
+
+<p>
+  这样做的好处：数据库结构和应用架构对齐；不同模块里同名的表不会冲突；而且因为都在同一个数据库里，
+  一条 <code>SELECT</code> 就能跨模式联合查询（如果每个模块各用一个数据库，就做不到了）。
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE SCHEMA products;
+CREATE SCHEMA customers;
+CREATE SCHEMA sales;
+</pre></div>
+
+<div class="code out"><pre>
+\dn
+      List of schemas
+   Name    |       Owner
+-----------+-------------------
+ customers | postgres
+ products  | postgres
+ public    | pg_database_owner
+ sales     | postgres
+(4 rows)
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 自动化</div>
+  <p>如果每个租户都要建同样的库、模式和表，就应该把这个过程自动化：新商家注册时，平台自动为他建好数据库和全部对象。</p>
+</div>
+
+<h3>当前模式与 search_path</h3>
+
+<p>
+  有了多个模式，就要理解<strong>当前模式</strong>：当 SQL 里没写模式名时，Postgres 去哪里找表？
+  答案由 <code>search_path</code> 决定：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SHOW search_path;
+</pre></div>
+<div class="code out"><pre>
+   search_path
+-----------------
+ "$user", public
+(1 row)
+</pre></div>
+
+<p>
+  意思是：先找和当前用户同名的模式，没有就找 <code>public</code>。可以随时改：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SET search_path TO products;
+-- 之后不写模式名的语句，都会在 products 模式里执行
+SELECT id FROM catalog;   -- 等价于 SELECT id FROM products.catalog
+</pre></div>
+
+<h3>创建表</h3>
+
+<p>
+  数据库和模式都有默认值（<code>postgres</code> 库、<code>public</code> 模式），可以跳过；但表必须你自己设计和创建，没有捷径。
+  Jake 准备上架商品，先建商品目录表：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.1 · 创建商品目录表">
+<pre>
+CREATE TABLE products.catalog (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR (100) NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT CHECK (category IN ('coffee', 'mug', 't-shirt')),
+    price NUMERIC(10, 2),
+    stock_quantity INT CHECK (stock_quantity >= 0)
+);
+</pre>
+</div>
+
+<ul>
+  <li><code>products.catalog</code>：表放在 products 模式下。模式名可以省略，省略就用当前模式。</li>
+  <li><code>SERIAL</code>：自增整数。Postgres 会在背后创建一个<strong>序列（sequence）</strong>对象来自动生成 ID，
+      生成 32 位整数，最大 2,147,483,647（2³¹−1）。</li>
+  <li><code>NOT NULL</code>、<code>CHECK</code>：约束，2.3 节详细讲。</li>
+</ul>
+
+<p>再建一张商品评论表：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.2 · 创建商品评论表">
+<pre>
+CREATE TABLE products.reviews (
+    id BIGSERIAL PRIMARY KEY,
+    product_id INT,
+    customer_id INT,
+    review TEXT,
+    rank SMALLINT
+);
+</pre>
+</div>
+
+<p>
+  这次 ID 用了 <code>BIGSERIAL</code>：生成 64 位整数，最大约 922 亿亿（2⁶³−1）。
+  因为评论数量预计会远超商品数量，所以选了更大的类型。
+  这张表故意没加任何约束 —— 约束不是必须的，而且以后随时可以用 <code>ALTER TABLE</code> 补上（2.3 节会演示）。
+</p>
+
+<div class="tw"><table>
+<tr><th>类型</th><th>位数</th><th>范围</th><th>适合</th></tr>
+<tr><td><code>SMALLINT</code></td><td>16 位</td><td>−32768 ~ 32767</td><td>评分、小枚举</td></tr>
+<tr><td><code>INT</code> / <code>SERIAL</code></td><td>32 位</td><td>约 ±21 亿</td><td>大多数 ID 和计数</td></tr>
+<tr><td><code>BIGINT</code> / <code>BIGSERIAL</code></td><td>64 位</td><td>约 ±922 亿亿</td><td>海量数据的 ID</td></tr>
+<tr><td><code>NUMERIC(10,2)</code></td><td>可变</td><td>共 10 位，2 位小数</td><td>金额（精确，不会有浮点误差）</td></tr>
+<tr><td><code>UUID</code></td><td>128 位</td><td>全局唯一</td><td>分布式 ID（2.4 节）</td></tr>
+</table></div>
+
+<div class="box note">
+  <div class="t">&#9432; 数据类型</div>
+  <p>Postgres 的数据类型非常丰富。为列挑选和应用层最匹配的类型时，官方文档是最好的参考：<a href="https://www.postgresql.org/docs/current/datatype.html">postgresql.org/docs/current/datatype.html</a>。</p>
+</div>
+
+<p>用 <code>\d</code> 看看建好的对象（如果列表是空的，先 <code>SET search_path TO products;</code>，或者用 <code>\dts products.*</code>）：</p>
+
+<div class="code out"><pre>
+                 List of relations
+  Schema  |      Name      |   Type   |  Owner
+----------+----------------+----------+----------
+ products | catalog        | table    | postgres
+ products | catalog_id_seq | sequence | postgres
+ products | reviews        | table    | postgres
+ products | reviews_id_seq | sequence | postgres
+(4 rows)
+</pre></div>
+
+<p>除了两张表，还多了两个 <code>_id_seq</code> 序列 —— 这就是 <code>SERIAL</code> / <code>BIGSERIAL</code> 在背后自动创建的。</p>
+
+<h2 id="dml">查询和修改数据</h2>
+
+<p>
+  SQL 标准定义了四个最核心的数据操作命令：<code>SELECT</code>、<code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code>，
+  它们属于 <strong>DML</strong>（Data Manipulation Language，数据操作语言）。
+  （而 <code>CREATE</code>、<code>ALTER</code>、<code>DROP</code> 这些改结构的命令属于 DDL，数据定义语言。）
+</p>
+
+<p>Jake 在网店后台添加了前五件商品，平台后端收到请求后执行：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.3 · 插入商品">
+<pre>
+INSERT INTO products.catalog
+  (name, description, category, price, stock_quantity) VALUES
+  ('Sunrise Blend',
+   'A smooth and balanced blend with notes of caramel and citrus.',
+   'coffee', 14.99, 50),
+  ('Midnight Roast',
+   'A dark roast with rich flavors of chocolate and toasted nuts.',
+   'coffee', 16.99, 40),
+  ('Morning Glory',
+   'A light roast with bright acidity and floral notes.',
+   'coffee', 13.99, 30),
+  ('Sunrise Brew Co. Mug',
+   'A ceramic mug with the Sunrise Brew Co. logo.',
+   'mug', 9.99, 100),
+  ('Sunrise Brew Co. T-Shirt',
+   'A soft cotton t-shirt with the Sunrise Brew Co. logo.',
+   't-shirt', 19.99, 25);
+</pre>
+</div>
+
+<p>三种口味的咖啡豆、一个品牌马克杯、一件品牌 T 恤。注意我们没有提供 <code>id</code> —— 它由序列自动生成：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT id, name FROM products.catalog;
+</pre></div>
+<div class="code out"><pre>
+ id |           name
+----+--------------------------
+  1 | Sunrise Blend
+  2 | Midnight Roast
+  3 | Morning Glory
+  4 | Sunrise Brew Co. Mug
+  5 | Sunrise Brew Co. T-Shirt
+(5 rows)
+</pre></div>
+
+<p>Jake 打开商品页，在下拉框里选“Coffee”分类，后端执行带 <code>WHERE</code> 过滤的查询：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT id, name, price FROM products.catalog
+WHERE category = 'coffee';
+</pre></div>
+<div class="code out"><pre>
+ id |      name      | price
+----+----------------+-------
+  1 | Sunrise Blend  | 14.99
+  2 | Midnight Roast | 16.99
+  3 | Morning Glory  | 13.99
+(3 rows)
+</pre></div>
+
+<p>他发现 Sunrise Blend 的价格不对，改成 16.54；又想起 Midnight Roast 的豆子缺货，把它下架：</p>
+
+<div class="code" data-lang="sql"><pre>
+UPDATE products.catalog SET price = 16.54 WHERE id = 1;
+
+DELETE FROM products.catalog WHERE id = 2;
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 千万别忘了 WHERE</div>
+  <p><code>UPDATE</code> 和 <code>DELETE</code> 不带 <code>WHERE</code> 会作用于<strong>整张表的所有行</strong>。这是新手（和老手）最经典的事故之一。执行前多看一眼。</p>
+</div>
+
+<div class="code" data-lang="sql"><pre>
+SELECT id, name, price, stock_quantity FROM products.catalog;
+</pre></div>
+<div class="code out"><pre>
+ id |           name           | price | stock_quantity
+----+--------------------------+-------+----------------
+  3 | Morning Glory            | 13.99 |             30
+  4 | Sunrise Brew Co. Mug     |  9.99 |            100
+  5 | Sunrise Brew Co. T-Shirt | 19.99 |             25
+  1 | Sunrise Blend            | 16.54 |             50
+(4 rows)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么 id=1 跑到最后去了</div>
+  <p>
+    没有 <code>ORDER BY</code> 时，Postgres <strong>不保证</strong>返回顺序。这里 id=1 被更新过 ——
+    Postgres 的更新实际上是写入一个新版本的行（下面讲 MVCC 时会细说），新版本存到了表的后面，所以扫描时最后出现。
+    需要固定顺序时，一定要写 <code>ORDER BY</code>。
+  </p>
+</div>
+
+<h2 id="integrity">数据完整性</h2>
+
+<p>
+  <strong>数据完整性</strong>指数据在整个生命周期中的准确、一致和完整。
+  关系型数据库就是为“任何时候数据都必须正确”的事务型应用设计的。Postgres 提供了事务和各种约束来保证这一点 ——
+  但这些能力需要我们开发者主动、及时地用起来。
+</p>
+
+<h3>约束：写入前的“安检门”</h3>
+
+<p>
+  第一道防线是<strong>数据类型</strong>：价格列是 <code>NUMERIC</code>，你就不可能写进去一段文本或一个布尔值。
+  第二道防线是<strong>约束（constraint）</strong>：每次写入时都会检查的规则。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="约束像安检门：合法数据通过，非法数据被拒绝">
+  <rect class="bx" x="20" y="40" width="170" height="60" rx="10"/>
+  <text class="ttl" x="105" y="66" text-anchor="middle">应用发来写入</text>
+  <text class="mono" x="105" y="86" text-anchor="middle">price = 16.54</text>
+
+  <rect class="bx" x="20" y="130" width="170" height="60" rx="10"/>
+  <text class="ttl" x="105" y="156" text-anchor="middle">应用发来写入</text>
+  <text class="mono" x="105" y="176" text-anchor="middle">price = -16</text>
+
+  <rect class="bx-a" x="270" y="24" width="210" height="182" rx="12"/>
+  <text class="ttl on-a" x="375" y="50" text-anchor="middle">约束检查</text>
+  <text class="sm" x="290" y="76">① 类型对吗？NUMERIC</text>
+  <text class="sm" x="290" y="98">② NOT NULL？</text>
+  <text class="sm" x="290" y="120">③ UNIQUE / 主键重复？</text>
+  <text class="sm" x="290" y="142">④ CHECK (price &gt; 0)？</text>
+  <text class="sm" x="290" y="164">⑤ 外键引用存在吗？</text>
+  <text class="sm" x="290" y="186">⑥ 排他约束冲突？</text>
+
+  <path class="ln-g" d="M192 70 H266" marker-end="url(#ar-g)"/>
+  <path class="ln-r" d="M192 160 H266" marker-end="url(#ar-r)"/>
+
+  <path class="ln-g" d="M482 70 H560" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="564" y="40" width="176" height="60" rx="10"/>
+  <text class="ttl on-g" x="652" y="66" text-anchor="middle">✓ 写入表中</text>
+  <text class="sm" x="652" y="86" text-anchor="middle">数据始终合法</text>
+
+  <path class="ln-r" d="M482 160 H560" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="564" y="130" width="176" height="60" rx="10"/>
+  <text class="ttl on-r" x="652" y="156" text-anchor="middle">✗ ERROR</text>
+  <text class="sm" x="652" y="176" text-anchor="middle">整条语句被拒绝</text>
+</svg>
+<figcaption>图 2-3　约束是数据库层面的最后一道防线：应用层的校验哪天被改坏了，它还在</figcaption>
+</figure>
+
+<div class="tw"><table>
+<tr><th>约束</th><th>作用</th></tr>
+<tr><td>非空 <code>NOT NULL</code></td><td>该列不能为 null</td></tr>
+<tr><td>唯一 <code>UNIQUE</code></td><td>该列（或列组合）不能有重复值</td></tr>
+<tr><td>主键 <code>PRIMARY KEY</code></td><td>行的唯一标识，相当于“非空 + 唯一”</td></tr>
+<tr><td>外键 <code>FOREIGN KEY</code></td><td>该列的值必须在另一张表的某行里存在</td></tr>
+<tr><td>检查 <code>CHECK</code></td><td>值必须满足自定义条件</td></tr>
+<tr><td>排他 <code>EXCLUDE</code></td><td>任意两行在指定列上用指定运算符比较，至少有一个比较结果为 false 或 null（2.6 节有实例）</td></tr>
+</table></div>
+
+<p>
+  设想我们平台为了赶进度，原本打算让后端在写库前做所有校验，结果手快改坏了好几处检查，库里已经出现了脏数据。
+  为了防止再发生，我们决定在数据库层面补上约束。先看看商品表现有哪些约束：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+\d products.catalog
+</pre></div>
+<div class="code out"><pre>
+                 Table "products.catalog"
+     Column     |          Type          | Nullable |
+----------------+------------------------+----------+
+ id             | integer                | not null |
+ name           | character varying(100) | not null |
+ description    | text                   | not null |
+ category       | text                   |          |
+ price          | numeric(10,2)          |          |
+ stock_quantity | integer                |          |
+Indexes:
+    "catalog_pkey" PRIMARY KEY, btree (id)
+Check constraints:
+    "catalog_category_check" CHECK (category = ANY (ARRAY['coffee'::text,
+         'mug'::text, 't-shirt'::text]))
+    "catalog_stock_quantity_check" CHECK (stock_quantity >= 0)
+</pre></div>
+
+<ul>
+  <li><code>id</code> 是主键。主键依赖一个名为 <code>catalog_pkey</code> 的<strong>索引</strong>来快速检查唯一性 ——
+      在索引里查找是<strong>对数复杂度</strong>，远快于把整张表从头扫到尾（全表扫描）。</li>
+  <li><code>name</code> 和 <code>description</code> 都是 <code>NOT NULL</code>。</li>
+  <li><code>category</code> 只能是 coffee、mug、t-shirt 之一。</li>
+  <li><code>stock_quantity</code> 不能小于 0。</li>
+</ul>
+
+<p>唯独 <code>price</code> 什么约束都没有。商家手滑输了个负价格怎么办？用 <code>ALTER TABLE</code> 补一个：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.4 · 添加价格约束">
+<pre>
+ALTER TABLE products.catalog
+    ADD CONSTRAINT catalog_price_check CHECK (price > 0);
+</pre>
+</div>
+
+<p>现在就算后端漏检，Postgres 也会拦住：</p>
+
+<div class="code" data-lang="sql"><pre>
+UPDATE products.catalog SET price = -16 WHERE name = 'Morning Glory';
+</pre></div>
+<div class="code out"><pre>
+ERROR: new row for relation "catalog" violates
+check constraint "catalog_price_check"
+DETAIL: Failing row contains (3, Morning Glory, A light roast with
+  bright acidity and floral notes., coffee, -16.00, 30).
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 已有数据违反新约束时</div>
+  <p>
+    如果表里已经有一行价格是负数，清单 2.4 的 <code>ALTER TABLE</code> 本身就会失败：
+    <code>ERROR: check constraint "catalog_price_check" of relation "catalog" is violated by some row</code>。
+    这时要先把违规的行修正，再加约束。
+  </p>
+</div>
+
+<p>评论表也补上约束：评论内容不能为空，评分必须在 1 到 5 之间：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.5 · 为评论表添加约束">
+<pre>
+ALTER TABLE products.reviews
+    ALTER COLUMN review SET NOT NULL,
+    ADD CONSTRAINT review_rank_check CHECK (rank BETWEEN 1 AND 5);
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 能早加就早加</div>
+  <p>如果你一开始就知道需要哪些约束，直接写在 <code>CREATE TABLE</code> 里。这里分开加只是为了演示 <code>ALTER TABLE</code> 的用法。</p>
+</div>
+
+<h3>外键：表与表之间的“引用必须存在”</h3>
+
+<p>
+  评论表的 <code>product_id</code> 和 <code>customer_id</code> 应该指向真实存在的商品和客户。
+  如果指向了一个根本不存在的商品呢？这就是<strong>外键约束</strong>要解决的问题。
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.6 · 在 product_id 上创建外键">
+<pre>
+ALTER TABLE products.reviews
+    ADD CONSTRAINT products_review_product_id_fk
+    FOREIGN KEY (product_id) REFERENCES products.catalog(id);
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 被引用的列必须唯一</div>
+  <p>
+    外键引用的列必须有唯一约束（主键天然满足）。否则会报错 <code>there is no unique constraint matching given keys for referenced table</code>。
+    原因是 Postgres 需要快速确认“这个 product_id 真的存在”，最快的办法就是去查唯一列上自带的索引。
+  </p>
+</div>
+
+<p>再建客户账户表，并给评论表的 <code>customer_id</code> 也加上外键：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.7 · 创建客户账户表">
+<pre>
+CREATE TABLE customers.accounts (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    passwd_hash TEXT NOT NULL
+);
+</pre>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 2.8 · 在 customer_id 上创建外键">
+<pre>
+ALTER TABLE products.reviews
+    ADD CONSTRAINT products_review_customer_id_fk
+    FOREIGN KEY (customer_id) REFERENCES customers.accounts(id);
+</pre>
+</div>
+
+<p>三位老顾客发现 Jake 开了网店，纷纷注册：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.9 · 添加新客户">
+<pre>
+INSERT INTO customers.accounts (name, email, passwd_hash)
+VALUES
+('Alice Johnson', 'alice.johnson@example.com',
+    '5f4dcc3b5aa765d61d8327deb882cf99'),
+('Bob Smith', 'bob.smith@example.com', 'd8578edf8458ce06fbc5bb76a58c5ca4'),
+('Charlie Brown', 'charlie.brown@example.com',
+     '5f4dcc3b5aa765d61d8327deb882cf99');
+</pre>
+</div>
+
+<p>
+  他们的 ID 依次是 1、2、3。Alice 看到了她已经拥有并且很喜欢的马克杯（id=4），忍不住要写好评。
+  可她点“发送”后却报错了。我们查后端日志，发现过去五分钟里很多商家的顾客都发不了评论，Postgres 报的是外键冲突：
+</p>
+
+<div class="code out"><pre>
+ERROR: insert or update on table "reviews" violates
+foreign key constraint "products_review_product_id_fk"
+DETAIL: Key (product_id)=(1004) is not present in table "catalog".
+</pre></div>
+
+<p>
+  马克杯的 ID 应该是 4，后端却传了 1004 —— 我们的应用代码里有个 bug。几分钟内修好上线后，Alice 的评论成功提交：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.10 · 发表商品评论">
+<pre>
+INSERT INTO products.reviews (product_id, customer_id, review, rank)
+VALUES (4, 1, 'This mug is perfect — sturdy, stylish, and keeps
+   my coffee warm for a good while.', 5);
+</pre>
+</div>
+
+<p>
+  虽然 bug 影响了一些用户，但如果没有外键，后果会严重得多：我们得花大量时间清理那些挂在错误商品、甚至不存在的商品下面的评论。
+</p>
+
+<h4>外键是双向守护的</h4>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="外键双向检查：阻止插入不存在的引用，也阻止删除仍被引用的行">
+  <rect class="bx-b" x="20" y="60" width="200" height="130" rx="10"/>
+  <text class="ttl on-b" x="120" y="84" text-anchor="middle">customers.accounts</text>
+  <rect class="cell-h" x="36" y="96" width="168" height="22"/><text class="sm b" x="46" y="111">id · name</text>
+  <rect class="cell" x="36" y="118" width="168" height="22"/><text class="sm" x="46" y="133">1 · Alice</text>
+  <rect class="cell" x="36" y="140" width="168" height="22"/><text class="sm" x="46" y="155">2 · Bob</text>
+  <rect class="cell" x="36" y="162" width="168" height="22"/><text class="sm" x="46" y="177">3 · Charlie</text>
+
+  <rect class="bx-b" x="270" y="60" width="220" height="130" rx="10"/>
+  <text class="ttl on-b" x="380" y="84" text-anchor="middle">products.reviews</text>
+  <rect class="cell-h" x="286" y="96" width="188" height="22"/><text class="sm b" x="294" y="111">product_id · customer_id</text>
+  <rect class="cell" x="286" y="118" width="188" height="22"/><text class="sm" x="294" y="133">4 · 1（Alice 的好评）</text>
+
+  <rect class="bx-b" x="540" y="60" width="200" height="130" rx="10"/>
+  <text class="ttl on-b" x="640" y="84" text-anchor="middle">products.catalog</text>
+  <rect class="cell-h" x="556" y="96" width="168" height="22"/><text class="sm b" x="566" y="111">id · name</text>
+  <rect class="cell" x="556" y="118" width="168" height="22"/><text class="sm" x="566" y="133">1 · Sunrise Blend</text>
+  <rect class="cell" x="556" y="140" width="168" height="22"/><text class="sm" x="566" y="155">4 · Mug</text>
+  <rect class="cell" x="556" y="162" width="168" height="22"/><text class="sm" x="566" y="177">…</text>
+
+  <path class="ln-a" d="M286 129 H206" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M474 129 H552" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="246" y="54" text-anchor="middle">外键</text>
+  <text class="sm on-a" x="515" y="54" text-anchor="middle">外键</text>
+
+  <rect class="bx-r" x="20" y="210" width="340" height="40" rx="8"/>
+  <text class="sm on-r" x="190" y="228" text-anchor="middle">✗ DELETE Alice（id=1）—— 她的评论还引用着她</text>
+  <text class="sm" x="190" y="243" text-anchor="middle">保护“被引用的表”</text>
+
+  <rect class="bx-r" x="400" y="210" width="340" height="40" rx="8"/>
+  <text class="sm on-r" x="570" y="228" text-anchor="middle">✗ INSERT 评论 product_id=1004 —— 商品不存在</text>
+  <text class="sm" x="570" y="243" text-anchor="middle">保护“拥有外键的表”</text>
+  <text class="sm" x="380" y="24" text-anchor="middle">reviews 指向另外两张表，两个方向的破坏都会被拦下</text>
+</svg>
+<figcaption>图 2-4　外键同时守护两边：不能引用不存在的行，也不能删除仍被引用的行</figcaption>
+</figure>
+
+<p>如果 Alice 想注销账户，后端直接删除她的记录：</p>
+
+<div class="code" data-lang="sql"><pre>
+DELETE FROM customers.accounts WHERE id = 1;
+</pre></div>
+<div class="code out"><pre>
+ERROR: update or delete on table "accounts" violates foreign key
+   constraint "products_review_customer_id_fk" on table "reviews"
+DETAIL: Key (id)=(1) is still referenced from table "reviews".
+</pre></div>
+
+<p>
+  Postgres 提醒我们：Alice 还有一条评论，删掉她这条评论就成了“孤儿”。我们不希望这样，
+  于是改用<strong>软删除</strong>：加一个 <code>deleted</code> 标志列，注销时只把它设为 true，记录本身保留。
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.11 · 为账户表添加 deleted 列">
+<pre>
+ALTER TABLE customers.accounts
+    ADD COLUMN deleted boolean DEFAULT false;
+
+-- 注销时：
+UPDATE customers.accounts SET deleted = true WHERE id = 1;
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; ON DELETE CASCADE</div>
+  <p>如果你希望删除客户时连同其评论一起删掉，在外键定义里加上 <code>ON DELETE CASCADE</code>。之后删除 accounts 里的客户，Postgres 会自动删除 reviews 里关联的所有评论。</p>
+</div>
+
+<h2 id="tx">事务</h2>
+
+<p>
+  不论是更新一行，还是跨几张表更新很多行，Postgres 都会按照 <strong>ACID</strong> 原则以事务方式处理：
+</p>
+
+<div class="cards">
+  <div class="card"><h4>A · 原子性 Atomicity</h4><p>要么全部成功，要么全部撤销，不会只做一半。</p></div>
+  <div class="card"><h4>C · 一致性 Consistency</h4><p>事务前后，数据都满足所有约束和规则。</p></div>
+  <div class="card"><h4>I · 隔离性 Isolation</h4><p>并发执行的事务互不干扰，像是排队执行一样。</p></div>
+  <div class="card"><h4>D · 持久性 Durability</h4><p>一旦提交，就算服务器马上断电，数据也不会丢。</p></div>
+</div>
+
+<h3>隐式事务</h3>
+
+<p>Jake 的仓库到了一批咖啡豆。他先给 Sunrise Blend 加 100 袋库存，又发现 Sunrise Blend 和 Morning Glory 各还有 50 袋：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.12 · 更新单个商品的库存">
+<pre>
+UPDATE products.catalog
+SET stock_quantity = stock_quantity + 100
+WHERE id = 1;
+</pre>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 2.13 · 同时更新两个商品的库存">
+<pre>
+UPDATE products.catalog
+SET stock_quantity = stock_quantity + 50
+WHERE id = 1 or id = 3;
+</pre>
+</div>
+
+<p>
+  这两条语句都是<strong>隐式事务</strong>：Postgres 给每条语句分配一个内部事务 ID，读出当前库存、加上数量、写回、提交。
+  中途出任何问题都会回滚到语句执行之前的状态。<code>INSERT</code> 和 <code>DELETE</code> 也一样。
+  也就是说，<strong>哪怕你从没写过 BEGIN，Postgres 也一直在背后帮你保证一致性</strong>。
+</p>
+
+<h3>显式事务</h3>
+
+<p>
+  当你需要把<strong>多条</strong> SQL 当作一个整体来执行时，就要用显式事务：以 <code>BEGIN</code> 开始，以 <code>COMMIT</code> 提交。
+  先建订单相关的两张表：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.14 · 创建 orders 和 order_items 表">
+<pre>
+CREATE TABLE sales.orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id INT REFERENCES customers.accounts(id),
+    order_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    total_amount DECIMAL(10, 2)
+);
+
+CREATE TABLE sales.order_items (
+    order_id UUID REFERENCES sales.orders(id),
+    product_id INT REFERENCES products.catalog(id),
+    quantity INT CHECK (quantity > 0),
+    price DECIMAL (10, 2),
+    PRIMARY KEY (order_id, product_id)
+);
+</pre>
+</div>
+
+<ul>
+  <li><code>orders.id</code> 是 <code>UUID</code> 主键，应用没传值时由 <code>gen_random_uuid()</code> 生成随机的 UUIDv4。
+      UUID 主键不依赖序列，通常扩展性更好。</li>
+  <li><code>order_items.price</code> 记录的是<strong>下单时</strong>的价格，因为商品价格以后可能会变。</li>
+  <li><code>PRIMARY KEY (order_id, product_id)</code> 是<strong>复合主键</strong>：一个订单里可以有多种商品，但每种商品只出现一次。</li>
+</ul>
+
+<div class="box note">
+  <div class="t">&#9432; Postgres 18 的 UUIDv7</div>
+  <p>
+    Postgres 18 开始支持 <code>uuidv7()</code>。UUIDv7 的值里包含 Unix 时间戳，时间相近生成的 UUID 在索引里也挨得近，
+    因此对索引更友好、访问更快。<code>gen_random_uuid()</code> 是 <code>uuidv4()</code> 的别名。
+  </p>
+</div>
+
+<p>一位顾客买了一袋 Sunrise Blend 和一个马克杯。后端用一个显式事务记录这笔订单：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.15 · 顾客购买两件商品">
+<pre>
+BEGIN;
+
+INSERT INTO sales.orders (id, customer_id, total_amount)
+VALUES ('19a0cffc-8757-453c-a4d2-b554fdc08954', 1, 26.53);
+
+INSERT INTO sales.order_items (order_id, product_id, quantity, price)
+VALUES ('19a0cffc-8757-453c-a4d2-b554fdc08954', 1, 1, 16.54),
+ ('19a0cffc-8757-453c-a4d2-b554fdc08954', 4, 1, 9.99);
+
+UPDATE products.catalog
+SET stock_quantity = stock_quantity - 1
+WHERE id IN (1, 4);
+
+COMMIT;
+</pre>
+</div>
+
+<p>（这里显式写出 UUID 只是为了让你看看它长什么样，实际可以交给 <code>gen_random_uuid()</code> 自动生成。）</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="显式事务的原子性：三条语句要么全部提交，要么全部回滚">
+  <text class="ttl on-g" x="20" y="24">情况 A：一切顺利</text>
+  <rect class="bx-d" x="20" y="34" width="70" height="44" rx="8"/><text class="mono" x="55" y="61" text-anchor="middle">BEGIN</text>
+  <rect class="bx-g" x="110" y="34" width="150" height="44" rx="8"/><text class="sm" x="185" y="54" text-anchor="middle">INSERT orders</text><text class="sm on-g" x="185" y="70" text-anchor="middle">✓</text>
+  <rect class="bx-g" x="280" y="34" width="150" height="44" rx="8"/><text class="sm" x="355" y="54" text-anchor="middle">INSERT order_items</text><text class="sm on-g" x="355" y="70" text-anchor="middle">✓</text>
+  <rect class="bx-g" x="450" y="34" width="150" height="44" rx="8"/><text class="sm" x="525" y="54" text-anchor="middle">UPDATE 库存</text><text class="sm on-g" x="525" y="70" text-anchor="middle">✓</text>
+  <rect class="bx-g" x="620" y="34" width="120" height="44" rx="8"/><text class="mono on-g" x="680" y="61" text-anchor="middle">COMMIT</text>
+  <path class="ln" d="M90 56 H108"/><path class="ln" d="M260 56 H278"/><path class="ln" d="M430 56 H448"/><path class="ln" d="M600 56 H618"/>
+  <text class="sm" x="380" y="100" text-anchor="middle">三张表的修改同时生效，其他会话这时才看得到</text>
+
+  <text class="ttl on-r" x="20" y="146">情况 B：最后一个马克杯刚被别人买走</text>
+  <rect class="bx-d" x="20" y="156" width="70" height="44" rx="8"/><text class="mono" x="55" y="183" text-anchor="middle">BEGIN</text>
+  <rect class="bx-g" x="110" y="156" width="150" height="44" rx="8"/><text class="sm" x="185" y="176" text-anchor="middle">INSERT orders</text><text class="sm on-g" x="185" y="192" text-anchor="middle">✓</text>
+  <rect class="bx-g" x="280" y="156" width="150" height="44" rx="8"/><text class="sm" x="355" y="176" text-anchor="middle">INSERT order_items</text><text class="sm on-g" x="355" y="192" text-anchor="middle">✓</text>
+  <rect class="bx-r" x="450" y="156" width="150" height="44" rx="8"/><text class="sm" x="525" y="176" text-anchor="middle">UPDATE 库存</text><text class="sm on-r" x="525" y="192" text-anchor="middle">✗ 违反 CHECK ≥ 0</text>
+  <rect class="bx-r" x="620" y="156" width="120" height="44" rx="8"/><text class="mono on-r" x="680" y="183" text-anchor="middle">ROLLBACK</text>
+  <path class="ln" d="M90 178 H108"/><path class="ln" d="M260 178 H278"/><path class="ln" d="M430 178 H448"/><path class="ln" d="M600 178 H618"/>
+  <path class="ln-r" d="M680 202 V232 H185 V204" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="432" y="250" text-anchor="middle">前面已经成功的两条 INSERT 也一并撤销，不留任何可见痕迹</text>
+</svg>
+<figcaption>图 2-5　显式事务把多条语句捆成一个整体：全成，或全不成</figcaption>
+</figure>
+
+<div class="box deep">
+  <div class="t">&#9670; 回滚的数据去哪了</div>
+  <p>
+    被回滚的修改并不会立刻从磁盘上消失。Postgres 的 <strong>MVCC</strong>（多版本并发控制）引擎保证后续的请求再也看不到它们；
+    这些“死掉”的行版本会在一段时间后被垃圾回收清理掉，这个过程叫 <strong>vacuum</strong>（清理）。
+  </p>
+</div>
+
+<h3>多版本并发控制（MVCC）</h3>
+
+<p>
+  在一些顾客下单的同时，另一些顾客还在浏览商品目录，产生大量 <code>SELECT</code>。
+  Postgres 实现了 MVCC，默认使用<strong>读已提交（read committed）</strong>隔离级别。
+  这意味着：一个顾客在 <code>SELECT * FROM products.catalog</code>，另一个在执行清单 2.15 的 <code>UPDATE</code>，<strong>两者互不阻塞</strong>。
+</p>
+
+<p>读已提交隔离级别保证两件事：</p>
+
+<ul>
+  <li><strong>不会脏读（dirty read）</strong>：任何事务都看不到别的事务<em>还没提交</em>的修改。</li>
+  <li><strong>不会脏写（dirty write）</strong>：两个事务同时改同一行时，后来的会被<em>阻塞</em>，直到先来的提交，避免覆盖别人未提交的值。</li>
+</ul>
+
+<p>亲手验证一下。下面这个事务要在<strong>两个 psql 会话里并发执行</strong>（先别急着运行）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.16 · 读取并修改商品库存">
+<pre>
+BEGIN;
+
+SELECT stock_quantity FROM products.catalog
+WHERE id = 1;
+
+UPDATE products.catalog
+SET stock_quantity = stock_quantity - 1
+WHERE id = 1;
+
+COMMIT;
+</pre>
+</div>
+
+<p>再开一个终端窗口，建立第二个连接：<code>docker exec -it postgres psql -U postgres -d coffee_chain</code>，然后按下图的时间顺序交替执行：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 470" role="img" aria-label="两个会话并发执行事务的时间线">
+  <text class="ttl on-b" x="190" y="24" text-anchor="middle">会话 1</text>
+  <text class="ttl on-p" x="570" y="24" text-anchor="middle">会话 2</text>
+  <path class="ln-d" d="M380 36 V460"/>
+  <text class="sm" x="380" y="32" text-anchor="middle">时间 ↓</text>
+
+  <rect class="bx-b" x="40" y="44" width="300" height="56" rx="8"/>
+  <text class="mono" x="54" y="66">BEGIN; SELECT stock_quantity …</text>
+  <text class="sm on-b" x="54" y="88">→ 199</text>
+
+  <rect class="bx-b" x="40" y="112" width="300" height="56" rx="8"/>
+  <text class="mono" x="54" y="134">UPDATE … SET stock - 1</text>
+  <text class="sm on-b" x="54" y="156">新版本 198，<tspan class="b">尚未提交</tspan>，行被锁住</text>
+
+  <rect class="bx-p" x="420" y="180" width="300" height="56" rx="8"/>
+  <text class="mono" x="434" y="202">BEGIN; SELECT stock_quantity …</text>
+  <text class="sm on-p" x="434" y="224">→ 199（看不到未提交的 198，也没被阻塞）</text>
+
+  <rect class="bx-r" x="420" y="248" width="300" height="56" rx="8"/>
+  <text class="mono" x="434" y="270">UPDATE … SET stock - 1</text>
+  <text class="sm on-r" x="434" y="292">⏸ 被阻塞：等会话 1 释放行锁</text>
+
+  <rect class="bx-g" x="40" y="316" width="300" height="44" rx="8"/>
+  <text class="mono on-g" x="54" y="343">COMMIT;  → 198 生效</text>
+
+  <path class="ln-g" d="M342 338 Q390 338 418 360" marker-end="url(#ar-g)"/>
+  <rect class="bx-p" x="420" y="364" width="300" height="56" rx="8"/>
+  <text class="sm" x="434" y="386">解除阻塞，UPDATE <tspan class="b">重新读取</tspan>最新值 198</text>
+  <text class="sm on-p" x="434" y="408">→ 197；然后 COMMIT;</text>
+
+  <rect class="bx-a" x="40" y="380" width="300" height="70" rx="8"/>
+  <text class="ttl on-a" x="54" y="404">最终结果：197 ✓</text>
+  <text class="sm" x="54" y="424">199 − 1 − 1，两次扣减都没丢</text>
+  <text class="sm" x="54" y="440">读不阻塞写，写不阻塞读，只有写写互斥</text>
+</svg>
+<figcaption>图 2-6　读已提交隔离级别下两个并发事务的执行过程（对应原书表 2.1）</figcaption>
+</figure>
+
+<p>两个事务都完成后确认结果：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT name, stock_quantity FROM products.catalog WHERE id = 1;
+</pre></div>
+<div class="code out"><pre>
+     name      | stock_quantity
+---------------+----------------
+ Sunrise Blend |            197
+(1 row)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="MVCC 原理：更新不是原地改，而是写入新版本，不同事务看到不同版本">
+  <text class="ttl" x="20" y="24">MVCC 的核心思想：一行数据可以同时存在多个版本</text>
+  <rect class="cell-h" x="20" y="44" width="420" height="26"/>
+  <text class="sm b" x="30" y="62">行版本</text><text class="sm b" x="150" y="62">stock_quantity</text><text class="sm b" x="280" y="62">状态</text>
+  <rect class="cell" x="20" y="70" width="420" height="30"/>
+  <text class="mono" x="30" y="90">v1</text><text class="mono" x="150" y="90">199</text><text class="sm" x="280" y="90">旧版本（已被 v2 取代）</text>
+  <rect class="cell-b" x="20" y="100" width="420" height="30"/>
+  <text class="mono" x="30" y="120">v2</text><text class="mono" x="150" y="120">198</text><text class="sm" x="280" y="120">会话 1 已提交</text>
+  <rect class="cell-p" x="20" y="130" width="420" height="30"/>
+  <text class="mono" x="30" y="150">v3</text><text class="mono" x="150" y="150">197</text><text class="sm" x="280" y="150">会话 2 已提交 · 当前</text>
+
+  <rect class="bx-d" x="470" y="44" width="270" height="116" rx="10"/>
+  <text class="sm" x="484" y="68">• 读操作看到的是“自己能看到的</text>
+  <text class="sm" x="484" y="86">  最新已提交版本”，所以不用等锁</text>
+  <text class="sm" x="484" y="110">• 旧版本没人再需要后，</text>
+  <text class="sm" x="484" y="128">  由 vacuum 回收空间</text>
+  <text class="sm" x="484" y="150">• 详细原理见仓库里的 MVCC 视频</text>
+  <text class="sm" x="20" y="186">（这也解释了前面“更新过的行跑到表末尾”的现象：更新 = 写一个新版本）</text>
+</svg>
+<figcaption>图 2-7　MVCC：更新写入新版本，读者各取所需，互不阻塞</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 更强的隔离级别</div>
+  <p>
+    读已提交在一致性和并发性能之间取得了很好的平衡，所以是默认值。
+    但 SQL 标准还定义了<strong>不可重复读</strong>、<strong>幻读</strong>等现象，Postgres 提供了更强的
+    <code>REPEATABLE READ</code>（可重复读）和 <code>SERIALIZABLE</code>（可串行化）隔离级别来应对。
+    什么时候需要它们，官方文档讲得很清楚：<a href="https://www.postgresql.org/docs/current/transaction-iso.html">Transaction Isolation</a>。
+  </p>
+</div>
+
+<p>清单 2.16 里的 <code>SELECT</code> 对结果没有影响，实际应用里可以去掉，这里只是为了演示读已提交的行为。</p>
+
+<h2 id="joins">连接查询（JOIN）</h2>
+
+<p>
+  到目前为止，每个 <code>SELECT</code> 都只查一张表。<strong>连接（join）</strong>能一次从多张表取数据：
+  选好表，再用<strong>连接条件</strong>把它们的行配对起来。
+</p>
+
+<p>Jake 开店一小时后打开销售看板。要显示“下单最多的三位顾客”，后端执行：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.17 · 下单最多的三位顾客">
+<pre>
+SELECT c.name, c.id, count(*) as total_orders
+FROM customers.accounts c
+JOIN sales.orders s ON c.id = s.customer_id
+GROUP BY c.id
+ORDER BY total_orders DESC
+LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+     name      | id | total_orders
+---------------+----+--------------
+ Alice Johnson |  1 |            1
+(1 row)
+</pre></div>
+
+<p>
+  <code>c</code> 和 <code>s</code> 是表的别名，省得每次都写全名。<code>ON c.id = s.customer_id</code> 是连接条件。
+  这是<strong>内连接（inner join）</strong>：只返回两边都能配对上的行。开店才一小时，只有一笔订单，聊胜于无！
+</p>
+
+<p>看板上还有一份“还没下过单的顾客”报表，这要用<strong>左连接（left join）</strong>：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.18 · 没有下过单的顾客">
+<pre>
+SELECT c.name
+FROM customers.accounts c
+LEFT JOIN sales.orders s ON c.id = s.customer_id
+WHERE s.customer_id IS NULL;
+</pre>
+</div>
+<div class="code out"><pre>
+     name
+---------------
+ Bob Smith
+ Charlie Brown
+(2 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="内连接与左连接的区别">
+  <text class="ttl" x="20" y="22">accounts（左表）</text>
+  <rect class="cell-h" x="20" y="32" width="150" height="24"/><text class="sm b" x="30" y="49">id · name</text>
+  <rect class="cell-g" x="20" y="56" width="150" height="26"/><text class="sm" x="30" y="74">1 · Alice</text>
+  <rect class="cell" x="20" y="82" width="150" height="26"/><text class="sm" x="30" y="100">2 · Bob</text>
+  <rect class="cell" x="20" y="108" width="150" height="26"/><text class="sm" x="30" y="126">3 · Charlie</text>
+
+  <text class="ttl" x="220" y="22">orders（右表）</text>
+  <rect class="cell-h" x="220" y="32" width="150" height="24"/><text class="sm b" x="230" y="49">id · customer_id</text>
+  <rect class="cell-g" x="220" y="56" width="150" height="26"/><text class="sm" x="230" y="74">19a0… · 1</text>
+  <path class="ln-g" d="M172 69 H218"/>
+
+  <text class="ttl on-b" x="420" y="22">JOIN（内连接）</text>
+  <rect class="cell-h" x="420" y="32" width="320" height="24"/><text class="sm b" x="430" y="49">name · order id</text>
+  <rect class="cell-g" x="420" y="56" width="320" height="26"/><text class="sm" x="430" y="74">Alice · 19a0…</text>
+  <text class="sm" x="430" y="104">只保留两边都匹配上的行</text>
+
+  <text class="ttl on-a" x="420" y="146">LEFT JOIN（左连接）</text>
+  <rect class="cell-h" x="420" y="156" width="320" height="24"/><text class="sm b" x="430" y="173">name · s.customer_id</text>
+  <rect class="cell-g" x="420" y="180" width="320" height="26"/><text class="sm" x="430" y="198">Alice · 1</text>
+  <rect class="cell-a" x="420" y="206" width="320" height="26"/><text class="sm" x="430" y="224">Bob · NULL ← 右表没有匹配，补 NULL</text>
+  <rect class="cell-a" x="420" y="232" width="320" height="26"/><text class="sm" x="430" y="250">Charlie · NULL</text>
+  <text class="sm on-a" x="430" y="282">再加 WHERE s.customer_id IS NULL → 只剩 Bob 和 Charlie</text>
+
+  <text class="sm" x="20" y="170">左表的每一行都会出现在左连接结果里；</text>
+  <text class="sm" x="20" y="188">右表找不到对应行时，右表的列全是 NULL。</text>
+  <text class="sm" x="20" y="214">“找出没有 X 的 Y”是左连接的经典用法。</text>
+</svg>
+<figcaption>图 2-8　内连接只要“配对成功”的；左连接保留左表全部行，配不上的补 NULL</figcaption>
+</figure>
+
+<p>最后一份报表是商品受欢迎程度，同样用左连接 —— 这样一件都没卖出的商品也会出现在列表里：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.19 · 商品受欢迎程度">
+<pre>
+SELECT c.name, c.category, c.price, SUM(oi.quantity) AS total_sold
+FROM products.catalog c
+LEFT JOIN sales.order_items oi ON c.id = oi.product_id
+GROUP BY c.id
+ORDER BY total_sold DESC NULLS LAST, price DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+           name           | category | price | total_sold
+--------------------------+----------+-------+------------
+ Sunrise Blend            | coffee   | 16.54 |          1
+ Sunrise Brew Co. Mug     | mug      |  9.99 |          1
+ Sunrise Brew Co. T-Shirt | t-shirt  | 19.99 |
+ Morning Glory            | coffee   | 13.99 |
+(4 rows)
+</pre></div>
+
+<p>
+  没卖出的商品 <code>SUM</code> 结果是 NULL。<code>NULLS LAST</code> 让它们排在最后；
+  销量相同时再按价格从高到低排（<code>price DESC</code>）。
+</p>
+
+<h2 id="functions">函数与触发器</h2>
+
+<p>
+  关系型数据库不只是放数据的容器，它还能运行相当复杂的逻辑。
+  你可以用 <strong>PL/pgSQL</strong>（Postgres 专属的过程式语言）写函数和触发器，
+  也可以借助扩展用 Java、JavaScript、Python 等语言来写。先看一个纯 SQL 的简单函数：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.20 · 返回商品价格的函数">
+<pre>
+CREATE OR REPLACE FUNCTION products.get_product_price(product_id INT)
+RETURNS NUMERIC(10, 2) AS $$
+    SELECT price
+    FROM products.catalog
+    WHERE id = product_id;
+$$ LANGUAGE sql;
+</pre>
+</div>
+
+<div class="code" data-lang="sql"><pre>
+SELECT products.get_product_price(5);
+</pre></div>
+<div class="code out"><pre>
+ get_product_price
+-------------------
+             19.99
+(1 row)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; $$ 是什么</div>
+  <p>
+    <code>$$ … $$</code> 是 Postgres 的“美元引号”，用来包住函数体。好处是函数体里的单引号不用转义。
+    需要修改函数时，改好代码后重新执行完整的 <code>CREATE OR REPLACE FUNCTION</code> 即可。
+  </p>
+</div>
+
+<p>这个函数本身没什么实际价值。那什么时候值得把逻辑放进数据库函数呢？至少有两种场景：</p>
+
+<ul>
+  <li><strong>和数据紧密耦合的复杂业务逻辑，每个客户端或微服务都要各自实现一遍</strong>。不如写成一个数据库函数，大家共用。</li>
+  <li><strong>多步骤逻辑需要在应用和数据库之间来回很多次</strong>。比如银行给几千个储蓄账户计息：
+      一种做法是把所有账户读到应用层、算好利息、再写回去；另一种是一个数据库函数在内部全部做完，省掉来回传输，网络延迟高、数据量大时尤其划算。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="把逻辑放在应用层需要多次往返；放在数据库函数里只需一次调用">
+  <text class="ttl" x="190" y="22" text-anchor="middle">逻辑在应用层：多次往返</text>
+  <rect class="bx-p" x="30" y="40" width="110" height="170" rx="10"/><text class="ttl on-p" x="85" y="130" text-anchor="middle">应用</text>
+  <rect class="bx-a" x="240" y="40" width="110" height="170" rx="10"/><text class="ttl on-a" x="295" y="130" text-anchor="middle">Postgres</text>
+  <path class="ln-b" d="M142 60 H236" marker-end="url(#ar-b)"/><text class="sm" x="190" y="55" text-anchor="middle">① 查待处理订单</text>
+  <path class="ln-g" d="M238 84 H144" marker-end="url(#ar-g)"/>
+  <path class="ln-b" d="M142 112 H236" marker-end="url(#ar-b)"/><text class="sm" x="190" y="107" text-anchor="middle">② 插入/更新明细</text>
+  <path class="ln-g" d="M238 136 H144" marker-end="url(#ar-g)"/>
+  <path class="ln-b" d="M142 164 H236" marker-end="url(#ar-b)"/><text class="sm" x="190" y="159" text-anchor="middle">③ 再查购物车</text>
+  <path class="ln-g" d="M238 188 H144" marker-end="url(#ar-g)"/>
+
+  <text class="ttl" x="570" y="22" text-anchor="middle">逻辑在数据库函数里：一次调用</text>
+  <rect class="bx-p" x="410" y="40" width="110" height="170" rx="10"/><text class="ttl on-p" x="465" y="130" text-anchor="middle">应用</text>
+  <rect class="bx-a" x="620" y="40" width="120" height="170" rx="10"/><text class="ttl on-a" x="680" y="70" text-anchor="middle">Postgres</text>
+  <rect class="bx" x="632" y="86" width="96" height="104" rx="6"/>
+  <text class="sm" x="680" y="106" text-anchor="middle">函数内部：</text>
+  <text class="sm" x="680" y="126" text-anchor="middle">① 查订单</text>
+  <text class="sm" x="680" y="146" text-anchor="middle">② 改明细</text>
+  <text class="sm" x="680" y="166" text-anchor="middle">③ 返回结果</text>
+  <path class="ln-b" d="M522 112 H616" marker-end="url(#ar-b)"/><text class="sm" x="570" y="104" text-anchor="middle">SELECT f(…)</text>
+  <path class="ln-g" d="M618 140 H524" marker-end="url(#ar-g)"/><text class="sm" x="570" y="158" text-anchor="middle">一次返回</text>
+</svg>
+<figcaption>图 2-9　把多步逻辑搬进数据库函数，省掉多次网络往返</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 函数 vs 存储过程</div>
+  <p>
+    在很多数据库里“函数”和“存储过程”是同义词，但 Postgres 里不是。
+    Postgres 的<strong>存储过程</strong>用 <code>CREATE PROCEDURE</code> 创建、<strong>不返回值</strong>，是 Postgres 11 才引入的独立 API；
+    而函数从一开始就有。
+  </p>
+</div>
+
+<p>
+  <strong>触发器（trigger）</strong>是一种特殊的函数，在数据变化之前或之后由 Postgres 自动执行。
+  适合审计（记录谁改了什么）和事件驱动架构（数据库里的变化触发别处的动作）。
+</p>
+
+<h3>实战：用函数实现购物车</h3>
+
+<p>
+  你一定有过这种体验：在家用电脑逛网店，往购物车里加了两件商品，还没付款就出门了；
+  几小时后用手机打开同一家店，购物车里那两件还在。我们用数据库函数来实现一个简化版。
+</p>
+
+<p>
+  先引入<strong>待处理订单（pending order）</strong>的概念：顾客正在挑选、还没结账的订单就是“购物车”。
+  复用 <code>sales.orders</code> 表，加一个状态列：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.21 · 为订单表添加 status 列">
+<pre>
+ALTER TABLE sales.orders
+ADD COLUMN status TEXT DEFAULT 'pending'
+  CHECK (status in ('pending','ordered'));
+
+UPDATE sales.orders SET status = 'ordered';
+
+ALTER TABLE sales.orders
+ADD CONSTRAINT one_pending_order_per_customer
+EXCLUDE USING btree (customer_id WITH =)
+WHERE (status = 'pending');
+</pre>
+</div>
+
+<ol>
+  <li>第一句加 <code>status</code> 列，只能是 <code>pending</code>（待处理）或 <code>ordered</code>（已下单），默认 pending。</li>
+  <li>第二句把已有订单都改成 ordered —— 因为上一句让它们默认成了 pending。</li>
+  <li>第三句是<strong>排他约束</strong>：<code>(customer_id WITH =)</code> 的意思是“customer_id 相等的两行不能同时存在”，
+      但只在 <code>WHERE status = 'pending'</code> 的行之间检查。也就是说，<strong>每个顾客最多只能有一个购物车</strong>，已完成的订单则不受限。
+      <code>USING btree</code> 表示用 B-tree 索引来高效检查。</li>
+</ol>
+
+<p>接着用 PL/pgSQL 实现“加入购物车”函数，它覆盖了大部分边界情况：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.22 · 实现 order_add_item 函数">
+<pre>
+CREATE OR REPLACE FUNCTION sales.order_add_item(customer_id_param INT,
+  product_id_param INT, quantity_param INT)
+RETURNS TABLE (order_id UUID, prod_id INT,
+  quantity INT, prod_price DECIMAL) AS $$
+DECLARE
+    pending_order_id UUID;               -- 变量：该顾客的购物车 ID
+BEGIN
+    -- ① 找这个顾客现有的购物车
+    SELECT id INTO pending_order_id
+    FROM sales.orders
+    WHERE customer_id = customer_id_param
+      AND status = 'pending'
+    LIMIT 1;
+
+    -- ② 没有就新建一个，并用 RETURNING 拿到自动生成的 UUID
+    IF pending_order_id IS NULL THEN
+        INSERT INTO sales.orders (customer_id, status)
+        VALUES (customer_id_param, 'pending')
+        RETURNING id INTO pending_order_id;
+    END IF;
+
+    -- ③ 商品已在购物车里就改数量，不在就插入
+    MERGE INTO sales.order_items AS oi
+    USING (SELECT id, price FROM products.catalog
+      WHERE id = product_id_param) AS prod
+    ON oi.product_id = prod.id AND oi.order_id = pending_order_id
+    WHEN MATCHED THEN
+        UPDATE SET quantity = quantity_param
+    WHEN NOT MATCHED THEN
+        INSERT (order_id, product_id, quantity, price)
+        VALUES (pending_order_id, prod.id, quantity_param, prod.price);
+
+    -- ④ 返回购物车里的全部商品
+    RETURN QUERY
+    SELECT oi.order_id, oi.product_id, oi.quantity, oi.price as prod_price
+    FROM sales.order_items as oi
+    WHERE oi.order_id = pending_order_id;
+END;
+$$ LANGUAGE plpgsql;
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="order_add_item 函数的执行流程图">
+  <rect class="bx-b" x="20" y="20" width="200" height="50" rx="10"/>
+  <text class="ttl on-b" x="120" y="42" text-anchor="middle">调用</text>
+  <text class="sm" x="120" y="60" text-anchor="middle">order_add_item(顾客, 商品, 数量)</text>
+
+  <path class="ln" d="M120 72 V96" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="20" y="100" width="200" height="50" rx="10"/>
+  <text class="ttl on-a" x="120" y="122" text-anchor="middle">① 该顾客有 pending 订单？</text>
+  <text class="sm" x="120" y="140" text-anchor="middle">SELECT … INTO</text>
+
+  <path class="ln-r" d="M222 125 H286" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="254" y="118" text-anchor="middle">没有</text>
+  <rect class="bx" x="290" y="100" width="200" height="50" rx="10"/>
+  <text class="ttl" x="390" y="122" text-anchor="middle">② 新建 pending 订单</text>
+  <text class="sm" x="390" y="140" text-anchor="middle">INSERT … RETURNING id</text>
+
+  <path class="ln-g" d="M120 152 V196" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="128" y="178">有</text>
+  <path class="ln" d="M390 152 V178 H180 V196" marker-end="url(#ar)"/>
+
+  <rect class="bx-a" x="20" y="200" width="200" height="50" rx="10"/>
+  <text class="ttl on-a" x="120" y="222" text-anchor="middle">③ MERGE：商品已在车里？</text>
+  <text class="sm" x="120" y="240" text-anchor="middle">按 (订单, 商品) 匹配</text>
+
+  <path class="ln" d="M222 214 H286" marker-end="url(#ar)"/>
+  <text class="sm" x="254" y="207" text-anchor="middle">是</text>
+  <rect class="bx" x="290" y="196" width="160" height="34" rx="8"/>
+  <text class="sm" x="370" y="217" text-anchor="middle">UPDATE 数量</text>
+  <path class="ln" d="M222 240 H286" marker-end="url(#ar)"/>
+  <text class="sm" x="254" y="256" text-anchor="middle">否</text>
+  <rect class="bx" x="290" y="236" width="160" height="34" rx="8"/>
+  <text class="sm" x="370" y="257" text-anchor="middle">INSERT 一行明细</text>
+
+  <path class="ln" d="M452 213 H520 V230" />
+  <path class="ln" d="M452 253 H520 V230" />
+  <path class="ln" d="M520 230 H556" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="560" y="200" width="180" height="60" rx="10"/>
+  <text class="ttl on-g" x="650" y="224" text-anchor="middle">④ RETURN QUERY</text>
+  <text class="sm" x="650" y="244" text-anchor="middle">返回整个购物车</text>
+
+  <rect class="bx-d" x="540" y="30" width="200" height="110" rx="10"/>
+  <text class="sm" x="552" y="52">整个函数是<tspan class="b">一个事务</tspan>：</text>
+  <text class="sm" x="552" y="72">任何一步失败，</text>
+  <text class="sm" x="552" y="92">之前的所有修改都会回滚。</text>
+  <text class="sm" x="552" y="118">排他约束保证每人</text>
+  <text class="sm" x="552" y="134">最多一个 pending 订单</text>
+</svg>
+<figcaption>图 2-10　购物车函数 <code>order_add_item</code> 的执行流程</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; MERGE 是什么</div>
+  <p><code>MERGE</code>（Postgres 15 起支持）把“存在就更新，不存在就插入”合成一条语句：<code>USING</code> 指定数据来源，<code>ON</code> 是匹配条件，<code>WHEN MATCHED</code> / <code>WHEN NOT MATCHED</code> 分别处理两种情况。</p>
+</div>
+
+<p>老顾客 Charlie Brown（id=3）登录后，往购物车里放了两袋 Morning Glory（id=3）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.23 · 把商品加入购物车">
+<pre>
+SELECT * FROM sales.order_add_item(
+    customer_id_param => 3,
+    product_id_param => 3,
+    quantity_param => 2
+    );
+</pre>
+</div>
+<div class="code out"><pre>
+               order_id               | prod_id | quantity | prod_price
+--------------------------------------+---------+----------+------------
+ e900fb15-aa65-4eea-bd52-1abe8d5832b6 |       3 |        2 |      13.99
+(1 row)
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 命名参数</div>
+  <p><code>参数名 =&gt; 值</code> 是命名参数写法，只为可读性，可以省略：<code>SELECT * FROM sales.order_add_item(3, 3, 2)</code> 效果一样。</p>
+</div>
+
+<p>结账前他又加了一件 T 恤（id=5）。函数找到已有的购物车，把 T 恤加进去，返回完整清单：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM sales.order_add_item(
+    customer_id_param => 3,
+    product_id_param => 5,
+    quantity_param => 1
+    );
+</pre></div>
+<div class="code out"><pre>
+               order_id               | prod_id | quantity | prod_price
+--------------------------------------+---------+----------+------------
+ e900fb15-aa65-4eea-bd52-1abe8d5832b6 |       3 |        2 |      13.99
+ e900fb15-aa65-4eea-bd52-1abe8d5832b6 |       5 |        1 |      19.99
+(2 rows)
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 函数是原子执行的</div>
+  <p>Postgres 以事务方式执行函数：函数执行中任何一步失败，它之前做的所有修改都会回滚。这一点对保证数据一致性非常重要。</p>
+</div>
+
+<p>接下来实现结账函数：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.24 · 实现 order_checkout 函数">
+<pre>
+CREATE OR REPLACE FUNCTION sales.order_checkout(customer_id_param INT)
+RETURNS TABLE (order_id UUID, customer_id INT, total_amount DECIMAL) AS $$
+DECLARE
+    pending_order_id UUID;
+    final_total_amount DECIMAL := 0;
+BEGIN
+    SELECT id INTO pending_order_id
+    FROM sales.orders as o
+    WHERE o.customer_id = customer_id_param
+      AND status = 'pending'
+    LIMIT 1;
+
+    IF pending_order_id IS NULL THEN
+        RAISE EXCEPTION 'No pending order found for customer %',
+          customer_id_param;
+    END IF;
+
+    SELECT SUM(oi.quantity * oi.price) INTO final_total_amount
+    FROM sales.order_items oi
+    WHERE oi.order_id = pending_order_id;
+
+    UPDATE sales.orders
+    SET status = 'ordered',
+        total_amount = final_total_amount,
+        order_date = CURRENT_TIMESTAMP
+    WHERE id = pending_order_id;
+
+    UPDATE products.catalog
+    SET stock_quantity = stock_quantity - oi.quantity
+    FROM sales.order_items oi
+    WHERE products.catalog.id = oi.product_id
+      AND oi.order_id = pending_order_id;
+
+    RETURN QUERY
+    SELECT o.id, o.customer_id, o.total_amount
+    FROM sales.orders as o
+    WHERE o.id = pending_order_id;
+END;
+$$ LANGUAGE plpgsql;
+</pre>
+</div>
+
+<ol>
+  <li>找到顾客的购物车，找不到就 <code>RAISE EXCEPTION</code> 抛出异常（<code>%</code> 是占位符）。</li>
+  <li>算出订单总额。</li>
+  <li>把订单状态改为 ordered，写入总额和下单时间。</li>
+  <li>扣减库存。热门商品可能库存不够 —— 这时 <code>stock_quantity &gt;= 0</code> 的 CHECK 约束会让这一步失败，整个函数回滚。</li>
+  <li>返回订单摘要。</li>
+</ol>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM sales.order_checkout(customer_id_param => 3);
+</pre></div>
+<div class="code out"><pre>
+               order_id               | customer_id | total_amount
+--------------------------------------+-------------+--------------
+ e900fb15-aa65-4eea-bd52-1abe8d5832b6 |           3 |        47.97
+(1 row)
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; SELECT * FROM 函数</div>
+  <p>用 <code>SELECT * FROM 函数名(…)</code> 调用，psql 会把返回的列名一起显示；不需要列名的话可以简写成 <code>SELECT sales.order_checkout(3)</code>。</p>
+</div>
+
+<h3>实战：用触发器自动维护订单总额</h3>
+
+<p>
+  现在有个小问题：顾客往购物车里加东西时，订单的 <code>total_amount</code> 并不会更新，要等到结账时才计算。
+  比如 Bob（id=2）加了一袋 Sunrise Blend：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM sales.order_add_item(
+    customer_id_param => 2,
+    product_id_param => 1,
+    quantity_param => 1);
+
+SELECT id, status, total_amount FROM sales.orders
+WHERE id = '34221a65-df20-4396-b9f4-3e3cf328f9d2';  -- 换成你自己的 order_id
+</pre></div>
+<div class="code out"><pre>
+                  id                  | status  | total_amount
+--------------------------------------+---------+--------------
+ 34221a65-df20-4396-b9f4-3e3cf328f9d2 | pending |
+(1 row)
+</pre></div>
+
+<p>总额是空的。我们写一个触发器：每当购物车明细被增、改、删，就自动重算订单总额。先写触发器函数：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.25 · 更新订单总额的触发器函数">
+<pre>
+CREATE OR REPLACE FUNCTION sales.update_order_total()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE sales.orders
+    SET total_amount = (
+        SELECT COALESCE(SUM(oi.quantity * oi.price), 0)
+        FROM sales.order_items oi
+        WHERE oi.order_id = COALESCE(NEW.order_id, OLD.order_id)
+    )
+    WHERE id = COALESCE(NEW.order_id, OLD.order_id) AND status = 'pending';
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+</pre>
+</div>
+
+<ul>
+  <li>触发器执行时，Postgres 会传入两个特殊变量：<code>NEW</code> 是行的新版本，<code>OLD</code> 是旧版本。</li>
+  <li><code>COALESCE(a, b)</code> 返回第一个非 NULL 的参数。INSERT/UPDATE 时 <code>NEW</code> 不为空，DELETE 时只有 <code>OLD</code> 不为空，所以 <code>COALESCE(NEW.order_id, OLD.order_id)</code> 三种情况都能拿到订单 ID。</li>
+  <li>购物车被清空时 <code>SUM</code> 结果是 NULL，外层 <code>COALESCE(…, 0)</code> 把它变成 0。</li>
+  <li>最后 <code>RETURN NEW</code>，让 Postgres 原样保存新版本的行。</li>
+</ul>
+
+<p>再创建触发器本身，把函数“挂”到 order_items 表上：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.26 · 更新订单总额的触发器">
+<pre>
+CREATE TRIGGER trigger_update_order_total
+AFTER INSERT OR UPDATE OR DELETE ON sales.order_items
+FOR EACH ROW
+EXECUTE FUNCTION sales.update_order_total();
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="触发器工作流程：修改 order_items 后自动更新 orders 的总额">
+  <rect class="bx-p" x="20" y="70" width="170" height="64" rx="10"/>
+  <text class="ttl on-p" x="105" y="96" text-anchor="middle">order_add_item(…)</text>
+  <text class="sm" x="105" y="116" text-anchor="middle">或任何直接修改</text>
+
+  <path class="ln" d="M192 102 H236" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="240" y="60" width="170" height="84" rx="10"/>
+  <text class="ttl on-b" x="325" y="86" text-anchor="middle">sales.order_items</text>
+  <text class="sm" x="325" y="108" text-anchor="middle">INSERT / UPDATE / DELETE</text>
+  <text class="sm" x="325" y="126" text-anchor="middle">每一行变化</text>
+
+  <path class="ln-a" d="M412 102 H456" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="434" y="94" text-anchor="middle">AFTER</text>
+  <rect class="bx-a" x="460" y="50" width="130" height="104" rx="10"/>
+  <text class="ttl on-a" x="525" y="76" text-anchor="middle">触发器</text>
+  <text class="sm" x="525" y="98" text-anchor="middle">自动执行</text>
+  <text class="mono" x="525" y="118" text-anchor="middle">update_</text>
+  <text class="mono" x="525" y="134" text-anchor="middle">order_total()</text>
+
+  <path class="ln-a" d="M592 102 H626" marker-end="url(#ar-a)"/>
+  <rect class="bx-g" x="630" y="60" width="110" height="84" rx="10"/>
+  <text class="ttl on-g" x="685" y="86" text-anchor="middle">orders</text>
+  <text class="sm" x="685" y="108" text-anchor="middle">total_amount</text>
+  <text class="sm" x="685" y="126" text-anchor="middle">重新计算</text>
+
+  <text class="sm" x="380" y="186" text-anchor="middle">应用代码什么都不用做 —— 不管谁、用什么方式改了明细，总额都保持正确</text>
+</svg>
+<figcaption>图 2-11　触发器在后台默默维护派生数据</figcaption>
+</figure>
+
+<p>Bob 改主意想买两袋，过一会儿又想到亲戚下周要来，改成四袋：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM sales.order_add_item(customer_id_param => 2,
+    product_id_param => 1, quantity_param => 2);
+-- 订单总额自动变成 33.08（16.54 × 2）
+
+SELECT * FROM sales.order_add_item(customer_id_param => 2,
+    product_id_param => 1, quantity_param => 4);
+-- 订单总额自动变成 66.16（16.54 × 4）
+</pre></div>
+
+<div class="code out"><pre>
+                  id                  | status  | total_amount
+--------------------------------------+---------+--------------
+ 34221a65-df20-4396-b9f4-3e3cf328f9d2 | pending |        66.16
+(1 row)
+</pre></div>
+
+<p>Bob 结账：<code>SELECT * FROM sales.order_checkout(2);</code>，总额 66.16。</p>
+
+<div class="box tip">
+  <div class="t">&#128161; LISTEN / NOTIFY</div>
+  <p>
+    如果你希望数据变化时 Postgres 主动通知应用，可以看看 <code>LISTEN</code>/<code>NOTIFY</code>：
+    应用用 <code>LISTEN</code> 订阅某个频道，事件发生时数据库用 <code>NOTIFY</code> 异步通知所有订阅者。第 11 章用 Postgres 做消息队列时会实际用到。
+  </p>
+</div>
+
+<h2 id="views">视图</h2>
+
+<p>
+  <strong>视图（view）</strong>本质上是一个<strong>有名字的查询</strong>，返回表格形式的数据。
+  如果一个复杂查询被多个应用反复使用，与其在每个应用里复制粘贴、各自维护，不如在数据库里建一个视图，大家按名字调用。
+</p>
+
+<p>Jake 的看板里有一份按商品汇总的销售报表：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.27 · 销售汇总报表">
+<pre>
+SELECT
+    c.name AS product_name,
+    c.category,
+    SUM(oi.quantity) AS total_quantity_sold,
+    SUM(oi.quantity * oi.price) AS total_revenue
+FROM products.catalog c
+LEFT JOIN sales.order_items oi ON c.id = oi.product_id
+GROUP BY c.id
+ORDER BY total_quantity_sold DESC, total_revenue DESC;
+</pre>
+</div>
+
+<p>把它变成视图：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.28 · 为销售汇总创建视图">
+<pre>
+CREATE VIEW sales.product_sales_summary AS
+SELECT
+    c.name AS product_name,
+    c.category,
+    SUM(oi.quantity) AS total_quantity_sold,
+    SUM(oi.quantity * oi.price) AS total_revenue
+FROM products.catalog c
+LEFT JOIN sales.order_items oi ON c.id = oi.product_id
+GROUP BY c.id
+ORDER BY total_quantity_sold DESC, total_revenue DESC;
+</pre>
+</div>
+
+<p>之后后端只需要一行，而且还能像普通表一样继续过滤：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM sales.product_sales_summary WHERE category='coffee';
+</pre></div>
+<div class="code out"><pre>
+ product_name  | category | total_quantity_sold | total_revenue
+---------------+----------+---------------------+---------------
+ Sunrise Blend | coffee   |                   5 |         82.70
+ Morning Glory | coffee   |                   2 |         27.98
+(2 rows)
+</pre></div>
+
+<h3>物化视图</h3>
+
+<p>
+  用 <code>CREATE VIEW</code> 创建的普通视图<strong>不保存结果</strong>，每次调用都重新执行底层查询。
+  如果查询很耗资源，或者数据不需要实时，可以用<strong>物化视图（materialized view）</strong>：
+  它执行一次查询并把结果存下来，所有人看到的都是这份结果，直到你显式刷新。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="普通视图与物化视图对比">
+  <text class="ttl on-b" x="190" y="24" text-anchor="middle">普通视图 VIEW</text>
+  <rect class="bx" x="40" y="40" width="110" height="44" rx="8"/><text class="sm" x="95" y="67" text-anchor="middle">SELECT * FROM v</text>
+  <path class="ln-b" d="M152 62 H224" marker-end="url(#ar-b)"/>
+  <rect class="bx-b" x="228" y="34" width="120" height="56" rx="8"/><text class="sm" x="288" y="56" text-anchor="middle">每次都执行</text><text class="sm" x="288" y="74" text-anchor="middle">底层查询</text>
+  <path class="ln-b" d="M288 92 V124" marker-end="url(#ar-b)"/>
+  <rect class="bx" x="228" y="128" width="120" height="40" rx="8"/><text class="sm" x="288" y="153" text-anchor="middle">基础表</text>
+  <text class="sm" x="190" y="196" text-anchor="middle">✓ 永远是最新数据</text>
+  <text class="sm" x="190" y="214" text-anchor="middle">✗ 查询复杂时每次都慢</text>
+
+  <path class="ln-d" d="M380 30 V220"/>
+
+  <text class="ttl on-g" x="570" y="24" text-anchor="middle">物化视图 MATERIALIZED VIEW</text>
+  <rect class="bx" x="410" y="40" width="110" height="44" rx="8"/><text class="sm" x="465" y="67" text-anchor="middle">SELECT * FROM mv</text>
+  <path class="ln-g" d="M522 62 H594" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="598" y="34" width="140" height="56" rx="8"/><text class="sm" x="668" y="56" text-anchor="middle">直接读取</text><text class="sm" x="668" y="74" text-anchor="middle">已存好的结果</text>
+  <rect class="bx" x="598" y="128" width="140" height="40" rx="8"/><text class="sm" x="668" y="153" text-anchor="middle">基础表</text>
+  <path class="ln-d" d="M668 126 V94" marker-end="url(#ar)"/>
+  <text class="sm" x="660" y="114" text-anchor="end">REFRESH 时才重算</text>
+  <text class="sm" x="570" y="196" text-anchor="middle">✓ 读取很快，像查一张普通表</text>
+  <text class="sm" x="570" y="214" text-anchor="middle">✗ 刷新之前数据是旧的</text>
+</svg>
+<figcaption>图 2-12　普通视图是“保存的查询”，物化视图是“保存的结果”</figcaption>
+</figure>
+
+<div class="code" data-lang="sql" data-file="清单 2.29 · 月度销售物化视图">
+<pre>
+CREATE MATERIALIZED VIEW sales.monthly_sales_summary AS
+SELECT
+    date_trunc('month', o.order_date) AS sales_month,
+    SUM(oi.quantity * oi.price) AS total_revenue,
+    COUNT(DISTINCT(o.id)) AS total_orders
+FROM sales.orders o
+JOIN sales.order_items oi ON o.id = oi.order_id
+GROUP BY sales_month
+ORDER BY sales_month;
+</pre>
+</div>
+
+<p><code>date_trunc('month', …)</code> 把时间截断到当月 1 日零点，于是同一个月的订单被分到一组。查询它：</p>
+
+<div class="code out"><pre>
+     sales_month     | total_revenue | total_orders
+---------------------+---------------+--------------
+ 2024-09-01 00:00:00 |        140.66 |            3
+(1 row)
+</pre></div>
+
+<p>几分钟后 Charlie 又买了三袋 Sunrise Blend 和两袋 Morning Glory：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.30 · 购买两种口味的咖啡">
+<pre>
+SELECT sales.order_add_item(
+    customer_id_param => 3,
+    product_id_param => 1,
+    quantity_param => 3
+    );
+
+SELECT sales.order_add_item(
+    customer_id_param => 3,
+    product_id_param => 3,
+    quantity_param => 2
+    );
+
+SELECT * FROM sales.order_checkout(customer_id_param => 3);
+</pre>
+</div>
+
+<p>结账金额 77.60。但 Jake 再看月度报表，数字还是 140.66 —— 物化视图不会自己刷新。他点了“刷新”按钮，后端执行：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.31 · 刷新并查询物化视图">
+<pre>
+REFRESH MATERIALIZED VIEW sales.monthly_sales_summary;
+
+SELECT * FROM sales.monthly_sales_summary;
+</pre>
+</div>
+<div class="code out"><pre>
+      sales_month       | total_revenue | total_orders
+------------------------+---------------+--------------
+ 2024-09-01 00:00:00+00 |        218.26 |            4
+(1 row)
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 定时刷新</div>
+  <p>除了提供手动刷新按钮，还可以用 <code>pg_cron</code> 扩展定时刷新物化视图，或者用触发器在特定事件发生时刷新。</p>
+</div>
+
+<h2 id="roles">角色与访问控制</h2>
+
+<p>
+  写代码时我们常常沉浸在功能里，忽略了安全。我们熟练使用应用层的安全框架做认证和授权，但只做应用层安全是不够的：
+  用户登录后，应用会<strong>以某个数据库角色</strong>打开连接、替用户执行 SQL。
+  如果这个角色的权限远大于应用允许用户做的事，一旦某个用户账号被盗，攻击者就可能借此在数据库里为所欲为。
+</p>
+
+<p>
+  Postgres 用<strong>角色（role）</strong>管理数据库层面的权限。角色可以是一个用户，也可以是一组用户，取决于怎么配置。
+  所以当有人说“用用户 X 连 Postgres”，技术上指的是“用角色 X 连接”。用 <code>\du</code> 看看现有角色：
+</p>
+
+<div class="code out"><pre>
+                             List of roles
+ Role name |                         Attributes
+-----------+------------------------------------------------------------
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS
+</pre></div>
+
+<p>
+  目前只有 Postgres 初始化时创建的 <code>postgres</code> 超级用户，它什么都能做。
+  做实验和早期开发用它没问题，但应用成形后就应该为不同类型的用户建专门的角色。
+  我们来给 Jake 建一个：能管理商品、看销售数据，但<strong>不能改数据库结构</strong>（那是平台的职责），也<strong>不能碰别人的数据库</strong>。
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.32 · 为咖啡店创建管理员角色">
+<pre>
+CREATE ROLE coffee_chain_admin WITH LOGIN PASSWORD 'password';
+
+GRANT CONNECT ON DATABASE coffee_chain TO coffee_chain_admin;
+
+REVOKE CONNECT ON DATABASE coffee_chain FROM PUBLIC;
+</pre>
+</div>
+
+<ul>
+  <li><code>CREATE ROLE … WITH LOGIN</code>：带 <code>LOGIN</code> 属性的角色可以用来登录，通常就叫“数据库用户”。</li>
+  <li><code>GRANT CONNECT</code>：允许它连接 coffee_chain 数据库。</li>
+  <li><code>REVOKE CONNECT … FROM PUBLIC</code>：<code>PUBLIC</code> 是一个包含所有角色的默认角色。撤销它的连接权限 = 默认谁都不能连。
+      coffee_chain_admin 虽然也属于 PUBLIC，但上一句已经显式授权给它，所以不受影响。</li>
+</ul>
+
+<p>再允许它读写各个模式里的所有表，并能使用序列生成 ID：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.33 · 为角色设置权限">
+<pre>
+GRANT USAGE ON SCHEMA public TO coffee_chain_admin;
+GRANT USAGE ON SCHEMA products TO coffee_chain_admin;
+GRANT USAGE ON SCHEMA customers TO coffee_chain_admin;
+GRANT USAGE ON SCHEMA sales TO coffee_chain_admin;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES
+  IN SCHEMA public TO coffee_chain_admin;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES
+  IN SCHEMA products TO coffee_chain_admin;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES
+  IN SCHEMA customers TO coffee_chain_admin;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES
+  IN SCHEMA sales TO coffee_chain_admin;
+
+GRANT USAGE, SELECT ON ALL SEQUENCES
+  IN SCHEMA products TO coffee_chain_admin;
+GRANT USAGE, SELECT ON ALL SEQUENCES
+  IN SCHEMA customers TO coffee_chain_admin;
+GRANT USAGE, SELECT ON ALL SEQUENCES
+  IN SCHEMA sales TO coffee_chain_admin;
+</pre>
+</div>
+
+<p>最后，确保默认谁都连不上 Susannah 的库和默认的 postgres 库：</p>
+
+<div class="code" data-lang="sql" data-file="清单 2.34 · 撤销 brewery 和 postgres 数据库的公共连接权限">
+<pre>
+REVOKE CONNECT ON DATABASE brewery FROM PUBLIC;
+REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="权限层级：连接数据库、使用模式、操作表和序列">
+  <rect class="bx-p" x="20" y="110" width="170" height="70" rx="10"/>
+  <text class="ttl on-p" x="105" y="138" text-anchor="middle">coffee_chain_admin</text>
+  <text class="sm" x="105" y="160" text-anchor="middle">Jake 的角色</text>
+
+  <rect class="bx-a" x="250" y="20" width="490" height="190" rx="12"/>
+  <text class="ttl on-a" x="264" y="42">database coffee_chain　①GRANT CONNECT</text>
+  <rect class="bx-b" x="270" y="56" width="450" height="138" rx="10"/>
+  <text class="ttl on-b" x="284" y="78">schema products / customers / sales / public　②GRANT USAGE</text>
+  <rect class="bx" x="290" y="94" width="200" height="84" rx="8"/>
+  <text class="ttl" x="390" y="118" text-anchor="middle">所有表</text>
+  <text class="sm" x="390" y="140" text-anchor="middle">③ SELECT, INSERT,</text>
+  <text class="sm" x="390" y="158" text-anchor="middle">UPDATE, DELETE</text>
+  <rect class="bx" x="504" y="94" width="200" height="84" rx="8"/>
+  <text class="ttl" x="604" y="118" text-anchor="middle">所有序列</text>
+  <text class="sm" x="604" y="140" text-anchor="middle">④ USAGE, SELECT</text>
+  <text class="sm" x="604" y="158" text-anchor="middle">（才能生成新 ID）</text>
+
+  <path class="ln-g" d="M192 145 H246" marker-end="url(#ar-g)"/>
+
+  <rect class="bx-r" x="250" y="226" width="230" height="50" rx="10"/>
+  <text class="ttl on-r" x="365" y="248" text-anchor="middle">database brewery</text>
+  <text class="sm" x="365" y="266" text-anchor="middle">✗ 无 CONNECT 权限</text>
+  <rect class="bx-r" x="510" y="226" width="230" height="50" rx="10"/>
+  <text class="ttl on-r" x="625" y="248" text-anchor="middle">database postgres</text>
+  <text class="sm" x="625" y="266" text-anchor="middle">✗ 无 CONNECT 权限</text>
+  <path class="ln-r" d="M105 182 V250 H246" marker-end="url(#ar-r)"/>
+
+  <text class="sm" x="20" y="30">权限要一层层打通：</text>
+  <text class="sm" x="20" y="48">连得上库 → 进得了模式</text>
+  <text class="sm" x="20" y="66">→ 操作得了表和序列。</text>
+  <text class="sm" x="20" y="84">但不是所有者，所以不能</text>
+  <text class="sm" x="20" y="102">DROP 或 CREATE 表。</text>
+</svg>
+<figcaption>图 2-13　Jake 的角色：只能进自己的库，只能读写数据，不能改结构</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 命令有点多？</div>
+  <p>
+    只为 Jake 一个人配角色就写了这么多条，而且可能还没覆盖所有边界情况。别担心，深入了解后会发现很直观。
+    比如可以创建一个<strong>组角色</strong>，把所有商家通用的 GRANT/REVOKE 定义在它上面，再把每个商家的角色加入这个组，自动继承权限。
+  </p>
+</div>
+
+<h3>验证权限</h3>
+
+<p>用 Jake 的角色连 Susannah 的库，被拒绝：</p>
+
+<div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U coffee_chain_admin -d brewery
+</pre></div>
+<div class="code out"><pre>
+psql: error: connection to server on socket
+"/var/run/postgresql/.s.PGSQL.5432" failed:
+FATAL: permission denied for database "brewery"
+DETAIL: User does not have CONNECT privilege.
+</pre></div>
+
+<p>连默认的 postgres 库也一样被拒绝。连自己的 coffee_chain 库则成功（注意提示符从 <code>=#</code> 变成了 <code>=&gt;</code>，表示不是超级用户）：</p>
+
+<div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U coffee_chain_admin -d coffee_chain
+</pre></div>
+<div class="code out"><pre>
+psql (17.2 (Debian 17.2-1.pgdg120+1))
+Type "help" for help.
+
+coffee_chain=>
+</pre></div>
+
+<p>能查、能改：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT name, category, price FROM products.catalog;
+
+UPDATE products.catalog
+SET price = 10.50
+WHERE name = 'Sunrise Brew Co. Mug';
+</pre></div>
+
+<p>但万一 Jake 的账号被盗，攻击者也删不了表、建不了表：</p>
+
+<div class="code" data-lang="sql"><pre>
+DROP TABLE products.catalog;
+-- ERROR:  must be owner of table catalog
+
+CREATE TABLE test (id int);
+-- ERROR: permission denied for schema public
+</pre></div>
+
+<p>
+  因为 coffee_chain_admin 不是数据库及其对象的<strong>所有者</strong> —— 所有者是创建它们的 <code>postgres</code> 角色（<code>\l</code> 可以看到）。
+  <code>postgres</code> 权限太大，只应该给有管理员权限的人，或者需要初始化、修改数据库结构的应用组件使用。
+  Jake 的角色也可以给协助他打理店铺的经理使用；而面向顾客，还可以再建一个权限更小的角色。
+</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 具备你对关系型数据库期待的所有标准能力。</li>
+  <li><strong>数据库、模式、表</strong>是基础构件，可以把数据库结构和应用架构对应起来；多租户可以在表、模式、数据库三个层级实现。</li>
+  <li>SQL 非常灵活：既能操作单表，也能用 <code>JOIN</code> 联合多表。</li>
+  <li><strong>约束和外键</strong>在数据库层面守住数据正确性；<strong>事务</strong>（ACID）和 <strong>MVCC</strong> 让并发读写既安全又高效。</li>
+  <li><strong>函数和触发器</strong>让你直接在数据库里执行应用逻辑，减少网络往返。</li>
+  <li><strong>视图</strong>封装复杂查询；<strong>物化视图</strong>缓存结果，需要手动或定时刷新。</li>
+  <li><strong>角色</strong>让你细粒度地控制数据库访问，遵循“最小权限”原则。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 <code>customers.accounts.email</code> 加一个 <code>UNIQUE</code> 约束，然后尝试插入一个邮箱重复的顾客，观察报错。</li>
+    <li>在一个显式事务里先 <code>DELETE FROM products.reviews;</code>，查询确认评论没了，然后执行 <code>ROLLBACK;</code>，再查一次 —— 评论回来了吗？</li>
+    <li>调用 <code>sales.order_checkout(1)</code>（Alice 没有购物车），观察 <code>RAISE EXCEPTION</code> 的效果。</li>
+    <li>给 Jake 的店加一件库存只有 1 的商品，让两位顾客都把它加入购物车，依次结账，看第二个人会遇到什么。</li>
+    <li>为咖啡店的顾客创建一个只读角色 <code>coffee_chain_reader</code>：只能 <code>SELECT</code> products 模式里的表，然后用它登录验证。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

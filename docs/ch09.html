@@ -1,0 +1,1258 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 9 章 · 时间序列 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="9">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 9 章</span>
+<h1>时间序列</h1>
+<p class="lede">
+  <strong>时间序列</strong>是随时间采集的一串数据点，每个点代表系统或对象在某一时刻的状态。通过采集一段时间的数据，我们能看出系统如何演变，从而发现趋势、提前行动、预测未来。
+  查看服务器上周的 CPU 和内存用量、研究过去三个月的汇率波动、分析病人过去一年的生命体征，都是在和时间序列打交道。
+  这一章我们开发一个<strong>智能手表应用</strong>：记录用户心率，在 Postgres 里高效存储和分析，及时提醒用户重要的健康变化。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解时间序列数据的两个特点，以及为什么要分区</li>
+    <li>会用 Postgres 原生的范围分区</li>
+    <li>用 TimescaleDB 的<strong>超表（hypertable）</strong>自动管理分区（chunk），设置数据保留策略</li>
+    <li>用 <code>time_bucket</code>、<code>time_bucket_gapfill</code>、<code>LOCF</code>、<code>interpolate</code> 分析数据</li>
+    <li>用<strong>连续聚合</strong>预计算结果并自动刷新</li>
+    <li>比较 B-tree 和 BRIN 索引在时序数据上的大小与性能</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="basics">Postgres 如何处理时间序列数据</h2>
+
+<p>没接触过时序数据？只需要知道它有两个鲜明特点：</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#9201;</span><h4>每个点都带时间</h4><p>每条记录都包含测量或事件发生的时间。</p></div>
+  <div class="card"><span class="ic">&#10133;</span><h4>只追加，不修改</h4><p>测量结果一旦记录就不再更新（append-only）。</p></div>
+</div>
+
+<p>智能手表持续监测心率，每分钟把数据发给后端（断网时则在恢复后批量补发）。后端把每条记录存进这张表：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE heart_rate_measurements (
+   watch_id INT NOT NULL,              -- 设备 ID
+   recorded_at TIMESTAMPTZ NOT NULL,   -- 测量时间
+   heart_rate INT NOT NULL,            -- 心率（次/分钟，BPM）
+   activity TEXT NOT NULL CHECK (      -- 当时在做什么
+       activity IN ('walking', 'sleeping', 'resting', 'workout'))
+);
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么用 TIMESTAMPTZ</div>
+  <p>
+    <code>TIMESTAMPTZ</code>（带时区的时间戳）把时间点存成“自 2000 年 1 月 1 日 UTC 起的微秒数”。写入时 Postgres 自动转换成 UTC 存储；
+    读取时再根据数据库服务器、当前连接或用户的时区转换回来。处理跨时区的用户时非常省心（后面会看到东京用户的例子）。
+  </p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="一位用户一天的心率时间序列示意">
+  <path class="ln" d="M50 180 H730"/>
+  <path class="ln" d="M50 20 V180"/>
+  <text class="sm" x="44" y="40" text-anchor="end">140</text>
+  <text class="sm" x="44" y="100" text-anchor="end">90</text>
+  <text class="sm" x="44" y="160" text-anchor="end">50</text>
+  <path class="ln-d" d="M50 40 H730 M50 100 H730 M50 160 H730"/>
+  <text class="sm" x="50" y="198" text-anchor="middle">0:00</text>
+  <text class="sm" x="220" y="198" text-anchor="middle">6:00</text>
+  <text class="sm" x="390" y="198" text-anchor="middle">12:00</text>
+  <text class="sm" x="560" y="198" text-anchor="middle">18:00</text>
+  <text class="sm" x="730" y="198" text-anchor="middle">24:00</text>
+  <!-- sleeping -->
+  <rect class="area-b" x="50" y="22" width="170" height="156" style="fill-opacity:.35;stroke:none"/>
+  <text class="sm on-b b" x="135" y="34" text-anchor="middle">sleeping</text>
+  <path class="ln-b" d="M50 150 L70 152 L90 149 L110 153 L130 151 L150 154 L170 150 L190 152 L220 148"/>
+  <!-- resting / walking -->
+  <path class="ln-g" d="M220 148 L240 130 L260 120 L280 128 L300 122 L320 135 L340 118 L360 126 L380 130"/>
+  <text class="sm on-g b" x="300" y="34" text-anchor="middle">resting · walking</text>
+  <!-- workout -->
+  <rect class="area-a" x="380" y="22" width="60" height="156" style="fill-opacity:.35;stroke:none"/>
+  <text class="sm on-a b" x="410" y="34" text-anchor="middle">workout</text>
+  <path class="ln-a" d="M380 130 L390 60 L400 50 L410 55 L420 45 L430 52 L440 58"/>
+  <path class="ln-g" d="M440 58 L450 120 L480 126 L520 118 L560 128 L600 122 L640 130 L680 126 L700 140"/>
+  <path class="ln-b" d="M700 140 L715 150 L730 152"/>
+  <text class="sm" x="600" y="58">每分钟一个点：</text>
+  <text class="sm" x="600" y="74">1 人 1 天 = 1,440 条</text>
+  <text class="sm" x="600" y="90">1000 人 1 天 = 144 万条</text>
+</svg>
+<figcaption>图 9-1　时间序列：一条带时间戳、只增不改的数据流（数据为示意）</figcaption>
+</figure>
+
+<p>
+  这么简单的表结构正符合时序应用的最佳实践：每条测量只存必要的最少信息。因为时序数据只增不减，表会飞快地膨胀，结构越复杂膨胀越快，存储和处理成本越高。
+  每分钟一条，一个用户每天就是 1440 条；1000 个用户就是每天 <strong>144 万条</strong>。（有些系统按秒甚至毫秒采集，每天轻松达到数十亿条。）
+</p>
+
+<h3>表分区</h3>
+
+<p>
+  把所有测量放在一张巨大的表里并不现实：用户大多数时候只关心最新的数据（今天或最近几天），每周、每月的趋势只是偶尔看看。
+  所以<strong>近期数据和历史数据应该分开存放</strong>：针对近期数据的查询不受总量增长的影响，历史数据也随时能访问、压缩或淘汰。
+</p>
+
+<p>
+  Postgres 的<strong>表分区（partitioning）</strong>能把一张大的逻辑表拆成多张更小的物理表，叫<strong>分区</strong>。
+  其中<strong>范围分区</strong>按某列（或几列）的值划分成互不重叠的范围：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE heart_rate_measurements (
+  watch_id INT NOT NULL,
+  recorded_at TIMESTAMPTZ NOT NULL,
+  heart_rate INT NOT NULL,
+  activity TEXT NOT NULL CHECK (
+      activity IN ('walking', 'sleeping', 'resting', 'workout'))
+) PARTITION BY RANGE (recorded_at);     -- 按 recorded_at 的范围分区
+
+CREATE TABLE measurements_jan2025
+    PARTITION OF heart_rate_measurements
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+CREATE TABLE measurements_feb2025
+    PARTITION OF heart_rate_measurements
+    FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+</pre></div>
+
+<ul>
+  <li>分区就是普通的 Postgres 表，用特殊形式的 <code>CREATE TABLE</code> 创建：<code>PARTITION OF</code> 指定所属的父表，<code>FOR VALUES</code> 指定存储的值范围。</li>
+  <li>范围<strong>包含下界、不包含上界</strong>：<code>FROM ('2025-01-01') TO ('2025-02-01')</code> 存的是从 2025-01-01 00:00:00（含）到 2025-02-01 00:00:00（不含）。</li>
+</ul>
+
+<p>应用只管查父表，由 Postgres 决定访问哪些分区。查 1 月 1 日到 3 日：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN
+SELECT * FROM heart_rate_measurements
+WHERE recorded_at BETWEEN '2025-01-01' AND '2025-01-03';
+</pre></div>
+<div class="code out"><pre>
+ Seq Scan on measurements_jan2025 heart_rate_measurements
+   (cost=0.00..26.05 rows=5 width=48)
+   Filter: ((recorded_at >= '2025-01-01 00:00:00+00'::timestamp with time zone) AND
+            (recorded_at <= '2025-01-03 00:00:00+00'::timestamp with time zone))
+</pre></div>
+
+<p>只扫描了 1 月的分区。查 1 月 30 日到 2 月 2 日呢？</p>
+
+<div class="code out"><pre>
+ Append (cost=0.00..52.15 rows=10 width=48)
+   -> Seq Scan on measurements_jan2025 heart_rate_measurements_1 ...
+   -> Seq Scan on measurements_feb2025 heart_rate_measurements_2 ...
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="范围分区与分区裁剪">
+  <rect class="bx-a" x="250" y="14" width="260" height="50" rx="10"/>
+  <text class="ttl on-a" x="380" y="36" text-anchor="middle">heart_rate_measurements</text>
+  <text class="sm" x="380" y="54" text-anchor="middle">父表（逻辑表，本身不存数据）</text>
+
+  <rect class="bx" x="20" y="110" width="160" height="60" rx="8"/><text class="sm b" x="100" y="134" text-anchor="middle">… 2024-12</text><text class="sm" x="100" y="154" text-anchor="middle">历史分区</text>
+  <rect class="bx-b" x="200" y="110" width="160" height="60" rx="8"/><text class="sm b on-b" x="280" y="134" text-anchor="middle">measurements_jan2025</text><text class="sm" x="280" y="154" text-anchor="middle">[01-01, 02-01)</text>
+  <rect class="bx-g" x="380" y="110" width="160" height="60" rx="8"/><text class="sm b on-g" x="460" y="134" text-anchor="middle">measurements_feb2025</text><text class="sm" x="460" y="154" text-anchor="middle">[02-01, 03-01)</text>
+  <rect class="bx-d" x="560" y="110" width="180" height="60" rx="8"/><text class="sm b" x="650" y="134" text-anchor="middle">2025-03 …</text><text class="sm" x="650" y="154" text-anchor="middle">将来的分区要有人来建</text>
+  <path class="ln" d="M300 66 L100 106"/><path class="ln" d="M350 66 L280 106"/><path class="ln" d="M410 66 L460 106"/><path class="ln" d="M460 66 L650 106"/>
+
+  <rect class="cell-b" x="20" y="196" width="340" height="22"/><text class="sm" x="30" y="212">WHERE 01-01 ~ 01-03 → 只扫 jan2025</text>
+  <rect class="cell-g" x="20" y="218" width="520" height="22"/><text class="sm" x="30" y="234">WHERE 01-30 ~ 02-02 → 扫 jan2025 + feb2025（Append），其他分区都跳过</text>
+  <text class="sm on-a" x="560" y="212">分区裁剪</text>
+  <text class="sm on-a" x="560" y="228">partition pruning</text>
+</svg>
+<figcaption>图 9-2　范围分区：查询只访问时间范围对得上的分区</figcaption>
+</figure>
+
+<p>
+  表分区是 Postgres 支撑时序负载的关键能力：既解决了“所有数据挤在一张大表”的问题，又能让查询只访问匹配的分区，显著提升性能。
+  （深入了解见<a href="https://www.postgresql.org/docs/current/ddl-partitioning.html">官方文档</a>。）
+</p>
+
+<p>
+  分区对应用是透明的，但<strong>总得有人管理分区</strong>：提前创建未来的分区，决定何时淘汰、清空或压缩历史分区。
+  可以组合使用 <strong>pg_partman</strong>（用后台进程自动创建和维护分区）和 <strong>pg_cron</strong>（在数据库里按 cron 计划定时执行 pg_partman 的维护任务）。
+  但本书选一个更简单的方案：专为时序场景打造、同样能自动管理分区的 <strong>TimescaleDB</strong> 扩展。
+</p>
+
+<h2 id="start">启动带 TimescaleDB 的 Postgres</h2>
+
+<p>
+  TimescaleDB 为 Postgres 提供了时序数据库该有的能力：自动对时序表分区、为分析查询优化的列式存储引擎、数据保留策略、专门的时序查询函数等等。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 先停掉之前的容器</div>
+  <p>之前几章的容器不带 TimescaleDB。用 <code>docker ps --filter "name=postgres" --filter "publish=5432"</code> 找到占用 5432 端口的容器，再 <code>docker container stop &lt;container-name&gt;</code>。</p>
+</div>
+
+<div class="code" data-lang="bash" data-file="清单 9.1 · 在 Unix 上启动带 TimescaleDB 的 Postgres">
+<pre>
+docker volume create postgres-timescale-volume
+
+docker run --name postgres-timescale \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password \
+    -p 5432:5432 \
+    -v postgres-timescale-volume:/var/lib/postgresql/data \
+    -d timescale/timescaledb:2.19.2-pg17
+</pre>
+</div>
+
+<div class="code" data-lang="powershell" data-file="清单 9.2 · 在 Windows 上启动带 TimescaleDB 的 Postgres">
+<pre>
+docker volume create postgres-timescale-volume
+
+docker run --name postgres-timescale `
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password `
+    -p 5432:5432 `
+    -v postgres-timescale-volume:/var/lib/postgresql/data `
+    -d timescale/timescaledb:2.19.2-pg17
+</pre>
+</div>
+
+<div class="code" data-lang="bash"><pre>
+docker exec -it postgres-timescale psql -U postgres
+</pre></div>
+
+<div class="code" data-lang="sql" data-file="清单 9.3 · 查看可用的 TimescaleDB 版本">
+<pre>
+SELECT * FROM pg_available_extensions
+WHERE name = 'timescaledb';
+</pre>
+</div>
+<div class="code out"><pre>
+    name     | default_version | installed_version |          comment
+-------------+-----------------+-------------------+---------------------------
+ timescaledb | 2.19.2          | 2.19.2            | Enables scalable inserts
+             |                 |                   | and complex queries for
+             |                 |                   | time-series data
+</pre></div>
+
+<p>和 pgvector 不同，这个镜像里 TimescaleDB <strong>已经在 postgres 数据库里启用了</strong>（installed_version 有值），不用再 <code>CREATE EXTENSION</code>。<code>\conninfo</code> 可以确认当前连的是 postgres 数据库。</p>
+
+<h2 id="dataset">加载时序数据</h2>
+
+<p>假设手表应用已经被几千名用户用了一年多，数据存在另一个数据库里。我们想迁移到 Postgres，先做一个概念验证（POC），导入一部分生产数据：</p>
+
+<div class="code" data-lang="bash"><pre>
+cd just-use-postgres-book/
+docker cp data/smartwatch/. postgres-timescale:/home/.
+
+docker exec -it postgres-timescale psql -U postgres -c "\i /home/schema.sql"
+docker exec -it postgres-timescale psql -U postgres -c "\i /home/data.sql"
+</pre></div>
+
+<p><code>\dt watch.*</code> 能看到 heart_rate_measurements 表。三位用户从 2024 年底到整个 2025 年，共 140 万条测量：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*) FROM watch.heart_rate_measurements;   -- 1399415
+</pre></div>
+
+<div class="code" data-lang="sql" data-file="清单 9.4 · 每台设备的测量数量">
+<pre>
+SELECT watch_id, count(*) as total_measurements
+FROM watch.heart_rate_measurements
+GROUP BY watch_id ORDER BY watch_id;
+</pre>
+</div>
+<div class="code out"><pre>
+ watch_id | total_measurements
+----------+--------------------
+        1 |             466497
+        2 |             466409
+        3 |             466509
+(3 rows)
+</pre></div>
+
+<p>看看 2025 年 1 月 1 日早上 6:50 到 6:55 的一段序列：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.5 · 某个时间段的时间序列">
+<pre>
+SELECT watch_id, recorded_at, heart_rate, activity
+FROM watch.heart_rate_measurements
+WHERE watch_id = 1 AND
+  recorded_at BETWEEN '2025-01-01 06:50:00' AND '2025-01-01 06:55:00'
+ORDER BY recorded_at;
+</pre>
+</div>
+<div class="code out"><pre>
+ watch_id |      recorded_at       | heart_rate | activity
+----------+------------------------+------------+----------
+        1 | 2025-01-01 06:50:00+00 |         66 | resting
+        1 | 2025-01-01 06:51:00+00 |         69 | resting
+        1 | 2025-01-01 06:52:00+00 |         65 | resting
+        1 | 2025-01-01 06:53:00+00 |         68 | resting
+        1 | 2025-01-01 06:54:00+00 |         77 | walking
+        1 | 2025-01-01 06:55:00+00 |         65 | resting
+(6 rows)
+</pre></div>
+
+<h2 id="hypertable">TimescaleDB 超表</h2>
+
+<p>导入数据的脚本 <code>schema.sql</code> 里有这样一条语句：</p>
+
+<div class="code" data-lang="sql" data-file="data/smartwatch/schema.sql（节选）"><pre>
+SELECT create_hypertable(
+   relation => 'watch.heart_rate_measurements',
+   dimension => by_range('recorded_at', interval '1 month'),
+   create_default_indexes => false
+);
+</pre></div>
+
+<p>它把表变成了 TimescaleDB 的<strong>超表（hypertable）</strong>：一张会<strong>自动创建和管理分区</strong>的普通 Postgres 表。</p>
+
+<ol>
+  <li><code>relation</code>：要变成超表的表。</li>
+  <li><code>dimension</code>：分区方式。这里按 recorded_at 做范围分区，每个范围一个月。</li>
+  <li><code>create_default_indexes</code>：是否创建默认索引。这里关掉，后面专门讲时序数据的索引。</li>
+</ol>
+
+<div class="box warn">
+  <div class="t">&#9888; 分区粒度要随数据量调整</div>
+  <p>按月分区只是为了简单 —— 我们只有三台设备。当数据来自成千上万甚至上百万台设备时，每个月的分区会非常大，危及数据库和应用的性能，需要按天、按小时，甚至按设备来分区。</p>
+</div>
+
+<p>用 <code>\d+ watch.heart_rate_measurements</code> 查看，Child tables 部分列出了所有分区：</p>
+
+<div class="code out"><pre>
+Child tables: _timescaledb_internal._hyper_1_10_chunk,
+              _timescaledb_internal._hyper_1_11_chunk,
+              _timescaledb_internal._hyper_1_12_chunk,
+              _timescaledb_internal._hyper_1_1_chunk,
+              _timescaledb_internal._hyper_1_2_chunk,
+              ...
+</pre></div>
+
+<p>TimescaleDB 把分区叫 <strong>chunk（块）</strong>，它们其实就是普通的 Postgres 表（本章里“分区”“块”“子表”是一回事）。看其中一个：</p>
+
+<div class="code" data-lang="sql"><pre>
+\d _timescaledb_internal._hyper_1_1_chunk
+</pre></div>
+<div class="code out"><pre>
+           Table "_timescaledb_internal._hyper_1_1_chunk"
+   Column    |           Type           | Nullable
+-------------+--------------------------+----------
+ watch_id    | integer                  | not null
+ recorded_at | timestamp with time zone | not null
+ heart_rate  | integer                  | not null
+ activity    | text                     | not null
+Check constraints:
+    "constraint_1" CHECK (recorded_at >= '2024-12-13 00:00:00+00'::timestamp with time zone
+                      AND recorded_at <  '2025-01-12 00:00:00+00'::timestamp with time zone)
+    "heart_rate_measurements_activity_check" CHECK (...)
+Inherits: watch.heart_rate_measurements
+</pre></div>
+
+<p><code>constraint_1</code> 定义了这个 chunk 存储的时间范围。查询 2025-01-01 的数据时，Postgres 只访问它：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT count(*) FROM watch.heart_rate_measurements
+WHERE recorded_at = '2025-01-01';
+</pre></div>
+<div class="code out"><pre>
+ Aggregate (actual time=4.431..4.432 rows=1 loops=1)
+   -> Seq Scan on _hyper_1_1_chunk (actual time=0.037..4.423 rows=3 loops=1)
+         Filter: (recorded_at = '2025-01-01 00:00:00+00'::timestamp with time zone)
+         Rows Removed by Filter: 46108
+ Planning Time: 0.617 ms
+ Execution Time: 4.495 ms
+</pre></div>
+
+<p><code>show_chunks</code> 函数列出所有 chunk —— 目前 12 个，每个存一个月的数据：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT show_chunks('watch.heart_rate_measurements');
+-- _timescaledb_internal._hyper_1_1_chunk
+-- ...
+-- _timescaledb_internal._hyper_1_12_chunk   (12 rows)
+</pre></div>
+
+<p>最后一个 chunk 覆盖 2025-11-08 到 2025-12-08，所以 2025-12-08 之后没有数据（<code>SELECT … WHERE recorded_at &gt;= '2025-12-08'</code> 返回 0 行）。现在模拟手表发来这之后的第一条测量：</p>
+
+<div class="code" data-lang="sql"><pre>
+INSERT INTO watch.heart_rate_measurements VALUES
+(1,'2025-12-08 00:25:00',57,'sleeping');
+
+SELECT show_chunks('watch.heart_rate_measurements');
+-- ... earlier chunks
+-- _timescaledb_internal._hyper_1_13_chunk     ← 自动建好了！(13 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="超表自动创建新的 chunk">
+  <rect class="bx-a" x="240" y="14" width="280" height="44" rx="10"/>
+  <text class="ttl on-a" x="380" y="41" text-anchor="middle">超表 watch.heart_rate_measurements</text>
+
+  <g>
+    <rect class="bx" x="20" y="96" width="56" height="60" rx="6"/><text class="sm" x="48" y="122" text-anchor="middle">1</text><text class="sm" x="48" y="140" text-anchor="middle">12/13</text>
+    <rect class="bx" x="80" y="96" width="56" height="60" rx="6"/><text class="sm" x="108" y="122" text-anchor="middle">2</text><text class="sm" x="108" y="140" text-anchor="middle">1/12</text>
+    <rect class="bx" x="140" y="96" width="56" height="60" rx="6"/><text class="sm" x="168" y="122" text-anchor="middle">3</text>
+    <rect class="bx" x="200" y="96" width="56" height="60" rx="6"/><text class="sm" x="228" y="122" text-anchor="middle">4</text>
+    <text class="ttl" x="290" y="130" text-anchor="middle">……</text>
+    <rect class="bx" x="320" y="96" width="56" height="60" rx="6"/><text class="sm" x="348" y="122" text-anchor="middle">11</text>
+    <rect class="bx-b" x="380" y="96" width="90" height="60" rx="6"/><text class="sm b on-b" x="425" y="118" text-anchor="middle">chunk 12</text><text class="sm" x="425" y="136" text-anchor="middle">11/08 ~</text><text class="sm" x="425" y="150" text-anchor="middle">12/08</text>
+    <rect class="bx-g" x="480" y="96" width="110" height="60" rx="6"/><text class="sm b on-g" x="535" y="118" text-anchor="middle">chunk 13 ✨</text><text class="sm" x="535" y="136" text-anchor="middle">12/08 ~</text><text class="sm" x="535" y="150" text-anchor="middle">2026/01/07</text>
+  </g>
+  <path class="ln" d="M300 60 L48 92"/><path class="ln" d="M380 60 L425 92"/><path class="ln-g" d="M460 60 L535 92"/>
+
+  <rect class="bx-p" x="610" y="96" width="130" height="60" rx="8"/>
+  <text class="sm b on-p" x="675" y="118" text-anchor="middle">INSERT</text>
+  <text class="sm" x="675" y="136" text-anchor="middle">2025-12-08 00:25</text>
+  <path class="ln-p" d="M608 126 H594" marker-end="url(#ar-p)"/>
+
+  <path class="ln-d" d="M20 180 H740" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="200" text-anchor="middle">时间 →　新数据落到不存在的时间范围时，TimescaleDB 自动建一个新 chunk</text>
+  <text class="sm" x="380" y="218" text-anchor="middle">每个 chunk 都是一张普通表，带一个 CHECK 约束标明它的时间范围</text>
+</svg>
+<figcaption>图 9-3　超表 = 自动管理的分区表</figcaption>
+</figure>
+
+<p>新 chunk 的范围是 2025-12-08 到 2026-01-07。查询刚插入的那条记录，Postgres 只扫描 _hyper_1_13_chunk：</p>
+
+<div class="code out"><pre>
+ Seq Scan on _hyper_1_13_chunk (actual time=0.013..0.014 rows=1 loops=1)
+   Filter: (recorded_at >= '2025-12-08 00:00:00+00'::timestamp with time zone)
+ Planning Time: 0.208 ms
+ Execution Time: 0.026 ms
+</pre></div>
+
+<p>不管数据量多大，数据库都自动把新数据分配到各个分区，查询时只访问满足条件的子集，性能可预测。</p>
+
+<div class="box key">
+  <div class="t">&#9733; 数据保留策略：自动删除旧数据</div>
+  <p>只想保留一段时间的数据？在超表上定义<strong>保留策略</strong>。下面创建 30 天的保留策略：TimescaleDB 会安排一个每天运行的任务，删除只包含 30 天前数据的 chunk。</p>
+  <div class="code" data-lang="sql"><pre>
+SELECT add_retention_policy(
+  'watch.heart_rate_measurements', INTERVAL '30 days');
+
+-- 也可以指定任务运行频率，比如每 12 小时一次
+SELECT add_retention_policy(
+  'watch.heart_rate_measurements',
+  drop_after => INTERVAL '30 days',
+  schedule_interval => INTERVAL '12 hours');
+</pre></div>
+  <p><strong>读本章时千万别执行！</strong>示例数据是 2024–2025 年的，如果你在 2025 年之后读这本书，所有数据都在 30 天之外，会被全部删掉。删整个 chunk 比逐行 DELETE 高效得多。</p>
+</div>
+
+<h2 id="analyze">分析时间序列数据</h2>
+
+<p>TimescaleDB 提供了几十个专门的函数（称为 hyperfunctions），能高效处理和分析海量时序数据。我们用其中几个，让手表用户更好地了解自己的健康状况。</p>
+
+<h3>time_bucket：按时间分桶</h3>
+
+<p><code>time_bucket</code> 把时间戳归入指定长度的区间（<strong>桶</strong>），方便做汇总：最近 30 分钟的平均心率、每次 1 小时锻炼的最高心率、睡眠中每 15 分钟的最低心率……</p>
+
+<div class="code" data-lang="text"><pre>
+time_bucket(bucket_width, ts, [origin, timezone, offset])
+</pre></div>
+
+<div class="tw"><table>
+<tr><th>参数</th><th>含义</th></tr>
+<tr><td><code>bucket_width</code></td><td>桶的长度，比如 <code>'5 minutes'</code>、<code>'3 days'</code>、<code>'1 week'</code></td></tr>
+<tr><td><code>ts</code></td><td>要分桶的时间戳</td></tr>
+<tr><td><code>origin</code>（可选）</td><td>桶的对齐起点。默认：按月/年/世纪分桶时对齐到 2000 年 1 月 1 日零点，其他情况对齐到 <strong>2000 年 1 月 3 日零点</strong>（一个星期一）</td></tr>
+<tr><td><code>timezone</code>（可选）</td><td>计算桶边界用的时区，默认 UTC</td></tr>
+<tr><td><code>offset</code>（可选）</td><td>把所有桶整体偏移一段时间</td></tr>
+</table></div>
+
+<p>用户 1 在 2025-04-23 锻炼了，结束后打开 App，想看锻炼期间每 10 分钟的平均和最高心率图表：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.6 · 计算锻炼期间的平均和最高心率">
+<pre>
+SELECT
+  time_bucket('10 minutes', recorded_at) AS period, activity,
+  AVG(heart_rate)::int AS avg_rate, MAX (heart_rate)::int AS max_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id = 1 AND activity = 'workout'
+  AND recorded_at >= '2025-04-23' AND recorded_at < '2025-04-24'
+GROUP BY period, activity ORDER BY period;
+</pre>
+</div>
+<div class="code out"><pre>
+         period         | activity | avg_rate | max_rate
+------------------------+----------+----------+----------
+ 2025-04-23 07:00:00+00 | workout  |      126 |      137
+ 2025-04-23 07:10:00+00 | workout  |      129 |      138
+ 2025-04-23 07:20:00+00 | workout  |      131 |      139
+ 2025-04-23 07:30:00+00 | workout  |      128 |      135
+ 2025-04-23 07:40:00+00 | workout  |      135 |      183
+ 2025-04-23 07:50:00+00 | workout  |      130 |      139
+ 2025-04-23 18:00:00+00 | workout  |      130 |      139
+ 2025-04-23 18:10:00+00 | workout  |      136 |      184
+ 2025-04-23 18:20:00+00 | workout  |      134 |      186
+ 2025-04-23 18:30:00+00 | workout  |      130 |      139
+ 2025-04-23 18:40:00+00 | workout  |      135 |      193
+ 2025-04-23 18:50:00+00 | workout  |      129 |      135
+(12 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="time_bucket 把时间戳归入固定长度的桶">
+  <path class="ln" d="M30 80 H730" marker-end="url(#ar)"/>
+  <g>
+    <rect class="area-b" x="40" y="40" width="160" height="80" rx="6" style="fill-opacity:.6"/>
+    <rect class="area-g" x="210" y="40" width="160" height="80" rx="6" style="fill-opacity:.6"/>
+    <rect class="area-a" x="380" y="40" width="160" height="80" rx="6" style="fill-opacity:.6"/>
+    <rect class="area-b" x="550" y="40" width="160" height="80" rx="6" style="fill-opacity:.6"/>
+  </g>
+  <g>
+    <circle class="dot-b" cx="56" cy="80" r="4"/><circle class="dot-b" cx="72" cy="80" r="4"/><circle class="dot-b" cx="88" cy="80" r="4"/><circle class="dot-b" cx="104" cy="80" r="4"/><circle class="dot-b" cx="120" cy="80" r="4"/><circle class="dot-b" cx="136" cy="80" r="4"/><circle class="dot-b" cx="152" cy="80" r="4"/><circle class="dot-b" cx="168" cy="80" r="4"/><circle class="dot-b" cx="184" cy="80" r="4"/>
+    <circle class="dot-g" cx="226" cy="80" r="4"/><circle class="dot-g" cx="242" cy="80" r="4"/><circle class="dot-g" cx="258" cy="80" r="4"/><circle class="dot-g" cx="274" cy="80" r="4"/><circle class="dot-g" cx="290" cy="80" r="4"/><circle class="dot-g" cx="306" cy="80" r="4"/><circle class="dot-g" cx="322" cy="80" r="4"/><circle class="dot-g" cx="338" cy="80" r="4"/><circle class="dot-g" cx="354" cy="80" r="4"/>
+    <circle class="dot-a" cx="396" cy="80" r="4"/><circle class="dot-a" cx="412" cy="80" r="4"/><circle class="dot-a" cx="428" cy="80" r="4"/><circle class="dot-a" cx="444" cy="80" r="4"/><circle class="dot-a" cx="460" cy="80" r="4"/><circle class="dot-a" cx="476" cy="80" r="4"/><circle class="dot-a" cx="492" cy="80" r="4"/><circle class="dot-a" cx="508" cy="80" r="4"/><circle class="dot-a" cx="524" cy="80" r="4"/>
+  </g>
+  <text class="mono" x="40" y="34">07:00</text><text class="mono" x="210" y="34">07:10</text><text class="mono" x="380" y="34">07:20</text><text class="mono" x="550" y="34">07:30</text>
+  <text class="sm" x="120" y="140" text-anchor="middle">avg 126 · max 137</text>
+  <text class="sm" x="290" y="140" text-anchor="middle">avg 129 · max 138</text>
+  <text class="sm" x="460" y="140" text-anchor="middle">avg 131 · max 139</text>
+  <text class="sm" x="630" y="140" text-anchor="middle">…</text>
+  <text class="sm" x="380" y="176" text-anchor="middle">每个点（一分钟一次测量）按 recorded_at 落进它所在的 10 分钟桶；桶的标签是桶的起始时间</text>
+  <text class="sm" x="380" y="196" text-anchor="middle">time_bucket('10 minutes', '07:13:00') = '07:10:00'　→ 然后照常 GROUP BY、算聚合</text>
+</svg>
+<figcaption>图 9-4　time_bucket：把连续的时间切成等长的桶</figcaption>
+</figure>
+
+<p>再来一个每周各类活动的汇总，统计 4 月 1 日到 15 日：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.7 · 按活动类型计算每周汇总">
+<pre>
+SELECT time_bucket('1 week', recorded_at) AS period, activity,
+  AVG(heart_rate)::int AS avg_rate,
+  MAX (heart_rate)::int AS max_rate, MIN (heart_rate)::int AS min_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id = 1 AND recorded_at >= '2025-04-01'
+  AND recorded_at < '2025-04-15'
+GROUP BY period, activity ORDER BY period, activity;
+</pre>
+</div>
+<div class="code out"><pre>
+         period         | activity | avg_rate | max_rate | min_rate
+------------------------+----------+----------+----------+----------
+ 2025-03-31 00:00:00+00 | resting  |       67 |       69 |       65
+ 2025-03-31 00:00:00+00 | sleeping |       57 |       59 |       55
+ 2025-03-31 00:00:00+00 | walking  |       79 |       84 |       75
+ 2025-03-31 00:00:00+00 | workout  |      131 |      196 |      120
+ 2025-04-07 00:00:00+00 | resting  |       67 |       69 |       65
+ ...
+ 2025-04-14 00:00:00+00 | workout  |      131 |      182 |      120
+(12 rows)
+</pre></div>
+
+<p>
+  奇怪，查的是 4 月 1 日起，第一周却从 <strong>3 月 31 日</strong>开始？因为每周的桶默认对齐到 2000 年 1 月 3 日（星期一）零点，从那一刻起每 7 天一个桶。
+  2025 年 3 月 31 日恰好是星期一，于是这个桶包含了 4 月 1 日到 6 日的数据。想按月初对齐，就把 origin 设成 2025-04-01：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.8 · 修改每周汇总的时间起点">
+<pre>
+SELECT time_bucket('1 week', recorded_at, '2025-04-01'::timestamptz)
+  AS period, activity,
+  AVG(heart_rate)::int AS avg_rate,
+  MAX (heart_rate)::int AS max_rate, MIN (heart_rate)::int AS min_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id = 1 AND recorded_at >= '2025-04-01' AND
+  recorded_at < '2025-04-15'
+GROUP BY period, activity ORDER BY period, activity;
+</pre>
+</div>
+<div class="code out"><pre>
+         period         | activity | avg_rate | max_rate | min_rate
+------------------------+----------+----------+----------+----------
+ 2025-04-01 00:00:00+00 | resting  |       67 |       69 |       65
+ ...
+ 2025-04-08 00:00:00+00 | workout  |      130 |      198 |      120
+(8 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 180" role="img" aria-label="周桶的默认对齐与自定义 origin 对比">
+  <text class="sm" x="20" y="24">日历：</text>
+  <g>
+    <text class="sm" x="100" y="24" text-anchor="middle">3/31一</text><text class="sm" x="150" y="24" text-anchor="middle">4/1二</text><text class="sm" x="200" y="24" text-anchor="middle">4/2</text><text class="sm" x="250" y="24" text-anchor="middle">4/3</text><text class="sm" x="300" y="24" text-anchor="middle">4/4</text><text class="sm" x="350" y="24" text-anchor="middle">4/5</text><text class="sm" x="400" y="24" text-anchor="middle">4/6</text><text class="sm" x="450" y="24" text-anchor="middle">4/7一</text><text class="sm" x="500" y="24" text-anchor="middle">4/8二</text><text class="sm" x="550" y="24" text-anchor="middle">…</text><text class="sm" x="650" y="24" text-anchor="middle">4/14一</text>
+  </g>
+  <text class="sm b" x="20" y="64">默认</text>
+  <rect class="bx-b" x="76" y="44" width="350" height="34" rx="6"/><text class="sm" x="251" y="66" text-anchor="middle">桶 2025-03-31（只含 4/1~4/6 的数据）</text>
+  <rect class="bx-b" x="426" y="44" width="200" height="34" rx="6"/><text class="sm" x="526" y="66" text-anchor="middle">桶 04-07</text>
+  <rect class="bx-b" x="626" y="44" width="120" height="34" rx="6"/><text class="sm" x="686" y="66" text-anchor="middle">桶 04-14</text>
+  <text class="sm b" x="20" y="114">origin</text>
+  <rect class="bx-a" x="126" y="94" width="350" height="34" rx="6"/><text class="sm" x="301" y="116" text-anchor="middle">桶 2025-04-01</text>
+  <rect class="bx-a" x="476" y="94" width="230" height="34" rx="6"/><text class="sm" x="591" y="116" text-anchor="middle">桶 2025-04-08</text>
+  <text class="sm" x="380" y="160" text-anchor="middle">默认按“2000-01-03 星期一”每 7 天切一刀；指定 origin 就按你给的起点切。数据只到 4/14，所以默认多出一个桶（12 行 vs 8 行）</text>
+</svg>
+<figcaption>图 9-5　time_bucket 的 origin 参数决定桶从哪里开始切</figcaption>
+</figure>
+
+<h4>按用户的时区计算</h4>
+
+<p>time_bucket 默认用 UTC 计算桶边界，这也是我们服务器和连接的默认时区（<code>SHOW time zone;</code> 返回 UTC）。第二位用户住在日本，戴着 2 号手表。可以显式把 timezone 参数设为 Asia/Tokyo，让桶按他的本地时间对齐：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.9 · 为特定用户设置时区">
+<pre>
+BEGIN;
+
+SET LOCAL time zone 'Asia/Tokyo';
+
+SELECT time_bucket('1 week', recorded_at, 'Asia/Tokyo',
+  '2025-04-01'::timestamptz) AS period, activity,
+  AVG(heart_rate)::int AS avg_rate,
+  MAX (heart_rate)::int AS max_rate, MIN (heart_rate)::int AS min_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id = 2 AND recorded_at >= '2025-04-01' AND
+  recorded_at < '2025-04-15'
+GROUP BY period, activity ORDER BY period, activity;
+
+COMMIT;
+</pre>
+</div>
+<div class="code out"><pre>
+         period         | activity | avg_rate | max_rate | min_rate
+------------------------+----------+----------+----------+----------
+ 2025-04-01 00:00:00+09 | resting  |       77 |       79 |       75
+ 2025-04-01 00:00:00+09 | sleeping |       67 |       69 |       65
+ 2025-04-01 00:00:00+09 | walking  |       90 |       94 |       85
+ 2025-04-01 00:00:00+09 | workout  |      142 |      199 |      130
+ 2025-04-08 00:00:00+09 | resting  |       77 |       79 |       75
+ ...
+(8 rows)
+</pre></div>
+
+<ul>
+  <li><code>SET LOCAL</code> 在显式事务里把时区从 UTC 改成 Asia/Tokyo，只在这个事务内有效，<code>COMMIT</code> 后自动恢复。</li>
+  <li>事务内的所有操作都用东京时区：<code>WHERE</code> 里比较的日期范围、time_bucket 计算的桶边界，以及输出的 period —— 因为 recorded_at 和 period 都是 timestamptz，Postgres 会按当前连接（这里是当前事务）的时区解释和显示它们。</li>
+  <li>period 末尾的 <code>+09</code> 表示 UTC+9，正是东京时间。</li>
+</ul>
+
+<div class="box note">
+  <div class="t">&#9432; 另一种做法</div>
+  <p>这是完全依靠 Postgres 内置能力支持多时区用户的做法。另一种常见做法是在应用层把用户的本地时间转换成 UTC 再发给 Postgres，数据库里全程用 UTC 计算。</p>
+</div>
+
+<h3>time_bucket_gapfill：填补空缺</h3>
+
+<p>手表虽然定时测量，但不一定每次都能把数据送到后端：用户可能摘了手表，设备可能断网。于是某些时间段会缺数据。time_bucket 遇到空缺会直接跳过那个桶：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.10 · 观察桶中的空缺">
+<pre>
+SELECT watch_id, time_bucket('1 minute', recorded_at) AS minute,
+  AVG(heart_rate)::int AS avg_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id=1 AND recorded_at BETWEEN '2025-03-02 07:25'
+  AND '2025-03-02 07:36'
+GROUP BY watch_id, minute ORDER BY minute;
+</pre>
+</div>
+
+<p>结果只有 9 行：07:30、07:31、07:35 没有数据。用户想看连续的心率图，这样的缺口体验不好。换成 <code>time_bucket_gapfill</code>，它会生成<strong>连续的</strong>桶，包括空缺的：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.11 · 为空缺补上时间桶">
+<pre>
+SELECT watch_id, time_bucket_gapfill('1 minute', recorded_at) AS minute,
+  AVG(heart_rate)::int AS avg_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id=1 AND recorded_at BETWEEN '2025-03-02 07:25'
+  AND '2025-03-02 07:36'
+GROUP BY watch_id, minute ORDER BY minute;
+</pre>
+</div>
+
+<p>现在有 12 行了，但 07:30、07:31、07:35 的 avg_rate 还是空的 —— gapfill 只补桶，不补值。TimescaleDB 提供了两个配套函数来填值：</p>
+
+<ul>
+  <li><strong>LOCF</strong>（last observation carried forward，沿用上一次观测值）：用最近一个已知值填补。适合值往往保持不变或变化很小的场景。</li>
+  <li><strong>interpolate</strong>（线性插值）：在前后两个已知值之间做线性插值。适合值随时间平滑变化的场景。</li>
+</ul>
+
+<div class="code" data-lang="sql" data-file="清单 9.12 · 用 LOCF 填补空缺">
+<pre>
+SELECT watch_id, time_bucket_gapfill('1 minute', recorded_at) AS minute,
+  LOCF(AVG(heart_rate)::int) AS avg_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id=1 AND recorded_at BETWEEN '2025-03-02 07:25'
+  AND '2025-03-02 07:36'
+GROUP BY watch_id, minute ORDER BY minute;
+</pre>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 9.13 · 用 interpolate 填补空缺">
+<pre>
+SELECT watch_id, time_bucket_gapfill('1 minute', recorded_at) AS minute,
+  interpolate(AVG(heart_rate)::int) AS avg_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id=1 AND recorded_at BETWEEN '2025-03-02 07:25'
+  AND '2025-03-02 07:36'
+GROUP BY watch_id, minute ORDER BY minute;
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="三种结果对比：有空缺、LOCF 填补、线性插值填补">
+  <text class="sm b" x="20" y="22">分钟</text>
+  <g class="sm">
+    <text x="130" y="22" text-anchor="middle">:25</text><text x="180" y="22" text-anchor="middle">:26</text><text x="230" y="22" text-anchor="middle">:27</text><text x="280" y="22" text-anchor="middle">:28</text><text x="330" y="22" text-anchor="middle">:29</text><text x="380" y="22" text-anchor="middle" class="on-r">:30</text><text x="430" y="22" text-anchor="middle" class="on-r">:31</text><text x="480" y="22" text-anchor="middle">:32</text><text x="530" y="22" text-anchor="middle">:33</text><text x="580" y="22" text-anchor="middle">:34</text><text x="630" y="22" text-anchor="middle" class="on-r">:35</text><text x="680" y="22" text-anchor="middle">:36</text>
+  </g>
+
+  <text class="sm b" x="20" y="54">gapfill</text>
+  <g class="mono">
+    <text x="130" y="54" text-anchor="middle">127</text><text x="180" y="54" text-anchor="middle">132</text><text x="230" y="54" text-anchor="middle">132</text><text x="280" y="54" text-anchor="middle">121</text><text x="330" y="54" text-anchor="middle">121</text><text x="380" y="54" text-anchor="middle" class="on-r">∅</text><text x="430" y="54" text-anchor="middle" class="on-r">∅</text><text x="480" y="54" text-anchor="middle">122</text><text x="530" y="54" text-anchor="middle">136</text><text x="580" y="54" text-anchor="middle">132</text><text x="630" y="54" text-anchor="middle" class="on-r">∅</text><text x="680" y="54" text-anchor="middle">125</text>
+  </g>
+  <text class="sm b on-b" x="20" y="80">LOCF</text>
+  <g class="mono">
+    <text x="130" y="80" text-anchor="middle">127</text><text x="180" y="80" text-anchor="middle">132</text><text x="230" y="80" text-anchor="middle">132</text><text x="280" y="80" text-anchor="middle">121</text><text x="330" y="80" text-anchor="middle">121</text><text x="380" y="80" text-anchor="middle" class="on-b b">121</text><text x="430" y="80" text-anchor="middle" class="on-b b">121</text><text x="480" y="80" text-anchor="middle">122</text><text x="530" y="80" text-anchor="middle">136</text><text x="580" y="80" text-anchor="middle">132</text><text x="630" y="80" text-anchor="middle" class="on-b b">132</text><text x="680" y="80" text-anchor="middle">125</text>
+  </g>
+  <text class="sm b on-a" x="20" y="106">interpolate</text>
+  <g class="mono">
+    <text x="130" y="106" text-anchor="middle">127</text><text x="180" y="106" text-anchor="middle">132</text><text x="230" y="106" text-anchor="middle">132</text><text x="280" y="106" text-anchor="middle">121</text><text x="330" y="106" text-anchor="middle">121</text><text x="380" y="106" text-anchor="middle" class="on-a b">121</text><text x="430" y="106" text-anchor="middle" class="on-a b">122</text><text x="480" y="106" text-anchor="middle">122</text><text x="530" y="106" text-anchor="middle">136</text><text x="580" y="106" text-anchor="middle">132</text><text x="630" y="106" text-anchor="middle" class="on-a b">129</text><text x="680" y="106" text-anchor="middle">125</text>
+  </g>
+
+  <!-- chart: y scale 118..140 → 300..140 -->
+  <path class="ln" d="M100 300 H710"/>
+  <text class="sm" x="94" y="304" text-anchor="end">118</text>
+  <text class="sm" x="94" y="228" text-anchor="end">128</text>
+  <text class="sm" x="94" y="152" text-anchor="end">138</text>
+  <path class="ln-d" d="M100 224 H710 M100 148 H710"/>
+  <rect class="area-r" x="355" y="140" width="100" height="160" style="fill:var(--red-bg);stroke:none"/>
+  <rect class="area-r" x="605" y="140" width="50" height="160" style="fill:var(--red-bg);stroke:none"/>
+  <!-- interpolate line -->
+  <path class="ln-a" d="M130 231.2 L180 193.2 L230 193.2 L280 276.8 L330 276.8 L380 276.8 L430 269.2 L480 269.2 L530 162.8 L580 193.2 L630 216 L680 246.8"/>
+  <!-- LOCF step -->
+  <path class="ln-b" d="M330 276.8 L430 276.8 L455 276.8 M580 193.2 L655 193.2" style="stroke-dasharray:6 4"/>
+  <g>
+    <circle class="dot" cx="130" cy="231.2" r="4"/><circle class="dot" cx="180" cy="193.2" r="4"/><circle class="dot" cx="230" cy="193.2" r="4"/><circle class="dot" cx="280" cy="276.8" r="4"/><circle class="dot" cx="330" cy="276.8" r="4"/><circle class="dot" cx="480" cy="269.2" r="4"/><circle class="dot" cx="530" cy="162.8" r="4"/><circle class="dot" cx="580" cy="193.2" r="4"/><circle class="dot" cx="680" cy="246.8" r="4"/>
+    <circle class="dot-b" cx="380" cy="276.8" r="5"/><circle class="dot-b" cx="430" cy="276.8" r="5"/><circle class="dot-b" cx="630" cy="193.2" r="5"/>
+    <circle class="dot-a" cx="430" cy="269.2" r="5"/><circle class="dot-a" cx="630" cy="216" r="5"/>
+  </g>
+  <text class="sm on-b" x="110" y="166">● LOCF 填充值（如 :35 沿用 :34 的 132）</text>
+  <text class="sm on-a" x="110" y="184">● 插值填充值（如 :35 取 132 与 125 的中点 129）</text>
+  <text class="sm on-r" x="405" y="134" text-anchor="middle">缺失</text>
+</svg>
+<figcaption>图 9-6　gapfill 补桶，LOCF（蓝色虚线）沿用上一个值，interpolate（橙色）在前后值之间画直线</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#128161; 更多函数</div>
+  <p>TimescaleDB 还有几十个专门的时序函数，见<a href="https://docs.timescale.com/api/latest/hyperfunctions/">官方文档</a>。</p>
+</div>
+
+<h2 id="caggs">连续聚合</h2>
+
+<p>
+  除了各种分析函数，TimescaleDB 还提供<strong>连续聚合（continuous aggregates）</strong>：存储预先计算好的查询结果，并按预定策略在后台刷新。
+  适合在大量历史数据上跑分析查询，或者查询频率远高于数据更新频率的场景。
+</p>
+
+<p>
+  设想手表在后台持续监测心率，如果最近 5 分钟里心率一直低于 50 BPM 就发出警报 —— 这可能是<strong>心动过缓</strong>（bradycardia，心跳比正常慢）的症状，经常收到警报的用户应该去看医生。
+  这个监测可以在手表本地做，也可以交给本来就定时收到数据的后端。我们用连续聚合在后端实现。
+</p>
+
+<h3>创建和使用连续聚合</h3>
+
+<p>连续聚合是一种特殊的 Postgres <strong>物化视图</strong>（第 2 章讲过），它把预计算的结果存在一个<strong>超表</strong>里：可以像普通表一样查询，而且结果也是自动分区的。</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.14 · 创建连续聚合">
+<pre>
+CREATE MATERIALIZED VIEW watch.low_heart_rate_count_per_5min
+WITH (timescaledb.continuous) AS
+SELECT
+  watch_id,
+  time_bucket('5 minutes', recorded_at) AS bucket,
+  MIN(heart_rate) as min_rate,
+  COUNT(*) FILTER (WHERE heart_rate < 50) AS low_rate_count,
+  COUNT(*) AS total_measurements
+FROM watch.heart_rate_measurements
+GROUP BY watch_id, bucket;
+</pre>
+</div>
+
+<ul>
+  <li><code>WITH (timescaledb.continuous)</code> 把物化视图声明为连续聚合。</li>
+  <li>按 recorded_at 分成 5 分钟的桶，存在 bucket 列。</li>
+  <li>每个桶算出：最低心率 <code>min_rate</code>、低于 50 BPM 的次数 <code>low_rate_count</code>、测量总数 <code>total_measurements</code>。</li>
+  <li><code>COUNT(*) FILTER (WHERE …)</code> 只统计满足条件的行，是标准 SQL 的聚合过滤写法。</li>
+  <li>每台设备分别聚合（<code>GROUP BY watch_id, bucket</code>）。</li>
+</ul>
+
+<p>创建后它已经填好了数据：288577 行，存在 3 个 chunk 里（<code>show_chunks('watch.low_heart_rate_count_per_5min')</code> 可查）。</p>
+
+<p>假设现在是 2025 年 11 月 30 日深夜，用户戴着手表睡觉，后端收到数据并分析。手表收到一条推送：2:35 开始的 5 分钟内心率偏低。推送内容来自这条查询：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.15 · 查询连续聚合">
+<pre>
+SELECT bucket, low_rate_count,
+  (low_rate_count >= 5) AS bradycardia_detected
+FROM watch.low_heart_rate_count_per_5min
+WHERE bucket = '2025-11-30 02:35' AND watch_id = 3;
+</pre>
+</div>
+<div class="code out"><pre>
+         bucket         | low_rate_count | bradycardia_detected
+------------------------+----------------+----------------------
+ 2025-11-30 02:35:00+00 |              5 | t
+(1 row)
+</pre></div>
+
+<p>手表至少每分钟上报一次，所以 5 分钟里低心率出现 ≥ 5 次，很可能每一分钟心率都偏低。手表确认通知后设一个定时器，10 分钟后再查 2:35 到 2:45 这三个连续的 5 分钟窗口：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.16 · 获取 15 分钟窗口的数据">
+<pre>
+SELECT bucket, low_rate_count,
+  (low_rate_count >= 5) AS bradycardia_detected
+FROM watch.low_heart_rate_count_per_5min
+WHERE bucket BETWEEN '2025-11-30 02:35' AND
+  '2025-11-30 02:45' AND watch_id = 3
+ORDER BY bucket;
+</pre>
+</div>
+<div class="code out"><pre>
+         bucket         | low_rate_count | bradycardia_detected
+------------------------+----------------+----------------------
+ 2025-11-30 02:35:00+00 |              5 | t
+ 2025-11-30 02:40:00+00 |              5 | t
+ 2025-11-30 02:45:00+00 |              5 | t
+(3 rows)
+</pre></div>
+
+<p>低心率持续了整整 15 分钟。手表轻轻振动几秒并显示警报，确保用户醒来后注意到。</p>
+
+<h3>刷新连续聚合</h3>
+
+<p>接着是 12 月 1 日深夜，同一位用户的手表又上报了一批测量：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.17 · 插入新的心率测量">
+<pre>
+INSERT INTO watch.heart_rate_measurements
+(watch_id, recorded_at, heart_rate, activity) VALUES
+(3, '2025-12-01 00:45:00+00', 48, 'sleeping'),
+(3, '2025-12-01 00:46:00+00', 46, 'sleeping'),
+(3, '2025-12-01 00:47:00+00', 44, 'sleeping'),
+(3, '2025-12-01 00:47:30+00', 47, 'sleeping'),
+(3, '2025-12-01 00:48:00+00', 48, 'sleeping'),
+(3, '2025-12-01 00:48:30+00', 45, 'sleeping'),
+(3, '2025-12-01 00:49:00+00', 43, 'sleeping');
+</pre>
+</div>
+
+<p>数据进了表，但<strong>不会自动更新连续聚合</strong>。查 00:45 这个桶，结果是空的。TimescaleDB 可以定义<strong>刷新策略</strong>：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.18 · 为连续聚合定义刷新策略">
+<pre>
+SELECT add_continuous_aggregate_policy
+  ('watch.low_heart_rate_count_per_5min',
+  start_offset => INTERVAL '15 minutes',
+  end_offset => INTERVAL '1 minute',
+  schedule_interval => INTERVAL '1 minute');
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="连续聚合刷新策略的时间窗口">
+  <rect class="bx" x="20" y="20" width="200" height="60" rx="10"/>
+  <text class="ttl" x="120" y="44" text-anchor="middle">原始超表</text>
+  <text class="sm" x="120" y="64" text-anchor="middle">每分钟写入新测量</text>
+  <path class="ln-a" d="M222 50 H290" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="256" y="42" text-anchor="middle">后台刷新</text>
+  <rect class="bx-a" x="294" y="20" width="230" height="60" rx="10"/>
+  <text class="ttl on-a" x="409" y="44" text-anchor="middle">连续聚合</text>
+  <text class="sm" x="409" y="64" text-anchor="middle">每 5 分钟一行（也是超表）</text>
+  <path class="ln" d="M526 50 H590" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="594" y="20" width="146" height="60" rx="10"/>
+  <text class="ttl on-p" x="667" y="44" text-anchor="middle">应用查询</text>
+  <text class="sm" x="667" y="64" text-anchor="middle">很快，无需重算</text>
+
+  <path class="ln" d="M40 160 H720" marker-end="url(#ar)"/>
+  <text class="sm" x="720" y="182" text-anchor="end">时间</text>
+  <rect class="area-g" x="320" y="138" width="300" height="44" rx="4" style="fill-opacity:.7"/>
+  <text class="sm on-g b" x="470" y="164" text-anchor="middle">每次刷新的范围</text>
+  <path class="ln-d" d="M680 120 V196"/><text class="sm b" x="680" y="114" text-anchor="middle">现在</text>
+  <path class="ln-g" d="M320 200 H678" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="320" y="216">start_offset = 15 分钟前</text>
+  <path class="ln-p" d="M620 128 H678" marker-end="url(#ar-p)"/>
+  <text class="sm on-p" x="600" y="124" text-anchor="end">end_offset = 1 分钟（避开正在写入的数据）</text>
+  <text class="sm" x="40" y="132">schedule_interval = 每 1 分钟运行一次</text>
+</svg>
+<figcaption>图 9-7　连续聚合：后台按策略增量刷新最近一段时间的结果</figcaption>
+</figure>
+
+<ul>
+  <li><code>start_offset</code>：从当前时间往前多久开始刷新 —— 这里是 15 分钟前。</li>
+  <li><code>end_offset</code>：刷新到离当前时间多远为止 —— 这里停在 1 分钟前，避免和正在进行的写入冲突。</li>
+  <li><code>schedule_interval</code>：策略多久运行一次 —— 每分钟。</li>
+</ul>
+
+<p>但策略是相对<strong>当前时间</strong>工作的，而示例数据的时间戳是固定的（2025 年 12 月），所以策略多半刷新不到它们。这时可以手动刷新指定的时间范围：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.19 · 手动刷新连续聚合">
+<pre>
+CALL refresh_continuous_aggregate('watch.low_heart_rate_count_per_5min',
+    '2025-12-01 00:45:00+00', '2025-12-01 00:50:00+00');
+</pre>
+</div>
+<div class="code out"><pre>
+         bucket         | low_rate_count | bradycardia_detected
+------------------------+----------------+----------------------
+ 2025-12-01 00:45:00+00 |              7 | t
+(1 row)
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 连续聚合也能设保留策略</div>
+  <div class="code" data-lang="sql"><pre>
+SELECT add_retention_policy(
+   'watch.low_heart_rate_count_per_5min', INTERVAL '7 days');
+</pre></div>
+  <p>扩展会安排每天运行的任务，删除只包含 7 天前数据的聚合 chunk。原始数据和聚合可以有不同的保留期，比如原始数据留 30 天、5 分钟汇总留 1 年。</p>
+</div>
+
+<h2 id="index">为时序数据建索引</h2>
+
+<p>目前心率表上没有任何索引：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.20 · 查看表上已有的索引">
+<pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'watch' AND tablename = 'heart_rate_measurements';
+-- (0 rows)
+</pre>
+</div>
+
+<p>手表应用有一个功能：显示某类活动的每日统计。比如按小时算 3 月 15 日步行时的平均心率：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.21 · 计算步行时的平均心率">
+<pre>
+SELECT
+  time_bucket('1 hour', recorded_at) AS period,
+  AVG(heart_rate)::int AS avg_rate
+FROM watch.heart_rate_measurements
+WHERE activity = 'walking' AND watch_id = 1
+  AND recorded_at >= '2025-03-15 00:00'
+  AND recorded_at < '2025-03-16 00:00'
+GROUP BY period ORDER BY period;
+</pre>
+</div>
+
+<p>结果是 14 行（只要那个小时里走过路，哪怕一会儿，就有一行）。执行计划：</p>
+
+<div class="code out"><pre>
+ Finalize GroupAggregate (actual time=15.846..18.238 rows=14 loops=1)
+   -> Gather Merge (actual time=15.797..18.210 rows=14 loops=1)
+         Workers Planned: 1
+         Workers Launched: 1
+         -> Partial GroupAggregate (actual time=6.498..6.536 rows=7 loops=2)
+               -> Sort (actual time=6.489..6.499 rows=118 loops=2)
+                     -> Result (actual time=0.223..6.331 rows=118 loops=2)
+                           -> Parallel Seq Scan on _hyper_1_4_chunk
+                                (actual time=0.222..6.309 rows=118 loops=2)
+                                 Filter: (... AND (activity = 'walking'::text) AND (watch_id = 1))
+                                 Rows Removed by Filter: 62726
+ Planning Time: 0.667 ms
+ Execution Time: 18.335 ms
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 并行顺序扫描</div>
+  <p>
+    计划看起来复杂，是因为 Postgres 选择了<strong>并行顺序扫描</strong>：把表数据分成几段，交给多个协作进程。
+    接收查询的<strong>领导进程</strong>负责驱动执行、扫描 _hyper_1_4_chunk 并汇总最终结果；另外启动了 1 个<strong>并行工作进程</strong>（Workers Launched: 1）帮忙扫描同一个分区。
+    <code>loops=2</code> 就是说这个分区被两个进程（领导 + 工作进程）各扫了一部分。
+  </p>
+</div>
+
+<h3>B-tree 索引</h3>
+
+<p>
+  B-tree 完全支持 date、time、timestamp 等日期时间类型。recorded_at 上的单列索引是时序查询的通用方案。
+  但我们的应用通常同时按 watch_id 和 recorded_at 过滤，所以建一个复合索引：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.22 · 创建复合索引">
+<pre>
+CREATE INDEX heart_rate_btree_idx
+ON watch.heart_rate_measurements (recorded_at, watch_id);
+</pre>
+</div>
+
+<p>它能优化只按 recorded_at，或同时按 recorded_at 和 watch_id 过滤的查询（<code>pg_indexes</code> 可以确认是 <code>USING btree</code>）。表被分成了多个分区，Postgres 会为<strong>每个分区创建本地索引</strong>：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.23 · 查看分区上的索引">
+<pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = '_timescaledb_internal'
+  AND tablename LIKE '_hyper_1\_%_chunk' ESCAPE '\';
+</pre>
+</div>
+<div class="code out"><pre>
+               indexname               |              indexdef
+---------------------------------------+------------------------------------------
+ _hyper_1_1_chunk_heart_rate_btree_idx | CREATE INDEX _hyper_1_1_chunk_heart_rate_btree_idx
+                                       |   ON _timescaledb_internal._hyper_1_1_chunk
+                                       |   USING btree (recorded_at, watch_id)
+ _hyper_1_2_chunk_heart_rate_btree_idx | ...
+ _hyper_1_3_chunk_heart_rate_btree_idx | ...
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="在超表上建索引会在每个 chunk 上建本地索引；查询先裁剪分区再用本地索引">
+  <rect class="bx-a" x="250" y="14" width="260" height="40" rx="10"/>
+  <text class="mono on-a" x="380" y="39" text-anchor="middle">CREATE INDEX … ON 超表</text>
+  <g>
+    <rect class="bx" x="20" y="84" width="160" height="56" rx="8"/><text class="sm b" x="100" y="104" text-anchor="middle">chunk 1</text><text class="sm" x="100" y="124" text-anchor="middle">+ 本地索引</text>
+    <rect class="bx" x="200" y="84" width="160" height="56" rx="8"/><text class="sm b" x="280" y="104" text-anchor="middle">chunk 2 · 3</text><text class="sm" x="280" y="124" text-anchor="middle">+ 本地索引</text>
+    <rect class="bx-g" x="380" y="84" width="160" height="56" rx="8"/><text class="sm b on-g" x="460" y="104" text-anchor="middle">chunk 4（3 月）</text><text class="sm on-g" x="460" y="124" text-anchor="middle">+ 本地索引 ✓ 用这个</text>
+    <rect class="bx" x="560" y="84" width="180" height="56" rx="8"/><text class="sm b" x="650" y="104" text-anchor="middle">chunk 5 … 13</text><text class="sm" x="650" y="124" text-anchor="middle">+ 本地索引</text>
+  </g>
+  <path class="ln" d="M300 56 L100 80"/><path class="ln" d="M350 56 L280 80"/><path class="ln-g" d="M400 56 L460 80" marker-end="url(#ar-g)"/><path class="ln" d="M460 56 L650 80"/>
+  <text class="sm" x="380" y="170" text-anchor="middle">查 3 月 15 日：① 分区裁剪，只剩 chunk 4　② 在 chunk 4 的本地 B-tree 索引里定位</text>
+  <text class="sm" x="380" y="190" text-anchor="middle">每个本地索引只覆盖自己那一个月的数据，所以都不大；删除旧 chunk 时，它的索引也一起没了</text>
+</svg>
+<figcaption>图 9-8　超表上的索引 = 每个 chunk 一个本地索引</figcaption>
+</figure>
+
+<p>再看清单 9.21 的执行计划：</p>
+
+<div class="code out"><pre>
+ GroupAggregate (actual time=0.246..0.605 rows=14 loops=1)
+   -> Result (actual time=0.195..0.557 rows=236 loops=1)
+         -> Index Scan using _hyper_1_4_chunk_heart_rate_btree_idx on _hyper_1_4_chunk
+              (actual time=0.194..0.531 rows=236 loops=1)
+               Index Cond: ((recorded_at >= '2025-03-15 00:00:00+00') AND
+                            (recorded_at < '2025-03-16 00:00:00+00') AND (watch_id = 1))
+               Filter: (activity = 'walking'::text)
+               Rows Removed by Filter: 1157
+ Planning Time: 0.829 ms
+ Execution Time: 0.703 ms
+</pre></div>
+
+<p>
+  简单多了，<strong>0.7 ms vs 18 ms</strong>。数据库判断所需数据都在 _hyper_1_4_chunk 里，然后用这个分区的本地索引做 Index Scan。
+  因为是复合索引，不指定 watch_id、统计所有设备的查询也能用它（执行时间约 2.3 ms）。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 复合索引的列顺序</div>
+  <p>(recorded_at, watch_id) 能用于只有 recorded_at，或两者都有的条件；如果查询跳过第一列、只按 watch_id 过滤，Postgres 17 及更早的版本用不上这个索引（Postgres 18 起支持 skip scan）。复习见第 4 章。</p>
+</div>
+
+<h3>BRIN 索引</h3>
+
+<p>
+  <strong>BRIN</strong>（Block Range Index，块范围索引）是一种特别适合时序数据的索引，尤其在<strong>看重索引大小</strong>时可以替代 B-tree。
+  它为这样的大表设计：某些列的值和行在表中的<strong>物理位置</strong>高度相关。这是什么意思？以 recorded_at 为例：
+</p>
+
+<ul>
+  <li>每条新测量的 recorded_at 都是当前时间，比上一条更晚 —— 时钟只会向前走。</li>
+  <li>新行被追加到表里，Postgres 把它放进一个<strong>页（page）</strong>。页大小是 8 KB，远大于一条测量记录，所以每页能存几十条。</li>
+  <li>时序数据只追加、不更新，行按顺序填满一页又一页。同一页里的行，时间都很接近（即使来自不同设备，偏差也不大）；后面的页存的是更晚的时间。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="BRIN 索引结构：每个块范围记录最小值和最大值；查询只访问可能匹配的范围">
+  <text class="ttl" x="20" y="22">BRIN 索引（每 2 页为一个范围）</text>
+  <rect class="bx-g" x="20" y="34" width="250" height="56" rx="8"/>
+  <text class="sm b on-g" x="145" y="56" text-anchor="middle">范围 1（页 1–2）</text>
+  <text class="mono" x="145" y="78" text-anchor="middle">min 0:01 · max 3:21</text>
+  <rect class="bx" x="290" y="34" width="250" height="56" rx="8"/>
+  <text class="sm b" x="415" y="56" text-anchor="middle">范围 2（页 3–4）</text>
+  <text class="mono" x="415" y="78" text-anchor="middle">min 3:22 · max 6:43</text>
+  <text class="ttl" x="575" y="68" text-anchor="middle">…</text>
+  <rect class="bx" x="610" y="34" width="130" height="56" rx="8"/>
+  <text class="sm b" x="675" y="56" text-anchor="middle">范围 M–N</text>
+  <text class="mono" x="675" y="78" text-anchor="middle">min X · max Y</text>
+
+  <text class="ttl" x="740" y="128" text-anchor="end">表（按插入顺序存放的页）</text>
+  <rect class="bx-g" x="20" y="144" width="120" height="56" rx="6"/><text class="sm b" x="80" y="166" text-anchor="middle">页 1</text><text class="mono" x="80" y="186" text-anchor="middle">0:01…1:40</text>
+  <rect class="bx-g" x="150" y="144" width="120" height="56" rx="6"/><text class="sm b" x="210" y="166" text-anchor="middle">页 2</text><text class="mono" x="210" y="186" text-anchor="middle">1:41…3:21</text>
+  <rect class="bx" x="290" y="144" width="120" height="56" rx="6"/><text class="sm b" x="350" y="166" text-anchor="middle">页 3</text><text class="mono" x="350" y="186" text-anchor="middle">3:22…5:02</text>
+  <rect class="bx" x="420" y="144" width="120" height="56" rx="6"/><text class="sm b" x="480" y="166" text-anchor="middle">页 4</text><text class="mono" x="480" y="186" text-anchor="middle">5:03…6:43</text>
+  <text class="ttl" x="575" y="178" text-anchor="middle">…</text>
+  <rect class="bx" x="610" y="144" width="130" height="56" rx="6"/><text class="sm b" x="675" y="166" text-anchor="middle">页 N</text>
+  <path class="ln-g" d="M80 92 V140"/><path class="ln-g" d="M210 92 V140"/><path class="ln" d="M350 92 V140"/><path class="ln" d="M480 92 V140"/>
+
+  <rect class="bx-p" x="20" y="222" width="720" height="98" rx="10"/>
+  <text class="ttl on-p" x="36" y="246">查询 recorded_at BETWEEN 0:20 AND 0:50</text>
+  <text class="sm" x="36" y="270">① 扫描所有范围：只有范围 1 的 [0:01, 3:21] 可能包含 0:20~0:50，其余全部跳过</text>
+  <text class="sm" x="36" y="290">② 只读页 1、页 2，逐行复查条件（Recheck）。页 2 其实一行都不匹配，但 BRIN 不知道，照样要读</text>
+  <text class="sm" x="36" y="310">③ 代价：多读了一些页（lossy）；收益：索引只存 min/max，小得惊人</text>
+</svg>
+<figcaption>图 9-9　BRIN：只记录每一段页的最小值和最大值（对应原书图 9.1–9.4）</figcaption>
+</figure>
+
+<p>
+  建 BRIN 索引时，Postgres 扫描表，为每个<strong>页范围</strong>记录 recorded_at 的最小值和最大值。搜索时，BRIN 用这些范围信息决定访问哪些页、跳过哪些页。
+  因为它只存每个范围的 min/max，而不像 B-tree 那样索引每一个实际值，所以<strong>体积小得多</strong>：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.24 · 创建 BRIN 索引">
+<pre>
+CREATE INDEX heart_rate_brin_idx
+ON watch.heart_rate_measurements
+USING brin (recorded_at);
+</pre>
+</div>
+
+<p>和 B-tree 一样，它也会在每个分区上建本地索引。比较一下大小：</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.25 · 比较 B-tree 和 BRIN 索引的大小">
+<pre>
+SELECT
+  i.indexrelid::regclass AS index_name,
+  pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
+FROM timescaledb_information.chunks c
+JOIN pg_index i
+  ON i.indrelid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+WHERE c.hypertable_name = 'heart_rate_measurements'
+ORDER BY index_name;
+</pre>
+</div>
+<div class="code out"><pre>
+                          index_name                          | index_size
+--------------------------------------------------------------+------------
+ _timescaledb_internal._hyper_1_1_chunk_heart_rate_btree_idx  | 1432 kB
+ _timescaledb_internal._hyper_1_2_chunk_heart_rate_btree_idx  | 3896 kB
+ _timescaledb_internal._hyper_1_3_chunk_heart_rate_btree_idx  | 3896 kB
+ _timescaledb_internal._hyper_1_4_chunk_heart_rate_btree_idx  | 3896 kB
+ ...
+ _timescaledb_internal._hyper_1_1_chunk_heart_rate_brin_idx   | 24 kB
+ _timescaledb_internal._hyper_1_2_chunk_heart_rate_brin_idx   | 24 kB
+ _timescaledb_internal._hyper_1_3_chunk_heart_rate_brin_idx   | 24 kB
+ _timescaledb_internal._hyper_1_4_chunk_heart_rate_brin_idx   | 24 kB
+ ...
+(26 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="每个 chunk 上 B-tree 与 BRIN 索引大小对比">
+  <text class="ttl" x="20" y="22">每个 chunk 的索引大小（chunk 2~4）</text>
+  <text class="sm" x="120" y="62" text-anchor="end">B-tree</text>
+  <rect class="fill-b" x="130" y="48" width="580" height="22" rx="3"/>
+  <text class="mono" x="700" y="64" text-anchor="end" style="fill:#fff">3896 kB</text>
+  <text class="sm" x="120" y="102" text-anchor="end">BRIN</text>
+  <rect class="fill-a" x="130" y="88" width="4" height="22" rx="1"/>
+  <text class="mono on-a b" x="142" y="104">24 kB（约 1/160）</text>
+  <text class="sm" x="380" y="144" text-anchor="middle">B-tree 存每一行的 recorded_at、watch_id 和行指针；BRIN 只存每个页范围的 min/max</text>
+  <text class="sm" x="380" y="162" text-anchor="middle">数据越多，差距越大</text>
+</svg>
+<figcaption>图 9-10　BRIN 比 B-tree 小了两个数量级</figcaption>
+</figure>
+
+<p>
+  但 B-tree 存了每个实际值和指向具体行的指针，能<strong>直接</strong>访问需要的行，不必像 BRIN 那样扫描整页再过滤。所以只分析一小部分数据时，B-tree 往往更快。
+  计算 3 月 15 日所有用户睡眠时的平均心率：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 9.26 · 计算平均睡眠心率的执行计划">
+<pre>
+EXPLAIN (analyze, costs off)
+SELECT
+  time_bucket('1 hour', recorded_at) AS period,
+  AVG(heart_rate)::int AS avg_rate
+FROM watch.heart_rate_measurements
+WHERE activity = 'sleeping'
+  AND recorded_at >= '2025-03-15 00:00'
+  AND recorded_at < '2025-03-16 00:00'
+GROUP BY period ORDER BY period;
+</pre>
+</div>
+
+<p>数据量还不大（总共约 140 万行、每个分区约 12.5 万行），只查一天，Postgres 选择了 B-tree，耗时约 2.3 ms：</p>
+
+<div class="code out"><pre>
+ GroupAggregate (actual time=0.208..2.213 rows=10 loops=1)
+   -> Result (actual time=0.047..2.038 rows=1510 loops=1)
+         -> Index Scan using _hyper_1_4_chunk_heart_rate_btree_idx on _hyper_1_4_chunk
+              (actual time=0.046..1.883 rows=1510 loops=1)
+               Filter: (activity = 'sleeping'::text)
+               Rows Removed by Filter: 2670
+ Execution Time: 2.316 ms
+</pre></div>
+
+<p>删掉 B-tree（<code>DROP INDEX watch.heart_rate_btree_idx;</code>）再跑一次，Postgres 改用 BRIN：</p>
+
+<div class="code out"><pre>
+ Sort (actual time=8.406..8.409 rows=10 loops=1)
+   -> HashAggregate (actual time=8.368..8.389 rows=10 loops=1)
+         -> Result (actual time=0.482..8.077 rows=1510 loops=1)
+               -> Bitmap Heap Scan on _hyper_1_4_chunk (actual time=0.480..7.926 rows=1510 loops=1)
+                     Recheck Cond: ((recorded_at >= '2025-03-15 00:00:00+00') AND
+                                    (recorded_at < '2025-03-16 00:00:00+00'))
+                     Rows Removed by Index Recheck: 65452
+                     Filter: (activity = 'sleeping'::text)
+                     Rows Removed by Filter: 2670
+                     Heap Blocks: lossy=512
+                     -> Bitmap Index Scan on _hyper_1_4_chunk_heart_rate_brin_idx
+                          (actual time=0.031..0.031 rows=5120 loops=1)
+ Planning Time: 0.510 ms
+ Execution Time: 8.566 ms
+</pre></div>
+
+<ol>
+  <li><strong>Bitmap Index Scan</strong>：用 BRIN 找出 min/max 满足条件的页范围，生成要访问的页位图（全是 lossy 的，见第 4 章）。</li>
+  <li><strong>Bitmap Heap Scan</strong>：扫描这些页（<code>Heap Blocks: lossy=512</code>），其中 6.5 万多行不满足条件被剔除（Rows Removed by Index Recheck: 65452）。</li>
+  <li><strong>HashAggregate</strong>：对剩下的 1510 行做聚合、排序。</li>
+</ol>
+
+<p>约 8.5 ms，比 B-tree 的 2.3 ms 慢。但这<strong>并不是说 B-tree 总比 BRIN 快</strong>：数据量或查询条件变了，BRIN 也可能追平 B-tree。比较两者是为了说明 Postgres 提供了多种选择，你可以根据具体的时序负载做取舍。</p>
+
+<div class="tw"><table>
+<tr><th></th><th>B-tree</th><th>BRIN</th></tr>
+<tr><td>存什么</td><td>每个值 + 行指针</td><td>每个页范围的 min/max</td></tr>
+<tr><td>大小</td><td>大（本例约 3.9 MB/chunk）</td><td>极小（本例 24 kB/chunk）</td></tr>
+<tr><td>精确定位</td><td>直接到行</td><td>只能到页范围，要逐行复查</td></tr>
+<tr><td>前提</td><td>无</td><td>列值与物理顺序高度相关（时间戳追加写入）</td></tr>
+<tr><td>适合</td><td>查一小段数据、要求最快</td><td>超大表、在意索引大小与写入开销</td></tr>
+</table></div>
+
+<div class="box deep">
+  <div class="t">&#9670; 长时间范围的分析：列式存储</div>
+  <p>
+    如果应用开始分析好几个月甚至几年的数据，B-tree 和 BRIN 可能都不再被使用 —— 对相关分区做全表扫描反而更高效。
+    这时可以利用 TimescaleDB 的<strong>列式存储</strong>能力，把特定分区的数据以为分析优化的列式格式存储。
+    比如最近三个月的测量留在行存储里并建索引，三个月前的数据转到列存储、不建索引。
+    这超出了本书的范围，可以阅读 TimescaleDB 列存储 <a href="https://docs.timescale.com/use-timescale/latest/hypercore/">Hypercore 的文档</a>。
+  </p>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 能轻松处理持续写入、或不定期批量写入的时序负载。</li>
+  <li><strong>表分区</strong>把大表拆成多个分区，查询只访问满足条件的分区。</li>
+  <li><strong>TimescaleDB</strong> 把 Postgres 变成时序数据库：自动分区（超表 / chunk）、专门的分析函数、列式存储引擎等。</li>
+  <li><code>time_bucket</code> 把时间戳分桶，便于汇总；<code>time_bucket_gapfill</code> 生成连续的桶，配合 <code>LOCF</code> 或 <code>interpolate</code> 填补空缺。</li>
+  <li><strong>连续聚合</strong>存储预计算的结果，按策略在后台刷新。</li>
+  <li>超表和连续聚合都可以设置<strong>保留策略</strong>，自动删除过期数据。</li>
+  <li>B-tree 和 BRIN 索引都能优化时序查询，需要在<strong>索引大小</strong>和<strong>性能</strong>之间权衡。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用 <code>time_bucket('1 day', …)</code> 统计用户 1 在 2025 年 5 月每天的睡眠时长（提示：睡眠测量的条数 ≈ 分钟数）。</li>
+    <li>用 <code>time_bucket</code> 的 offset 参数，把每天的桶改成从早上 6 点开始，计算“从 6 点到次日 6 点”的平均心率。</li>
+    <li>创建一个按小时汇总、按活动类型分组的连续聚合，用 <code>refresh_continuous_aggregate</code> 刷新某一天，查询它。</li>
+    <li>在一个新建的测试超表上，用 <code>add_retention_policy</code> 加 7 天保留策略，插入一些 30 天前的数据，然后用 <code>SELECT * FROM timescaledb_information.jobs;</code> 查看后台任务。</li>
+    <li>把清单 9.26 的时间范围改成整个 3 月，分别只保留 B-tree 或只保留 BRIN，比较执行计划和耗时。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,1466 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 8 章 · 生成式 AI 与 pgvector — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="8">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 8 章</span>
+<h1>生成式 AI 与 pgvector</h1>
+<p class="lede">
+  生成式人工智能（gen AI）用专门的模型生成文本、图片、视频等内容。比如<strong>大语言模型（LLM）</strong>在海量文本上训练，能用英语、日语等自然语言回答问题、对话、完成任务。
+  这一章我们继续开发第 6 章的电影推荐服务：把电影简介变成<strong>向量嵌入</strong>存进 Postgres，用<strong>向量相似度搜索</strong>和<strong>检索增强生成（RAG）</strong>提供更聪明、更个性化的推荐。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 LLM 和嵌入模型分别能和 Postgres 怎样配合</li>
+    <li>搞懂“向量嵌入”到底是什么，为什么相似的内容在向量空间里挨得近</li>
+    <li>用 Docker 启动带 pgvector 的 Postgres，存储和查询 <code>vector</code> 类型</li>
+    <li>用余弦距离 <code>&lt;=&gt;</code> 做语义搜索</li>
+    <li>理解近似最近邻（ANN）与召回率，会用 IVFFlat 和 HNSW 索引并调参</li>
+    <li>用 Postgres + 嵌入模型 + LLM 搭一个 RAG 原型</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="genai">Postgres 如何与生成式 AI 配合</h2>
+
+<p>
+  电影推荐服务可以用好几种方式结合 gen AI 和 Postgres：最起码，可以把电影简介的向量嵌入存进数据库，让用户用自然语言描述来找电影；
+  更进一步，可以用 LLM 做一个 AI 智能体，根据用户偏好和 Postgres 里的电影目录给出推荐，甚至按用户的要求增删“想看”清单。
+  先看看 LLM 和嵌入模型分别怎样与 Postgres 集成。
+</p>
+
+<h3>Postgres 与 LLM</h3>
+
+<p>
+  LLM 在海量文本上训练，擅长回答各种通用问题。比如在 ChatGPT 网站上问：“制作《怪物史瑞克》的那家工作室，还做过哪两部电影？”
+  选用 GPT-4 模型时，回答大意是：“《怪物史瑞克》背后的梦工厂动画（DreamWorks Animation）作品很多，《马达加斯加》和《功夫熊猫》就是其中两部著名作品。”
+</p>
+
+<p>
+  LLM 提供商一般通过 API 提供模型，比如 OpenAI 的 GPT、Anthropic 的 Claude，用简单的 REST 调用就能访问；Meta 的 Llama、幻方的 DeepSeek 这类免费模型还可以部署在自己的基础设施上。
+  我们可以借此给推荐服务加一个聊电影的聊天机器人。但 LLM 不止能聊天 —— 它能理解提示词背后的意图，还能<strong>调用各种工具</strong>替我们干活：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="LLM 根据用户请求调用各种工具，Postgres 是其中之一">
+  <rect class="bx" x="320" y="12" width="120" height="40" rx="10"/>
+  <text class="ttl" x="380" y="37" text-anchor="middle">用户</text>
+  <path class="ln" d="M380 54 V100" marker-end="url(#ar)"/>
+  <text class="sm" x="390" y="82">任务和问题</text>
+
+  <circle class="bx-a" cx="380" cy="160" r="52"/>
+  <text class="ttl on-a" x="380" y="158" text-anchor="middle">LLM</text>
+  <text class="sm" x="380" y="176" text-anchor="middle">理解意图</text>
+
+  <rect class="bx-b" x="20" y="120" width="200" height="80" rx="10"/>
+  <text class="ttl on-b" x="120" y="146" text-anchor="middle">Postgres</text>
+  <text class="sm" x="120" y="168" text-anchor="middle">读取私有数据扩充知识</text>
+  <text class="sm" x="120" y="186" text-anchor="middle">替用户增删改数据</text>
+  <path class="ln-b" d="M326 160 H224" marker-end="url(#ar-b)"/>
+  <text class="sm" x="275" y="150" text-anchor="middle">数据访问</text>
+
+  <rect class="bx" x="560" y="70" width="180" height="56" rx="10"/>
+  <text class="ttl" x="650" y="94" text-anchor="middle">Web 工具</text>
+  <text class="sm" x="650" y="112" text-anchor="middle">查训练截止之后的新信息</text>
+  <path class="ln" d="M428 140 L556 104" marker-end="url(#ar)"/>
+
+  <rect class="bx" x="560" y="150" width="180" height="56" rx="10"/>
+  <text class="ttl" x="650" y="174" text-anchor="middle">Matplotlib</text>
+  <text class="sm" x="650" y="192" text-anchor="middle">写 Python 脚本画图</text>
+  <path class="ln" d="M432 170 L556 178" marker-end="url(#ar)"/>
+
+  <rect class="bx" x="100" y="236" width="200" height="56" rx="10"/>
+  <text class="ttl" x="200" y="260" text-anchor="middle">Jupyter 环境</text>
+  <text class="sm" x="200" y="278" text-anchor="middle">自己写代码、测试、调试</text>
+  <path class="ln" d="M340 196 L270 234" marker-end="url(#ar)"/>
+
+  <rect class="bx" x="460" y="236" width="200" height="56" rx="10"/>
+  <text class="ttl" x="560" y="260" text-anchor="middle">基础设施</text>
+  <text class="sm" x="560" y="278" text-anchor="middle">起实例、跑压测、运维</text>
+  <path class="ln" d="M420 196 L490 234" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 8-1　LLM 按用户的提示调用各种工具完成任务（对应原书图 8.1）</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Web 工具</strong>：每个模型都有<strong>知识截止日期</strong>（训练数据最后收集的时间），对之后发生的事一无所知；但它能通过 Web 工具上网获取最新信息。</li>
+  <li><strong>Matplotlib</strong>：要画图时，模型可以生成用 Matplotlib 绘图的 Python 脚本。</li>
+  <li><strong>基础设施</strong>：LLM 可以连接公有云或本地机房，启动应用实例、跑基准测试、做运维。</li>
+  <li><strong>Jupyter 环境</strong>：模型不仅能生成代码给我们，还能在类似 Jupyter 的环境里自己写、测、调试 Python 代码。</li>
+  <li><strong>Postgres</strong>：LLM 可以读取私有数据来辅助完成业务任务、扩充知识，也可以替我们操作数据。</li>
+</ul>
+
+<p>本章会在笔记本电脑上跑一个开源 LLM，用 RAG 把 Postgres 里的数据提供给它。</p>
+
+<h3>Postgres 与嵌入模型</h3>
+
+<p>
+  除了 LLM，gen AI 应用里另一类常用模型是<strong>嵌入模型（embedding model）</strong>：输入文本或其他数据，输出一个高维的数值向量，叫<strong>向量嵌入（vector embedding）</strong>。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 向量嵌入是什么</div>
+  <p>
+    向量嵌入是词、句子等数据的数值表示，它<strong>捕捉了含义和相互关系</strong>。本质上就是一个 n 维坐标，表示这段文本在 n 维空间里的位置。
+    比如电影《功夫熊猫》的嵌入如果是二维的，可能是 <code>[-1.5, -0.7]</code> —— 可以画在平面上。
+  </p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="电影嵌入在二维空间中的分布：梦工厂电影聚成一簇，皮克斯电影聚成另一簇">
+  <!-- axes -->
+  <path class="ln" d="M60 290 H720"/>
+  <path class="ln" d="M390 30 V300"/>
+  <text class="sm" x="60" y="310" text-anchor="middle">−2.0</text>
+  <text class="sm" x="225" y="310" text-anchor="middle">−1.0</text>
+  <text class="sm" x="390" y="310" text-anchor="middle">0</text>
+  <text class="sm" x="555" y="310" text-anchor="middle">1.0</text>
+  <text class="sm" x="720" y="310" text-anchor="middle">2.0</text>
+  <text class="sm" x="380" y="54" text-anchor="end">0.8</text>
+  <text class="sm" x="380" y="120" text-anchor="end">0.4</text>
+  <text class="sm" x="380" y="186" text-anchor="end">0.0</text>
+  <text class="sm" x="380" y="252" text-anchor="end">−0.4</text>
+  <path class="ln-d" d="M60 50 H720 M60 116 H720 M60 182 H720 M60 248 H720"/>
+
+  <!-- DreamWorks cluster -->
+  <ellipse class="area-a" cx="160" cy="215" rx="95" ry="58" style="fill-opacity:.6"/>
+  <circle class="dot-a" cx="200" cy="190" r="6"/><text class="sm" x="210" y="186">Madagascar</text>
+  <circle class="dot-a" cx="130" cy="232" r="6"/><text class="sm" x="96" y="222">Shrek</text>
+  <circle class="dot-a" cx="160" cy="250" r="7"/><text class="sm b" x="170" y="262">Kung Fu Panda [−1.5, −0.7]</text>
+  <text class="ttl on-a" x="90" y="150">梦工厂</text>
+
+  <!-- Pixar cluster -->
+  <ellipse class="area-b" cx="555" cy="95" rx="100" ry="52" style="fill-opacity:.6"/>
+  <circle class="dot-b" cx="590" cy="64" r="6"/><text class="sm" x="600" y="60">Monsters, Inc.</text>
+  <circle class="dot-b" cx="540" cy="92" r="6"/><text class="sm" x="480" y="84">Toy Story</text>
+  <circle class="dot-b" cx="580" cy="118" r="6"/><text class="sm" x="590" y="128">Finding Nemo</text>
+  <text class="ttl on-b" x="640" y="170" text-anchor="middle">皮克斯 / 迪士尼</text>
+
+  <text class="sm" x="560" y="230" text-anchor="middle">相似的内容 → 坐标相近</text>
+  <text class="sm" x="560" y="248" text-anchor="middle">不相关的内容 → 坐标相距很远</text>
+</svg>
+<figcaption>图 8-2　按动画工作室聚类的电影嵌入（投影到二维，对应原书图 8.2、8.3）</figcaption>
+</figure>
+
+<ul>
+  <li><strong>维度越多，越能捕捉上下文中的含义</strong>。实际的嵌入通常有几百到几千维。比如“panda”可以指以竹子为食、产自中国西南的黑白熊，也可以指那个精通功夫、爱吃包子的动画角色 —— 维度更多的模型能更好地分辨这些细微差别。</li>
+  <li>嵌入模型还被训练来<strong>识别关系</strong>。《功夫熊猫》《怪物史瑞克》《马达加斯加》都是梦工厂出品，它们的嵌入会形成一个簇；《玩具总动员》《海底总动员》《怪兽电力公司》出自皮克斯和迪士尼，形成另一个簇。</li>
+  <li>高维模型还能编码其他关系：上映年份、预算、演员、类型（动画还是恐怖片）……于是电影可以按各种标准在高维空间里聚类。</li>
+</ul>
+
+<p>这和 Postgres 有什么关系？我们可以为数据库里（以及其他文档、数据源里）的私有数据生成嵌入，存进 Postgres，再用<strong>向量相似度搜索</strong>找出和搜索词相关的数据。比如为电影简介生成嵌入后，推荐服务就能支持：</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#128269;</span><h4>语义搜索</h4><p>按用户的描述找电影，不要求关键词完全一致。</p></div>
+  <div class="card"><span class="ic">&#129513;</span><h4>聚类</h4><p>找出剧情、类型等方面相关的电影。</p></div>
+  <div class="card"><span class="ic">&#127916;</span><h4>推荐</h4><p>推荐和用户最近看过的相似的电影。</p></div>
+  <div class="card"><span class="ic">&#129302;</span><h4>RAG</h4><p>从私有数据里检索相关上下文交给 LLM，让它生成更相关的回答或执行操作。</p></div>
+</div>
+
+<h2 id="pgvector">启动带 pgvector 的 Postgres</h2>
+
+<p>
+  <strong>pgvector</strong> 扩展为 Postgres 提供了存储和查询向量嵌入的基础能力：它引入 <code>vector</code> 数据类型、向量相似度运算符，以及专门的向量索引。
+  简单说，<strong>pgvector 把 Postgres 变成了向量数据库</strong>。它可以从扩展仓库、包管理器、二进制包安装，也有打包好的 Docker 镜像 —— 我们用最后这种。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 先停掉之前的容器</div>
+  <p>前几章的 Postgres 容器（不带 pgvector）占用了 5432 端口。先检查并停掉它：</p>
+  <div class="code" data-lang="bash"><pre>
+docker ps --filter "name=postgres" --filter "publish=5432"
+docker container stop &lt;container-name&gt;    # 换成上面输出的 NAMES
+</pre></div>
+</div>
+
+<div class="code" data-lang="bash" data-file="清单 8.1 · 在 Unix 上启动带 pgvector 的 Postgres">
+<pre>
+docker volume create postgres-pgvector-volume
+
+docker run --name postgres-pgvector \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password \
+    -p 5432:5432 \
+    -v postgres-pgvector-volume:/var/lib/postgresql/data \
+    -d pgvector/pgvector:0.8.0-pg17
+</pre>
+</div>
+
+<div class="code" data-lang="powershell" data-file="清单 8.2 · 在 Windows 上启动带 pgvector 的 Postgres">
+<pre>
+docker volume create postgres-pgvector-volume
+
+docker run --name postgres-pgvector `
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password `
+    -p 5432:5432 `
+    -v postgres-pgvector-volume:/var/lib/postgresql/data `
+    -d pgvector/pgvector:0.8.0-pg17
+</pre>
+</div>
+
+<p>镜像 <code>pgvector/pgvector:0.8.0-pg17</code> = Postgres 17 + pgvector 0.8.0。连上去，确认扩展可用并启用它：</p>
+
+<div class="code" data-lang="bash"><pre>
+docker exec -it postgres-pgvector psql -U postgres
+</pre></div>
+
+<div class="code" data-lang="sql" data-file="清单 8.3 · 查看可用的 pgvector 版本">
+<pre>
+SELECT * FROM pg_available_extensions
+WHERE name = 'vector';
+</pre>
+</div>
+<div class="code out"><pre>
+  name  | default_version | installed_version |           comment
+--------+-----------------+-------------------+------------------------------
+ vector | 0.8.0           |                   | vector data type and ivfflat
+        |                 |                   | and hnsw access methods
+(1 row)
+</pre></div>
+
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION vector;   -- 注意扩展名是 vector，不是 pgvector
+</pre></div>
+
+<p>再查一次，installed_version 变成 0.8.0。</p>
+
+<h2 id="embeddings">生成嵌入</h2>
+
+<p>为私有文本数据生成嵌入，至少要考虑四件事：</p>
+
+<ol>
+  <li><strong>目标数据</strong>：要为哪些文本生成嵌入？可以来自文档、数据库记录等。应该挑和语义搜索、RAG 等场景相关的数据。</li>
+  <li><strong>嵌入模型</strong>：把文本转成向量的模型。有 OpenAI、Anthropic 等提供的专有模型服务，也有能部署在自己机器上的开源模型。另一个关键因素是<strong>维度</strong>：有的几百维，有的几千维。维度越多，相似度搜索通常越准，但也越耗内存、存储和算力。</li>
+  <li><strong>分块（chunking）</strong>：把大段文本切成小块再送进模型。块的大小通常用 <strong>token</strong>（词、子词或符号）衡量，模型一般会给出建议值；也可以按句子或段落切。</li>
+  <li><strong>向量数据库</strong>：能存储嵌入、支持相似度搜索，还要支持专门的向量索引。</li>
+</ol>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="生成和存储嵌入的流程：目标数据、分块、嵌入模型、Postgres">
+  <text class="ttl" x="90" y="22" text-anchor="middle">目标数据</text>
+  <rect class="bx" x="20" y="34" width="140" height="44" rx="8"/><text class="sm" x="90" y="61" text-anchor="middle">文档</text>
+  <rect class="bx" x="20" y="90" width="140" height="44" rx="8"/><text class="sm" x="90" y="117" text-anchor="middle">数据库</text>
+  <path class="ln" d="M162 56 L206 84" marker-end="url(#ar)"/>
+  <path class="ln" d="M162 112 L206 92" marker-end="url(#ar)"/>
+  <text class="sm" x="184" y="62">文本</text>
+
+  <rect class="bx-p" x="210" y="62" width="110" height="52" rx="10"/>
+  <text class="ttl on-p" x="265" y="92" text-anchor="middle">分块</text>
+  <path class="ln" d="M322 88 H356" marker-end="url(#ar)"/>
+  <text class="sm" x="339" y="80" text-anchor="middle">块</text>
+
+  <rect class="bx-g" x="360" y="56" width="150" height="64" rx="10"/>
+  <text class="ttl on-g" x="435" y="84" text-anchor="middle">嵌入模型</text>
+  <text class="sm" x="435" y="104" text-anchor="middle">文本 → 向量</text>
+  <path class="ln" d="M512 88 H546" marker-end="url(#ar)"/>
+  <text class="mono" x="560" y="80">[0.008, 0.043, …]</text>
+
+  <rect class="bx-a" x="580" y="96" width="160" height="64" rx="10"/>
+  <text class="ttl on-a" x="660" y="122" text-anchor="middle">Postgres</text>
+  <text class="sm" x="660" y="142" text-anchor="middle">（pgvector 向量数据库）</text>
+  <path class="ln" d="M600 86 L630 94" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="186" text-anchor="middle">应用逻辑：读目标文本 → 必要时分块 → 送进嵌入模型 → 把输出的嵌入存进 Postgres（对应原书图 8.4）</text>
+</svg>
+<figcaption>图 8-3　为目标文本生成并存储嵌入</figcaption>
+</figure>
+
+<h3>为电影生成嵌入</h3>
+
+<p>新版推荐服务的表结构和第 6 章类似，只是把 tsvector 列换成了 <code>vector</code> 列：</p>
+
+<div class="code" data-lang="sql" data-file="data/movie_pgvector/schema.sql（节选）"><pre>
+CREATE TABLE omdb.movies (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    movie_embedding VECTOR(1024),    -- 1024 维的向量
+    release_date DATE,
+    runtime INT,
+    budget NUMERIC,
+    revenue NUMERIC,
+    vote_average NUMERIC,
+    votes_count BIGINT
+);
+</pre></div>
+
+<p>
+  <code>vector</code> 类型由 pgvector 提供，括号里指定维数。我们用免费的开源嵌入模型 <strong>mxbai-embed-large</strong>，可以在本地运行，它生成 1024 维向量，所以列定义为 <code>vector(1024)</code>。
+  做法是：取每部电影的片名和简介，用空格拼起来送进模型，把得到的 1024 维嵌入存回 movie_embedding 列：
+</p>
+
+<div class="code" data-lang="python" data-file="清单 8.4 · 生成电影嵌入的伪代码">
+<pre>
+# 从数据库取出所有电影
+movies = database.execute("SELECT id, name, description FROM omdb.movies")
+
+# 逐部电影生成嵌入
+for each movie in movies:
+    id = movie.id
+    name = movie.name
+    description = movie.description
+
+    # 片名 + 简介拼在一起
+    combined_text = name + " " + description
+
+    # 用模型生成嵌入
+    embedding = embedding_model.generate_embedding(combined_text)
+
+    # 把嵌入写回数据库
+    database.execute(
+        "UPDATE omdb.movies SET movie_embedding = ? WHERE id = ?", embedding, id)
+</pre>
+</div>
+
+<p>
+  这里没有分块：拼接后的电影介绍本来就很短，已经包含了电影的关键信息；硬要切开反而会丢失上下文，影响相似度搜索的准确性。
+  这段伪代码可以用任何有 Postgres 驱动和 gen AI 库的语言实现：JavaScript 可以用 node-postgres + LangChain，Java 可以用 Postgres JDBC + Spring AI。
+</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 在数据库里直接生成嵌入</div>
+  <p>想直接在数据库里生成或更新嵌入，可以看看 <strong>pgai</strong> 扩展：它让你用纯 SQL 调用嵌入模型，在数据库里完成更多 gen AI 任务。</p>
+</div>
+
+<p>
+  本书不假设你会某种编程语言，所以下一节直接导入<strong>已经生成好嵌入</strong>的数据集。它是用仓库里的 Jupyter 笔记本 <code>ai_samples/embeddings_generator.ipynb</code> 生成的（本页末尾有它的核心代码），
+  仓库里也有在本地 Ollama 容器中部署 mxbai-embed-large 的说明，你可以自己从头生成，或者换一个模型试试。
+</p>
+
+<h3>导入最终数据集</h3>
+
+<div class="code" data-lang="bash"><pre>
+cd just-use-postgres-book/
+docker cp data/movie_pgvector/. postgres-pgvector:/home/.
+
+docker exec -it postgres-pgvector psql -U postgres -c "\i /home/schema.sql"
+docker exec -it postgres-pgvector psql -U postgres -c "\i /home/movies.sql"
+docker exec -it postgres-pgvector psql -U postgres -c "\i /home/phrases.sql"
+</pre></div>
+
+<div class="code" data-lang="sql"><pre>
+\dt omdb.*
+-- omdb | movies             | table
+-- omdb | phrases_dictionary | table
+
+SELECT count(*) FROM omdb.movies;                                   -- 4224
+SELECT count(*) FROM omdb.movies WHERE movie_embedding IS NOT NULL; -- 4224，每部都有嵌入
+</pre></div>
+
+<p>看看《侏罗纪公园》的嵌入长什么样（<code>\x on</code> 扩展显示）：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT name, description, movie_embedding
+FROM omdb.movies
+WHERE id = 329;
+</pre></div>
+<div class="code out"><pre>
+-[ RECORD 1 ]---+--------------------------------------------------------
+name            | Jurassic Park
+description     | After successfully pulling DNA from a petrified mosquito,
+                  a dinosaur park is created on an island. Yet before the dinosaur
+                  theme park opens to the public a group of scientists must tour the
+                  park and determine if it's ready for the public. ...
+movie_embedding | [0.008344619,0.0430743,0.04397416,-0.018851468,
+                  0.008879144,0.00067602337,-0.06890293,-0.002350036,
+                  0.039374635,0.02740375 ...（共 1024 个数）
+</pre></div>
+
+<p>数据集里还有一张 <code>omdb.phrases_dictionary</code> 表，存着几个用户可能用来搜索的短语，以及用同一个模型预先生成的嵌入：</p>
+
+<div class="code out"><pre>
+             Table "omdb.phrases_dictionary"
+      Column      |     Type     | Nullable
+------------------+--------------+----------
+ phrase           | text         | not null
+ phrase_embedding | vector(1024) |
+</pre></div>
+
+<p>以及一个辅助函数 <code>omdb.get_embedding(input_phrase)</code>：在字典表里查短语，返回它的嵌入；查不到就报错：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE OR REPLACE FUNCTION omdb.get_embedding(input_phrase TEXT)
+RETURNS VECTOR(1024) AS $$
+DECLARE
+    embedding VECTOR(1024);
+BEGIN
+    SELECT phrase_embedding INTO embedding
+    FROM omdb.phrases_dictionary
+    WHERE LOWER(phrase) = LOWER(input_phrase);
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'The seach phrase does not exist in the dictionary table.';
+    END IF;
+
+    RETURN embedding;
+END;
+$$ LANGUAGE plpgsql;
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么要预生成短语的嵌入</div>
+  <p>真实应用里，用户输入的问题要实时送进嵌入模型。为了让你不用部署模型也能体验，数据集预先为 4 个短语生成了嵌入：<br>
+  <code>May the force be with you</code> · <code>A movie about a Jedi who fights against the dark side of the force</code> ·
+  <code>A pirate captain who sails the seven seas in search of treasure</code> · <code>A clown fish who gets lost in the ocean and tries to find his way home</code></p>
+</div>
+
+<h2 id="search">向量相似度搜索</h2>
+
+<p>
+  <strong>向量相似度搜索</strong>，也叫<strong>最近邻搜索</strong>或<strong>语义搜索</strong>，根据向量表示找出数据集中相似或相关的条目。
+  用户用自然语言提问，应用为问题生成嵌入，和数据库里的嵌入比较，返回最相关的数据：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="向量相似度搜索的六个步骤">
+  <rect class="bx" x="20" y="90" width="110" height="60" rx="10"/>
+  <text class="ttl" x="75" y="125" text-anchor="middle">用户</text>
+
+  <rect class="bx-p" x="250" y="80" width="180" height="80" rx="12"/>
+  <text class="ttl on-p" x="340" y="114" text-anchor="middle">应用后端</text>
+  <text class="sm" x="340" y="134" text-anchor="middle">推荐服务</text>
+
+  <rect class="bx-g" x="570" y="20" width="170" height="70" rx="12"/>
+  <text class="ttl on-g" x="655" y="48" text-anchor="middle">嵌入模型</text>
+  <text class="sm" x="655" y="68" text-anchor="middle">mxbai-embed-large</text>
+
+  <rect class="bx-a" x="570" y="180" width="170" height="70" rx="12"/>
+  <text class="ttl on-a" x="655" y="208" text-anchor="middle">Postgres</text>
+  <text class="sm" x="655" y="228" text-anchor="middle">movie_embedding</text>
+
+  <path class="ln" d="M132 106 H246" marker-end="url(#ar)"/><text class="sm" x="190" y="98" text-anchor="middle">① 提问</text>
+  <path class="ln-g" d="M432 92 L566 52" marker-end="url(#ar-g)"/><text class="sm on-g" x="490" y="62">② 问题文本</text>
+  <path class="ln-g" d="M566 72 L436 108" marker-end="url(#ar-g)"/><text class="sm on-g" x="500" y="106">③ 问题的嵌入</text>
+  <path class="ln-a" d="M432 134 L566 196" marker-end="url(#ar-a)"/><text class="sm on-a" x="526" y="160">④ 相似度搜索</text>
+  <path class="ln-a" d="M566 220 L428 152" marker-end="url(#ar-a)"/><text class="sm on-a" x="460" y="214" text-anchor="middle">⑤ 最近的几部电影</text>
+  <path class="ln" d="M246 136 H134" marker-end="url(#ar)"/><text class="sm" x="190" y="154" text-anchor="middle">⑥ 推荐列表</text>
+</svg>
+<figcaption>图 8-4　用 Postgres 做向量相似度搜索（对应原书图 8.6）</figcaption>
+</figure>
+
+<ol>
+  <li>用户在推荐服务里输入问题或提示，发给后端。</li>
+  <li>后端用<strong>生成电影嵌入时用的同一个模型</strong>（mxbai-embed-large）把问题转换成嵌入。</li>
+  <li>模型返回嵌入。</li>
+  <li>后端在 Postgres 里做相似度搜索，把问题的嵌入和 movie_embedding 列比较。</li>
+  <li>数据库返回和问题最相关的电影 —— 也就是在高维空间里离问题嵌入最近的那些。</li>
+  <li>后端整理结果返回给用户。</li>
+</ol>
+
+<p>（我们用 <code>omdb.get_embedding</code> 查预生成的嵌入代替了第 2、3 步，但那些嵌入也是用 mxbai-embed-large 生成的。）</p>
+
+<h3>距离运算符与余弦距离</h3>
+
+<p>相似度搜索靠<strong>距离函数</strong>：在高维空间里离得最近的向量就是最相关的“最近邻”。pgvector 提供了几种距离运算符：</p>
+
+<div class="tw"><table>
+<tr><th>运算符</th><th>距离</th><th>索引运算符类</th><th>说明</th></tr>
+<tr><td><code>&lt;=&gt;</code></td><td>余弦距离</td><td><code>vector_cosine_ops</code></td><td>比较向量的<strong>夹角</strong>。文本嵌入最常用，尤其是 L2 归一化（长度恒为 1）的嵌入</td></tr>
+<tr><td><code>&lt;-&gt;</code></td><td>欧几里得距离（L2）</td><td><code>vector_l2_ops</code></td><td>两点之间的直线距离</td></tr>
+<tr><td><code>&lt;#&gt;</code></td><td>负内积</td><td><code>vector_ip_ops</code></td><td>返回的是内积的相反数，所以同样是越小越相似</td></tr>
+</table></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="余弦距离：夹角越小越相关">
+  <circle class="dot" cx="120" cy="200" r="5"/>
+  <path class="ln-p" d="M120 200 L330 50" marker-end="url(#ar-p)"/>
+  <text class="sm on-p b" x="336" y="44">“May the force be with you.”</text>
+  <path class="ln-a" d="M120 200 L380 100" marker-end="url(#ar-a)"/>
+  <text class="sm on-a b" x="386" y="100">Star Wars …</text>
+  <path class="ln-b" d="M120 200 L420 190" marker-end="url(#ar-b)"/>
+  <text class="sm on-b b" x="426" y="194">Jurassic Park …</text>
+  <path class="ln-a" d="M200 143 Q214 152 222 161"/>
+  <text class="ttl on-a" x="228" y="150">a</text>
+  <path class="ln-b" d="M168 166 Q182 184 184 198"/>
+  <text class="ttl on-b" x="160" y="186">b</text>
+
+  <rect class="bx" x="540" y="30" width="200" height="180" rx="10"/>
+  <text class="ttl" x="556" y="54">余弦距离 = 1 − cos(夹角)</text>
+  <text class="sm" x="556" y="80">• 夹角小 → 距离小 → 更相关</text>
+  <text class="sm" x="556" y="102">• 夹角大 → 距离大 → 不相关</text>
+  <text class="sm" x="556" y="128">a &lt; b：这句台词在《星战》</text>
+  <text class="sm" x="556" y="146">里频繁出现，在《侏罗纪</text>
+  <text class="sm" x="556" y="164">公园》里从没出现过</text>
+  <text class="sm" x="556" y="190">本例中距离落在 0~1 之间</text>
+</svg>
+<figcaption>图 8-5　余弦距离比较的是方向，而不是长度（对应原书图 8.7）</figcaption>
+</figure>
+
+<p>mxbai-embed-large 生成的是归一化的嵌入，所以我们用余弦距离。用户搜索“May the force be with you”（愿原力与你同在）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.5 · 用余弦距离做向量相似度搜索">
+<pre>
+SELECT id, name, description
+FROM omdb.movies
+ORDER BY movie_embedding <=> omdb.get_embedding('May the force be with you')
+LIMIT 3;
+</pre>
+</div>
+
+<ul>
+  <li>对每部电影计算 movie_embedding 和搜索短语嵌入之间的余弦距离（<code>&lt;=&gt;</code>）。</li>
+  <li>按距离<strong>升序</strong>排列，距离最小的在前。</li>
+  <li><code>LIMIT 3</code> 返回最相关的三部 —— 在 1024 维空间里离搜索短语最近的三个邻居。</li>
+</ul>
+
+<div class="code out"><pre>
+-[ RECORD 1 ]----------------------------------------------------------
+id          | 1892
+name        | Star Wars: Episode VI - Return of the Jedi
+description | Return of the Jedi is the third and final chapter in the
+              original wondrous Star Wars saga. Luke (Mark Hamill) must save
+              Han Solo (Harrison Ford) from the clutches of the monstrous
+              Jabba the Hut and bring down the newly reconstructed ... Death Star.
+-[ RECORD 2 ]----------------------------------------------------------
+id          | 204710
+name        | The Acolyte
+description | Star Wars series that takes viewers into a galaxy of shadowy
+              secrets and emerging dark-side powers in the final days of the
+              High Republic era.
+-[ RECORD 3 ]----------------------------------------------------------
+id          | 10840
+name        | On Your Mark
+description |
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 这就是“语义”搜索</div>
+  <p>
+    前两部确实是星球大战系列，但它们的片名和简介里<strong>根本没有</strong>“May the force be with you”这句话！
+    这句话很可能在嵌入模型的训练数据中频繁和星战一起出现，所以两者的嵌入关联很强。第 6 章的全文搜索是做不到这一点的。
+  </p>
+</div>
+
+<p>第三部看起来毫不相关，这说明了两点：</p>
+
+<ul>
+  <li>和 LLM 一样，嵌入模型也会<strong>幻觉</strong>（hallucination），产生不准确的结果。</li>
+  <li>生成嵌入时提供更多上下文，可以减少幻觉。这部电影的简介是空的，嵌入只由片名“On Your Mark”生成，模型很难把它和训练数据有意义地联系起来。</li>
+</ul>
+
+<p>在应用层做相似度搜索时，伪代码很简单 —— 把问题的嵌入作为查询参数传给 Postgres：</p>
+
+<div class="code" data-lang="python"><pre>
+# 为短语生成嵌入
+embedding = embedding_model.generate_embedding("May the force be with you")
+
+# 创建 SQL 查询
+query = query.create(
+   "SELECT id, name, description FROM omdb.movies
+    ORDER BY movie_embedding <=> ::phrase_embedding
+    LIMIT 3;")
+
+# 把嵌入作为参数传入
+query.set_param("phrase_embedding", embedding)
+
+# 执行向量相似度搜索
+movies = database.execute(query)
+</pre></div>
+
+<p>完整的 Python 实现见仓库里的 <code>ai_samples/similarity_search.ipynb</code>（本页末尾有摘录）。</p>
+
+<h3>换个说法，结果更准</h3>
+
+<p>把距离也显示出来：</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.6 · 在输出中加上余弦距离">
+<pre>
+WITH phrase AS (
+  SELECT omdb.get_embedding('May the force be with you') AS embedding
+)
+SELECT id, name, description, m.movie_embedding <=> p.embedding AS distance
+FROM omdb.movies m CROSS JOIN phrase p
+ORDER BY distance LIMIT 3;
+</pre>
+</div>
+
+<p>用 CTE 先取出短语的嵌入，再用 <code>CROSS JOIN</code> 让每部电影都和它配对算距离。结果的距离分别是 0.393、0.404、0.412。这里的余弦距离落在 0~1 之间，越接近 0 越相关。现在把搜索短语换得更具体：</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.7 · 改变搜索短语以提高准确度">
+<pre>
+WITH phrase AS (
+  SELECT omdb.get_embedding(
+    'A movie about a Jedi who fights against the dark side of the force')
+     AS embedding
+)
+SELECT id, name, description, m.movie_embedding <=> p.embedding AS distance
+FROM omdb.movies m CROSS JOIN phrase p
+ORDER BY distance LIMIT 3;
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="两个搜索短语的结果和距离对比">
+  <text class="ttl" x="190" y="22" text-anchor="middle">“May the force be with you”</text>
+  <rect class="cell-h" x="20" y="34" width="340" height="24"/><text class="sm b" x="30" y="51">电影</text><text class="sm b" x="290" y="51">距离</text>
+  <rect class="cell-g" x="20" y="58" width="340" height="28"/><text class="sm" x="30" y="77">Return of the Jedi</text><text class="mono" x="290" y="77">0.393</text>
+  <rect class="cell-g" x="20" y="86" width="340" height="28"/><text class="sm" x="30" y="105">The Acolyte</text><text class="mono" x="290" y="105">0.404</text>
+  <rect class="cell-r" x="20" y="114" width="340" height="28"/><text class="sm" x="30" y="133">On Your Mark ✗ 不相关</text><text class="mono" x="290" y="133">0.412</text>
+
+  <text class="ttl on-g" x="570" y="22" text-anchor="middle">“A movie about a Jedi who fights…”</text>
+  <rect class="cell-h" x="400" y="34" width="340" height="24"/><text class="sm b" x="410" y="51">电影</text><text class="sm b" x="670" y="51">距离</text>
+  <rect class="cell-g" x="400" y="58" width="340" height="28"/><text class="sm" x="410" y="77">Return of the Jedi</text><text class="mono on-g b" x="670" y="77">0.274</text>
+  <rect class="cell-g" x="400" y="86" width="340" height="28"/><text class="sm" x="410" y="105">The Acolyte</text><text class="mono on-g b" x="670" y="105">0.300</text>
+  <rect class="cell-g" x="400" y="114" width="340" height="28"/><text class="sm" x="410" y="133">The Empire Strikes Back ✓</text><text class="mono on-g b" x="670" y="133">0.312</text>
+
+  <path class="ln" d="M60 190 H700"/>
+  <circle class="dot-g" cx="236" cy="190" r="6"/><text class="sm on-g" x="236" y="212" text-anchor="middle">0.27</text>
+  <circle class="dot-r" cx="348" cy="190" r="6"/><text class="sm on-r" x="348" y="212" text-anchor="middle">0.39</text>
+  <text class="sm" x="60" y="212" text-anchor="middle">0 完全一致</text>
+  <text class="sm" x="700" y="212" text-anchor="middle">1</text>
+  <text class="sm" x="290" y="178" text-anchor="middle">← 更具体的描述，离最相关的电影更近</text>
+</svg>
+<figcaption>图 8-6　搜索短语越具体，结果越准、距离越小</figcaption>
+</figure>
+
+<p>这次三部全是星战，最近的距离约 0.27，明显比之前的 0.39 更近。想试试别的短语，可以运行仓库里的 similarity_search.ipynb 笔记本（里面也有用 Ollama 在本地启动嵌入模型的说明）。</p>
+
+<h2 id="index">为嵌入建索引</h2>
+
+<p>先看看当前相似度查询的执行计划（<code>\x off</code> 切回表格显示）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.8 · 相似度搜索查询的执行计划">
+<pre>
+EXPLAIN (analyze, costs off)
+SELECT id, name, description
+FROM omdb.movies
+ORDER BY movie_embedding <=>
+  omdb.get_embedding('May the force be with you')
+LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+ Limit (actual time=52.421..52.422 rows=3 loops=1)
+   -> Sort (actual time=52.420..52.420 rows=3 loops=1)
+         Sort Key: ((movie_embedding <=> omdb.get_embedding('May the force be with you'::text)))
+         Sort Method: top-N heapsort Memory: 27kB
+         -> Seq Scan on movies (actual time=0.803..51.398 rows=4224 loops=1)
+ Planning Time: 0.694 ms
+ Execution Time: 52.567 ms
+</pre></div>
+
+<p>全表扫描 4224 行 → 按距离排序 → 取前 3。计划看着简单，但可不轻松：</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 每个嵌入有 4 KB</div>
+  <p>
+    1024 维 × 每维 4 字节浮点数 + 8 字节头 = <strong>4104 字节（约 4 KB）</strong>。
+    每次搜索都要扫描整个电影目录、对每个 4 KB 的数组算一次余弦距离、再排序。数据量小还行，数据或查询量一涨就撑不住了。
+  </p>
+</div>
+
+<h3>近似最近邻与召回率</h3>
+
+<p>
+  pgvector 目前支持两种向量索引：<strong>IVFFlat</strong>（inverted file with flat compression，倒排文件 + 平坦压缩）和 <strong>HNSW</strong>（hierarchical navigable small world，分层可导航小世界）。
+  此外 pgvectorscale 扩展还提供 StreamingDiskANN 索引。
+</p>
+
+<p>
+  不管选哪种，都要记住：它们和 B-tree、GIN、GiST 的行为<strong>不一样</strong>，<strong>向量索引返回的是近似结果</strong>。
+  用 B-tree 找 <code>revenue &gt; 1000000</code> 的电影，所有匹配行一个不落；但用向量索引找“May the force be with you”相关的电影，它只比较一部分嵌入，结果未必最准。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="精确最近邻与近似最近邻对比，以及召回率">
+  <rect class="bx-b" x="20" y="20" width="350" height="150" rx="12"/>
+  <text class="ttl on-b" x="195" y="44" text-anchor="middle">ENN 精确最近邻（全表扫描）</text>
+  <g>
+    <circle class="dot" cx="60" cy="80" r="4"/><circle class="dot" cx="90" cy="120" r="4"/><circle class="dot" cx="130" cy="70" r="4"/><circle class="dot" cx="170" cy="140" r="4"/><circle class="dot" cx="300" cy="80" r="4"/><circle class="dot" cx="330" cy="140" r="4"/><circle class="dot" cx="280" cy="150" r="4"/><circle class="dot" cx="100" cy="150" r="4"/>
+    <circle class="dot-g" cx="215" cy="95" r="6"/><circle class="dot-g" cx="240" cy="120" r="6"/><circle class="dot-g" cx="250" cy="85" r="6"/>
+  </g>
+  <path class="ln-p" d="M228 102 L215 95 M228 102 L240 120 M228 102 L250 85"/>
+  <circle class="dot-p" cx="228" cy="102" r="5"/>
+  <text class="sm" x="195" y="190" text-anchor="middle">和<tspan class="b">每一个</tspan>嵌入比较 → 一定找到真正的最近邻</text>
+  <text class="sm" x="195" y="208" text-anchor="middle">召回率 = 1，但慢</text>
+
+  <rect class="bx-a" x="390" y="20" width="350" height="150" rx="12"/>
+  <text class="ttl on-a" x="565" y="44" text-anchor="middle">ANN 近似最近邻（向量索引）</text>
+  <rect class="bx-d" x="540" y="62" width="150" height="96" rx="8"/>
+  <g>
+    <circle class="dot" cx="430" cy="80" r="4" style="opacity:.35"/><circle class="dot" cx="460" cy="120" r="4" style="opacity:.35"/><circle class="dot" cx="500" cy="70" r="4" style="opacity:.35"/><circle class="dot" cx="470" cy="150" r="4" style="opacity:.35"/><circle class="dot" cx="700" cy="140" r="4" style="opacity:.35"/>
+    <circle class="dot-g" cx="585" cy="95" r="6"/><circle class="dot-g" cx="620" cy="85" r="6"/><circle class="dot-r" cx="660" cy="140" r="6"/>
+    <circle class="dot" cx="525" cy="125" r="6" style="opacity:.35"/>
+  </g>
+  <circle class="dot-p" cx="598" cy="102" r="5"/>
+  <text class="sm" x="565" y="190" text-anchor="middle">只在<tspan class="b">一部分</tspan>候选里比较（虚线框）→ 快</text>
+  <text class="sm" x="565" y="208" text-anchor="middle">但真正的近邻可能在框外被漏掉（红点顶替了它）</text>
+
+  <rect class="bx-d" x="20" y="222" width="720" height="24" rx="6"/>
+  <text class="sm" x="380" y="239" text-anchor="middle">召回率 recall = 返回结果中“真正的最近邻”所占的比例，0~1，越接近 1 越准</text>
+</svg>
+<figcaption>图 8-7　向量索引用一点准确度换来大幅提速，召回率衡量的就是这个代价</figcaption>
+</figure>
+
+<p>
+  向量索引做的是<strong>近似最近邻（ANN）</strong>搜索。所以评估向量索引时，除了性能和大小，还要关注<strong>召回率（recall）</strong>：返回的“最近”嵌入中，有多少是真正的最近邻。
+  全表扫描做的是<strong>精确最近邻（ENN）</strong>搜索，和每一个嵌入都比较过，召回率是 1。
+</p>
+
+<h3>IVFFlat 索引</h3>
+
+<p>
+  IVFFlat 把向量嵌入分成若干<strong>列表（list）</strong>，也叫<strong>簇（cluster）</strong>，每个列表里的嵌入彼此相似。
+  每个列表有一个<strong>质心（centroid）</strong>，代表簇的中心点，由对嵌入运行 <strong>k-means 聚类</strong>算出。算好质心后，每个嵌入被分配到离它最近的质心所在的列表。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 320" role="img" aria-label="IVFFlat 索引：嵌入被分成若干列表，每个列表有一个质心；搜索时只看离查询最近的几个列表">
+  <rect class="area-p" x="80" y="30" width="250" height="120" rx="40" style="fill:var(--purple-bg);stroke:var(--purple);stroke-width:1.5"/>
+  <text class="ttl on-p" x="96" y="52">列表 1：星球大战</text>
+  <path class="fill-p" d="M200 85 l8 8 l-8 8 l-8 -8 z"/>
+  <circle class="dot-p" cx="150" cy="80" r="5"/><text class="sm" x="120" y="74">Return of the Jedi</text>
+  <circle class="dot-p" cx="250" cy="96" r="5"/><text class="sm" x="232" y="90">A New Hope</text>
+  <circle class="dot-p" cx="180" cy="128" r="5"/><text class="sm" x="150" y="142">The Mandalorian</text>
+
+  <rect class="area-a" x="40" y="186" width="250" height="110" rx="40"/>
+  <text class="ttl on-a" x="56" y="208">列表 2：梦工厂</text>
+  <path class="fill-a" d="M160 236 l8 8 l-8 8 l-8 -8 z"/>
+  <circle class="dot-a" cx="110" cy="230" r="5"/><text class="sm" x="80" y="226">Madagascar</text>
+  <circle class="dot-a" cx="210" cy="250" r="5"/><text class="sm" x="218" y="254">Shrek</text>
+  <circle class="dot-a" cx="140" cy="276" r="5"/><text class="sm" x="150" y="286">Kung Fu Panda</text>
+
+  <rect class="area-b" x="430" y="30" width="240" height="120" rx="40"/>
+  <text class="ttl on-b" x="446" y="52">列表 3：皮克斯</text>
+  <path class="fill-b" d="M550 90 l8 8 l-8 8 l-8 -8 z"/>
+  <circle class="dot-b" cx="490" cy="80" r="5"/><text class="sm" x="460" y="74">Monsters, Inc.</text>
+  <circle class="dot-b" cx="600" cy="90" r="5"/><text class="sm" x="580" y="84">Toy Story</text>
+  <circle class="dot-b" cx="520" cy="128" r="5"/><text class="sm" x="530" y="140">Finding Nemo</text>
+
+  <rect class="area-g" x="390" y="186" width="260" height="110" rx="40"/>
+  <text class="ttl on-g" x="406" y="208">列表 4：漫威</text>
+  <path class="fill-g" d="M520 240 l8 8 l-8 8 l-8 -8 z"/>
+  <circle class="dot-g" cx="460" cy="236" r="5"/><text class="sm" x="440" y="230">Hulk</text>
+  <circle class="dot-g" cx="580" cy="232" r="5"/><text class="sm" x="560" y="226">Iron Man</text>
+  <circle class="dot-g" cx="500" cy="276" r="5"/><text class="sm" x="510" y="286">Avengers</text>
+
+  <circle class="fill-r" cx="350" cy="100" r="7"/>
+  <text class="sm on-r b" x="345" y="178" text-anchor="middle">查询：“May the force</text>
+  <text class="sm on-r b" x="345" y="194" text-anchor="middle">be with you”</text>
+  <path class="ln-r" d="M343 100 L210 93" marker-end="url(#ar-r)"/>
+  <path class="ln-d" d="M357 100 L540 98"/>
+  <path class="ln-d" d="M350 108 L170 236"/>
+  <path class="ln-d" d="M354 108 L512 240"/>
+
+  <rect class="bx" x="680" y="40" width="70" height="250" rx="8"/>
+  <path class="fill-a" d="M715 64 l8 8 l-8 8 l-8 -8 z"/>
+  <text class="sm" x="715" y="96" text-anchor="middle">◆ = 质心</text>
+  <text class="sm" x="715" y="130" text-anchor="middle">① 查询和</text>
+  <text class="sm" x="715" y="146" text-anchor="middle">每个质心</text>
+  <text class="sm" x="715" y="162" text-anchor="middle">比距离</text>
+  <text class="sm" x="715" y="192" text-anchor="middle">② 只在最近</text>
+  <text class="sm" x="715" y="208" text-anchor="middle">的 probes 个</text>
+  <text class="sm" x="715" y="224" text-anchor="middle">列表里搜</text>
+  <text class="sm" x="715" y="254" text-anchor="middle">其他列表</text>
+  <text class="sm" x="715" y="270" text-anchor="middle">整个跳过</text>
+</svg>
+<figcaption>图 8-8　IVFFlat：先找最近的“簇”，再在簇里找最近的电影（对应原书图 8.8）</figcaption>
+</figure>
+
+<p>
+  质心不仅在建索引时用来分配嵌入，搜索时也用：Postgres 先计算查询嵌入和<strong>每个质心</strong>的距离，然后只在质心最近的那个列表里继续搜索。
+  对“May the force be with you”来说，存着星战电影的列表 1 的质心最近，其他列表都被跳过。
+</p>
+
+<h4>创建和使用索引</h4>
+
+<div class="code" data-lang="sql" data-file="清单 8.9 · 创建 IVFFlat 索引">
+<pre>
+CREATE INDEX movie_embeddings_ivfflat_idx
+ON omdb.movies
+USING ivfflat (movie_embedding vector_cosine_ops) WITH (lists = 5);
+</pre>
+</div>
+
+<ul>
+  <li><code>vector_cosine_ops</code>：建索引时用余弦距离把嵌入分配到各个列表。<strong>查询也必须用同一种距离</strong>（<code>&lt;=&gt;</code>），换成别的运算符索引就用不上。</li>
+  <li><code>WITH (lists = 5)</code>：分成 5 个列表。pgvector 文档建议：<strong>100 万行以内从 <code>行数 / 1000</code> 开始试，超过 100 万行用 <code>sqrt(行数)</code></strong>。</li>
+</ul>
+
+<p>建好后再看执行计划 —— 仍然是 Seq Scan！</p>
+
+<div class="code out"><pre>
+ Limit (actual time=52.598..52.599 rows=3 loops=1)
+   -> Sort (actual time=52.596..52.596 rows=3 loops=1)
+         Sort Key: ((movie_embedding <=> omdb.get_embedding('May the force be with you'::text)))
+         -> Seq Scan on movies (actual time=0.635..51.893 rows=4224 loops=1)
+ Execution Time: 52.764 ms
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 规划器不认 omdb.get_embedding()</div>
+  <p>
+    查询用了余弦距离、有 ORDER BY 和 LIMIT，看起来都对，但规划器还是忽略了索引，原因是调用了 <code>omdb.get_embedding(…)</code> 函数。
+    写书时，规划器期望更简单的查询形式。把函数换成直接查字典表的<strong>子查询</strong>就好了：
+  </p>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 8.10 · 检查使用 IVFFlat 索引后的执行计划">
+<pre>
+EXPLAIN (analyze, costs off)
+SELECT id, name, description
+FROM omdb.movies
+ORDER BY movie_embedding <=>
+    (SELECT phrase_embedding
+    FROM omdb.phrases_dictionary
+    WHERE phrase = 'May the force be with you')
+LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+ Limit (actual time=1.408..1.444 rows=3 loops=1)
+   InitPlan 1
+     -> Seq Scan on phrases_dictionary (actual time=0.022..0.023 rows=1 loops=1)
+           Filter: (phrase = 'May the force be with you'::text)
+           Rows Removed by Filter: 3
+   -> Index Scan using movie_embeddings_ivfflat_idx on movies
+        (actual time=1.400..1.434 rows=3 loops=1)
+         Order By: (movie_embedding <=> (InitPlan 1).col1)
+ Planning Time: 0.192 ms
+ Execution Time: 1.492 ms
+</pre></div>
+
+<p>先在字典表里查到短语的嵌入（InitPlan），再用 IVFFlat 索引做 Index Scan。<strong>约 1 ms vs 约 50 ms</strong>。</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 应用层不用改</div>
+  <p>如果应用像前面的伪代码那样，先在应用里生成嵌入、再把它作为参数传给 <code>ORDER BY movie_embedding &lt;=&gt; $1</code>，规划器能轻松识别出可以用 IVFFlat 索引，应用这边什么都不用改。</p>
+</div>
+
+<h4>提高搜索时的召回率：probes</h4>
+
+<p>看看用索引查出来的结果：</p>
+
+<div class="code out"><pre>
+  id   |           name
+-------+--------------------------
+ 10840 | On Your Mark
+  9956 | The Brave
+ 10268 | Je vous trouve très beau
+(3 rows)
+</pre></div>
+
+<p>
+  召回率很低 —— 一部星战都没有！说明索引在一个不含星战嵌入的列表里搜了。（你的结果可能不同：建 IVFFlat 时有随机化，每次建出来的结构不一定一样。）
+  用 <code>ivfflat.probes</code> 参数可以指定搜索时<strong>访问几个列表</strong>（默认 1）。在事务里用 <code>SET LOCAL</code> 只对这一个查询生效：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.11 · 增加 IVFFlat 索引的 probes 数">
+<pre>
+BEGIN;
+
+SET LOCAL ivfflat.probes = 2;
+
+SELECT id, name
+FROM omdb.movies
+ORDER BY movie_embedding <=>
+    (SELECT phrase_embedding
+    FROM omdb.phrases_dictionary
+    WHERE phrase = 'May the force be with you')
+LIMIT 3;
+
+COMMIT;
+</pre>
+</div>
+<div class="code out"><pre>
+   id   |                    name
+--------+--------------------------------------------
+   1892 | Star Wars: Episode VI - Return of the Jedi
+ 204710 | The Acolyte
+  10840 | On Your Mark
+(3 rows)
+</pre></div>
+
+<p>这次和清单 8.5 全表扫描（ENN）的结果一样了。代价是要访问两个列表，执行时间从约 1 ms 涨到约 2.9 ms —— 相比召回率的大幅提升，可以忽略。</p>
+
+<div class="box note">
+  <div class="t">&#9432; IVFFlat 的局限</div>
+  <ul>
+    <li>需要多少 probes 才能有好的召回率，取决于数据量、列表数和具体查询。务必充分测试，在召回率和性能之间找平衡。</li>
+    <li>IVFFlat 最适合<strong>在已有数据上建索引、之后数据变化不大</strong>的场景。质心只在建索引时算一次，之后不会更新。数据大量增长或频繁更新后，新嵌入仍按旧质心分配，分布可能不再理想，召回率下降。这时可以重建索引，或者换用 HNSW —— 它更灵活，甚至可以在空表上建。</li>
+  </ul>
+</div>
+
+<h3>HNSW 索引</h3>
+
+<p>
+  HNSW 构建一个<strong>多层图</strong>：每个节点代表一个向量，边连接相近的向量。<strong>上层稀疏、下层稠密</strong>，出现在高层的节点也出现在所有更低的层。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 424" role="img" aria-label="HNSW 多层图：搜索从最稀疏的顶层开始，逐层下降到最稠密的底层">
+  <!-- layer 3 -->
+  <path class="area-b" d="M60 30 L700 30 L660 120 L20 120 Z" style="fill-opacity:.5"/>
+  <text class="ttl on-b" x="36" y="54">第 3 层（最稀疏）</text>
+  <circle class="dot" cx="200" cy="70" r="6"/><text class="sm" x="210" y="66">Iron Man</text>
+  <circle class="dot" cx="240" cy="100" r="6"/><text class="sm" x="250" y="106">Avengers</text>
+  <circle class="dot-a" cx="520" cy="62" r="7"/><text class="sm on-a b" x="530" y="58">A New Hope</text>
+  <circle class="dot-a" cx="500" cy="100" r="7"/><text class="sm on-a b" x="510" y="108">The Mandalorian</text>
+  <path class="ln" d="M200 70 L240 100 L500 100 L520 62 L200 70"/>
+
+  <!-- layer 2 -->
+  <path class="area-g" d="M60 150 L700 150 L660 250 L20 250 Z" style="fill-opacity:.5"/>
+  <text class="ttl on-g" x="36" y="174">第 2 层</text>
+  <circle class="dot" cx="200" cy="190" r="6"/><circle class="dot" cx="240" cy="222" r="6"/><circle class="dot" cx="130" cy="230" r="6"/><text class="sm" x="104" y="244">Hulk</text>
+  <circle class="dot-a" cx="520" cy="182" r="7"/><circle class="dot-a" cx="500" cy="222" r="7"/>
+  <circle class="dot-a" cx="430" cy="176" r="7"/><text class="sm on-a b" x="370" y="170">Return of the Jedi</text>
+  <path class="ln" d="M130 230 L200 190 L240 222 L130 230"/>
+  <path class="ln-a" d="M430 176 L520 182 L500 222 L430 176"/>
+  <path class="ln" d="M240 222 L500 222"/>
+
+  <!-- layer 1 -->
+  <path class="area-a" d="M60 280 L700 280 L660 390 L20 390 Z" style="fill-opacity:.5"/>
+  <text class="ttl on-a" x="36" y="304">第 1 层（最稠密，包含所有节点）</text>
+  <circle class="dot" cx="200" cy="320" r="5"/><circle class="dot" cx="240" cy="350" r="5"/><circle class="dot" cx="130" cy="360" r="5"/><circle class="dot" cx="300" cy="318" r="5"/><circle class="dot" cx="260" cy="378" r="5"/>
+  <text class="sm" x="310" y="314">Spider-Man</text><text class="sm" x="268" y="384">Thor</text>
+  <circle class="dot-a" cx="520" cy="312" r="6"/><circle class="dot-a" cx="500" cy="350" r="6"/><circle class="dot-a" cx="430" cy="306" r="6"/>
+  <circle class="dot-a" cx="400" cy="340" r="6"/><text class="sm on-a" x="330" y="336">The Last Jedi</text>
+  <circle class="dot-a" cx="560" cy="370" r="6"/><text class="sm on-a" x="570" y="376">Attack of the Clones</text>
+  <path class="ln" d="M130 360 L200 320 L240 350 L130 360 M300 318 L200 320 M240 350 L260 378"/>
+  <path class="ln-a" d="M430 306 L520 312 L500 350 L430 306 M400 340 L430 306 M400 340 L500 350 M500 350 L560 370"/>
+
+  <!-- descent -->
+  <path class="ln-r" d="M520 62 V174" marker-end="url(#ar-r)"/>
+  <path class="ln-r" d="M500 222 V342" marker-end="url(#ar-r)"/>
+  <text class="sm on-r b" x="380" y="414" text-anchor="middle">红色箭头：搜索从顶层出发，每层只沿着离查询最近的节点往下走；漫威那片区域在第 2 层就不再访问</text>
+</svg>
+<figcaption>图 8-9　HNSW 索引：像先坐高铁到城市、再换地铁、最后步行（对应原书图 8.9）</figcaption>
+</figure>
+
+<p>
+  搜索总是从最高层（第 3 层）开始，逐层下降，每层只走离查询嵌入最近的节点。
+  搜“May the force be with you”时，先在第 3 层计算它和 Iron Man、Avengers、A New Hope、The Mandalorian 四个节点的距离，发现后两者最近；
+  于是在第 2 层只在星战那片区域继续，漫威电影不再访问；最后在第 1 层发现更多星战电影，整理出最终结果。
+</p>
+
+<h4>创建和使用索引</h4>
+
+<p>先删掉 IVFFlat 索引（同一张表没必要有两个向量索引），再建 HNSW：</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.12 · 创建 HNSW 索引">
+<pre>
+DROP INDEX omdb.movie_embeddings_ivfflat_idx;
+
+CREATE INDEX movie_embeddings_hnsw_idx
+ON omdb.movies
+USING hnsw (movie_embedding vector_cosine_ops)
+WITH (m = 8, ef_construction = 16);
+</pre>
+</div>
+
+<div class="tw"><table>
+<tr><th>参数</th><th>阶段</th><th>含义</th><th>默认</th><th>调大的效果</th></tr>
+<tr><td><code>m</code></td><td>建索引</td><td>每个节点最多有几条边</td><td>16</td><td>图更稠密，召回更好、跳数更少；但建索引更慢、更占内存</td></tr>
+<tr><td><code>ef_construction</code></td><td>建索引</td><td>构建时候选列表的大小：遍历时保存的最近候选，结束后截断成 m 个最近邻</td><td>64</td><td>考虑的候选更多，索引质量更好；建索引更慢</td></tr>
+<tr><td><code>hnsw.ef_search</code></td><td>查询</td><td>搜索时保存的候选节点数</td><td>40</td><td>探索更多可能的近邻，召回更好；查询更慢</td></tr>
+</table></div>
+
+<p>我们的数据集比较小，所以 m 设成 8；ef_construction 设成 16，保证至少是 m 的两倍。</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.13 · 检查使用 HNSW 索引后的执行计划">
+<pre>
+EXPLAIN (analyze, costs off)
+SELECT id, name
+FROM omdb.movies
+ORDER BY movie_embedding <=>
+    (SELECT phrase_embedding
+    FROM omdb.phrases_dictionary
+    WHERE phrase = 'May the force be with you')
+LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+ Limit (actual time=1.889..1.923 rows=3 loops=1)
+   InitPlan 1
+     -> Seq Scan on phrases_dictionary (actual time=0.025..0.026 rows=1 loops=1)
+           Filter: (phrase = 'May the force be with you'::text)
+   -> Index Scan using movie_embeddings_hnsw_idx on movies
+        (actual time=1.887..1.918 rows=3 loops=1)
+         Order By: (movie_embedding <=> (InitPlan 1).col1)
+ Planning Time: 0.205 ms
+ Execution Time: 1.970 ms
+</pre></div>
+
+<p>结果和全表扫描（ENN）一样：Return of the Jedi、The Acolyte、On Your Mark —— 在 m = 8、ef_construction = 16 下既得到了完美召回，又大幅提升了性能。</p>
+
+<h4>提高搜索时的召回率：ef_search</h4>
+
+<p>
+  上线前应该用更多用户可能输入的短语充分测试，调整 m 和 ef_construction，在召回率、性能、索引大小之间找平衡。
+  假设上线后发现某些短语召回率不好，除了重建索引，还可以不动索引、调大查询时的 <code>hnsw.ef_search</code>。
+  它可以用 <code>SET hnsw.ef_search = 值</code> 对整个会话生效，也可以在事务里用 <code>SET LOCAL</code> 只对一个查询生效：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 8.14 · 用 HNSW 提高搜索准确度">
+<pre>
+BEGIN;
+SET LOCAL hnsw.ef_search = 50;
+
+SELECT id, name
+FROM omdb.movies
+ORDER BY movie_embedding <=>
+  (SELECT phrase_embedding
+  FROM omdb.phrases_dictionary
+  WHERE phrase =
+  'A movie about a Jedi who fights against the dark side of the force')
+LIMIT 3;
+
+COMMIT;
+</pre>
+</div>
+<div class="code out"><pre>
+   id   |                      name
+--------+------------------------------------------------
+   1892 | Star Wars: Episode VI - Return of the Jedi
+ 204710 | The Acolyte
+   1891 | Star Wars: Episode V - The Empire Strikes Back
+(3 rows)
+</pre></div>
+
+<p>（在我们的小数据集上，ef_search 设成默认的 40 甚至更小，结果都一样 —— 建索引时的参数已经足够实现完美召回，至少对这几个示例短语是这样。）</p>
+
+<h3>IVFFlat 还是 HNSW？</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="IVFFlat 与 HNSW 的对比">
+  <rect class="bx-b" x="20" y="20" width="350" height="196" rx="12"/>
+  <text class="ttl on-b" x="195" y="46" text-anchor="middle">IVFFlat</text>
+  <text class="sm" x="36" y="72">结构：k-means 聚类成 lists</text>
+  <text class="sm" x="36" y="92">建索引参数：<tspan class="mono">lists</tspan>　查询参数：<tspan class="mono">ivfflat.probes</tspan></text>
+  <text class="sm on-g" x="36" y="120">✓ 索引小，建得快</text>
+  <text class="sm on-r" x="36" y="142">✗ 质心固定，数据大变后召回下降</text>
+  <text class="sm on-r" x="36" y="164">✗ 要先有数据才能建好</text>
+  <text class="sm" x="36" y="196">适合：数据基本不变、在意索引大小或建索引时间</text>
+
+  <rect class="bx-a" x="390" y="20" width="350" height="196" rx="12"/>
+  <text class="ttl on-a" x="565" y="46" text-anchor="middle">HNSW ✓ 推荐服务的选择</text>
+  <text class="sm" x="406" y="72">结构：多层近邻图</text>
+  <text class="sm" x="406" y="92">建索引：<tspan class="mono">m, ef_construction</tspan>　查询：<tspan class="mono">hnsw.ef_search</tspan></text>
+  <text class="sm on-g" x="406" y="120">✓ 查询准、快</text>
+  <text class="sm on-g" x="406" y="142">✓ 数据增删后召回依然稳定，可在空表上建</text>
+  <text class="sm on-r" x="406" y="164">✗ 建索引更慢，索引更大</text>
+  <text class="sm" x="406" y="196">适合：最看重准确度和查询性能、数据持续增长</text>
+</svg>
+<figcaption>图 8-10　两种向量索引的取舍</figcaption>
+</figure>
+
+<p>电影目录会不断增长，我们希望这对召回率和搜索性能影响很小，所以推荐服务选 <strong>HNSW</strong>。</p>
+
+<h2 id="rag">实现 RAG</h2>
+
+<p>
+  pgvector 很好地说明了扩展生态为什么对 Postgres 的普及如此重要：启用它，Postgres 就成了向量数据库，能存嵌入、做相似度搜索、用专门的索引优化。
+  现在推荐服务已经能根据用户的提示推荐电影了。但如果我们想更进一步 —— 不只是检索出数据展示给用户，而是把检索到的数据作为<strong>上下文交给 LLM</strong>，让它据此生成回答或执行任务呢？这就是 <strong>RAG</strong>（Retrieval-Augmented Generation，检索增强生成）。
+</p>
+
+<p>有了 RAG，LLM 就成了应用的一个组件：和用户交互，同时考虑我们的私有数据和知识库。收到用户提示后：</p>
+
+<ul>
+  <li><strong>检索上下文</strong>：用用户的提示在私有数据里找相关信息。</li>
+  <li><strong>增强 LLM</strong>：把检索到的上下文交给 LLM，扩充它的知识或影响它的行为。</li>
+  <li><strong>生成回答</strong>：让 LLM 完成任务（如果需要）并生成最终回答。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="用 LLM、嵌入模型和 Postgres 实现 RAG 的十个步骤">
+  <rect class="bx" x="20" y="40" width="100" height="56" rx="10"/>
+  <text class="ttl" x="70" y="73" text-anchor="middle">用户</text>
+
+  <rect class="bx-p" x="250" y="30" width="180" height="76" rx="12"/>
+  <text class="ttl on-p" x="340" y="62" text-anchor="middle">应用后端</text>
+  <text class="sm" x="340" y="82" text-anchor="middle">聊天机器人</text>
+
+  <rect class="bx-r" x="590" y="30" width="150" height="76" rx="12"/>
+  <text class="ttl on-r" x="665" y="62" text-anchor="middle">LLM</text>
+  <text class="sm" x="665" y="82" text-anchor="middle">TinyLlama</text>
+
+  <rect class="bx-b" x="270" y="180" width="140" height="56" rx="10"/>
+  <text class="ttl on-b" x="340" y="204" text-anchor="middle">获取上下文</text>
+  <text class="sm" x="340" y="222" text-anchor="middle">get context 模块</text>
+
+  <rect class="bx-a" x="20" y="256" width="170" height="64" rx="12"/>
+  <text class="ttl on-a" x="105" y="284" text-anchor="middle">Postgres</text>
+  <text class="sm" x="105" y="304" text-anchor="middle">pgvector</text>
+
+  <rect class="bx-g" x="570" y="256" width="170" height="64" rx="12"/>
+  <text class="ttl on-g" x="655" y="284" text-anchor="middle">嵌入模型</text>
+  <text class="sm" x="655" y="304" text-anchor="middle">mxbai-embed-large</text>
+
+  <path class="ln" d="M122 58 H246" marker-end="url(#ar)"/><text class="sm" x="184" y="50" text-anchor="middle">① 问题</text>
+  <path class="ln" d="M246 84 H124" marker-end="url(#ar)"/><text class="sm" x="184" y="100" text-anchor="middle">⑩ 回答</text>
+
+  <path class="ln-r" d="M432 54 H586" marker-end="url(#ar-r)"/><text class="sm on-r" x="510" y="46" text-anchor="middle">⑧ 问题 + 上下文</text>
+  <path class="ln-r" d="M586 84 H434" marker-end="url(#ar-r)"/><text class="sm on-r" x="510" y="100" text-anchor="middle">⑨ 生成的回答</text>
+
+  <path class="ln-b" d="M320 108 V176" marker-end="url(#ar-b)"/><text class="sm on-b" x="314" y="146" text-anchor="end">② 问题</text>
+  <path class="ln-b" d="M360 176 V110" marker-end="url(#ar-b)"/><text class="sm on-b" x="366" y="146">⑦ 上下文</text>
+
+  <path class="ln-g" d="M412 200 L566 268" marker-end="url(#ar-g)"/><text class="sm on-g" x="500" y="218">③ 问题</text>
+  <path class="ln-g" d="M566 292 L414 228" marker-end="url(#ar-g)"/><text class="sm on-g" x="476" y="282">④ 嵌入</text>
+
+  <path class="ln-a" d="M268 214 L194 270" marker-end="url(#ar-a)"/><text class="sm on-a" x="228" y="226" text-anchor="end">⑤ 嵌入 → 相似度搜索</text>
+  <path class="ln-a" d="M194 296 L272 236" marker-end="url(#ar-a)"/><text class="sm on-a" x="238" y="300">⑥ 相关电影</text>
+</svg>
+<figcaption>图 8-11　用 LLM、嵌入模型和 Postgres 实现 RAG（对应原书图 8.10）</figcaption>
+</figure>
+
+<ol>
+  <li>用户打开聊天机器人提问，问题从前端发到后端。</li>
+  <li>后端调用“获取上下文”模块，从 Postgres 的私有数据中检索上下文。</li>
+  <li>模块用嵌入模型为问题生成嵌入。</li>
+  <li>嵌入模型返回嵌入。</li>
+  <li>模块用这个嵌入在 Postgres 里做相似度搜索，找出和问题相关的电影。</li>
+  <li>Postgres 返回结果，这就是要交给 LLM 的上下文。</li>
+  <li>模块把上下文返回给后端。</li>
+  <li>后端把问题和上下文一起交给 LLM，让它生成推荐。如果需要，还可以把之前的对话历史一起带上。</li>
+  <li>LLM 生成回答。</li>
+  <li>回答发回前端，显示在聊天窗口里。</li>
+</ol>
+
+<h3>准备原型环境</h3>
+
+<p>
+  原型用 Python 实现，在仓库的 Jupyter 笔记本 <a href="https://github.com/dmagda/just-use-postgres-book/blob/main/ai_samples/rag.ipynb">ai_samples/rag.ipynb</a> 里，一步步执行即可 —— 不需要懂 Python，只要装好 Python 和 VS Code 这类 IDE。
+  嵌入模型继续用 mxbai-embed-large；LLM 用 <strong>TinyLlama</strong>：一个 11 亿参数的紧凑开源模型，只占约 640 MB 内存，对算力要求不高，大多数开发机都能跑。
+  也可以换成更强的模型，比如 Meta 的 Llama 3.3（需要 43 GB 内存）或 OpenAI 的 GPT-4o（需要订阅）。
+</p>
+
+<p>按仓库 <code>ai_samples/README.md</code> 的说明，用 Ollama 在本地部署这两个模型：</p>
+
+<div class="code" data-lang="bash" data-file="ai_samples/README.md · 启动 Ollama 并下载模型">
+<pre>
+docker volume create ollama-volume
+
+docker run --name ollama \
+    -p 11434:11434 \
+    -v ollama-volume:/root/.ollama \
+    -d ollama/ollama:0.5.11
+
+# 下载嵌入模型和 LLM
+docker exec -it ollama ollama pull mxbai-embed-large:335m
+docker exec -it ollama ollama pull tinyllama
+</pre>
+</div>
+
+<div class="code" data-lang="bash" data-file="ai_samples/README.md · 通过 REST API 验证模型可用">
+<pre>
+# 验证 LLM
+curl http://localhost:11434/api/generate -d '{
+  "model": "tinyllama",
+  "stream": false,
+  "prompt":"What is Postgres?"
+}'
+
+# 验证嵌入模型
+curl http://localhost:11434/api/embed -d '{
+  "model": "mxbai-embed-large:335m",
+  "input": "Just Use Postgres!"
+}'
+</pre>
+</div>
+
+<p>笔记本需要的 Python 依赖：<code>pip install -q psycopg2-binary==2.9.9 langchain-ollama==0.2.3</code>。</p>
+
+<h3>和 LLM 交互</h3>
+
+<p>笔记本定义了 <code>answer_question(question, context)</code> 函数，让 TinyLlama 结合提供的上下文回答用户问题：</p>
+
+<div class="code" data-lang="python" data-file="清单 8.15 · 用 LLM 和给定上下文回答问题">
+<pre>
+def answer_question(question, context):
+    # 通过 LangChain 的 Ollama 接口连接 tinyllama 模型
+    llm = OllamaLLM(model="tinyllama", temperature=0.6)
+
+    # 结合上下文生成给 LLM 的最终提示词
+    prompt = f"""
+    You're a movie expert and your task is to answer questions about movies
+    based on the provided context.
+
+    This is the user's question: {question}
+    Consider the following context to provide a detailed and
+    accurate answer: {context}
+
+    The context includes the following details for each movie:
+    - "Title" of the movie
+    - "Vote Average" - the average rating of the movie
+    - "Budget" - the budget allocated for the movie in US dollars
+    - "Revenue" - the total revenue generated by the movie in US dollars
+    - "Release Date" - the date the movie was released
+
+    Respond in an engaging style that inspires the user to watch the movies.
+    """
+
+    # 调用 LLM，生成回答
+    response = llm.invoke(prompt)
+    return response
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="提示词的组装：指令、用户问题、检索到的上下文">
+  <rect class="bx" x="20" y="20" width="200" height="44" rx="8"/><text class="sm b" x="120" y="47" text-anchor="middle">角色与任务说明</text>
+  <rect class="bx-p" x="20" y="76" width="200" height="44" rx="8"/><text class="sm b" x="120" y="96" text-anchor="middle">{question}</text><text class="sm" x="120" y="112" text-anchor="middle">用户的原始问题</text>
+  <rect class="bx-a" x="20" y="132" width="200" height="44" rx="8"/><text class="sm b" x="120" y="152" text-anchor="middle">{context}</text><text class="sm" x="120" y="168" text-anchor="middle">从 Postgres 检索到的电影</text>
+  <path class="ln" d="M222 42 L300 90" marker-end="url(#ar)"/>
+  <path class="ln" d="M222 98 H300" marker-end="url(#ar)"/>
+  <path class="ln" d="M222 154 L300 106" marker-end="url(#ar)"/>
+  <rect class="bx-d" x="304" y="62" width="180" height="72" rx="10"/>
+  <text class="ttl" x="394" y="92" text-anchor="middle">prompt</text>
+  <text class="sm" x="394" y="112" text-anchor="middle">+ 字段说明、语气要求</text>
+  <path class="ln-r" d="M486 98 H540" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="544" y="62" width="196" height="72" rx="10"/>
+  <text class="ttl on-r" x="642" y="92" text-anchor="middle">llm.invoke(prompt)</text>
+  <text class="sm" x="642" y="112" text-anchor="middle">temperature = 0.6</text>
+  <text class="sm" x="380" y="194" text-anchor="middle">LLM 是无状态的：要它记得之前的对话，就得自己保存历史，用 {history} 一并放进提示词</text>
+</svg>
+<figcaption>图 8-12　RAG 的本质：把检索到的数据“塞进”提示词</figcaption>
+</figure>
+
+<ol>
+  <li>用 LangChain 框架的 OllamaLLM 接口连接 TinyLlama。<code>temperature</code> 控制回答的随机性。</li>
+  <li>组装 prompt：用 <code>{question}</code> 放入用户原始问题，<code>{context}</code> 放入从 Postgres 检索到的上下文，并说明 LLM 该如何使用这些信息、生成什么样的回答。</li>
+  <li>调用 <code>llm.invoke(prompt)</code> 生成回答。</li>
+</ol>
+
+<h3>为 LLM 检索上下文</h3>
+
+<div class="code" data-lang="python" data-file="清单 8.16 · 从 Postgres 检索上下文">
+<pre>
+def retrieve_context_from_postgres(question):
+    # 连接带 pgvector 扩展的 Postgres 实例
+    db_params = {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "postgres",
+    "user": "postgres",
+    "password": "password"
+    }
+    conn = psycopg2.connect(**db_params)
+    cursor = conn.cursor()
+
+    # 通过 OllamaEmbeddings 接口连接嵌入模型
+    embedding_model = OllamaEmbeddings(model="mxbai-embed-large:335m")
+
+    # 为用户的问题生成嵌入
+    embedding = embedding_model.embed_query(question)
+
+    # 做向量相似度搜索，找出相关电影
+    query = """
+    SELECT name, vote_average, budget, revenue, release_date
+    FROM omdb.movies
+    ORDER BY movie_embedding <=> %s::vector LIMIT 3
+    """
+
+    cursor.execute(query, (embedding, ))
+
+    context = ""
+
+    # 把查询结果拼成上下文
+    for row in cursor.fetchall():
+        context += f"Movie title: {row[0]}, Vote Average: {row[1]}"
+        context += f", Budget: {row[2]}, Revenue: {row[3]}"
+        context += f", Release Date: {row[4]}\n"
+
+    cursor.close()
+    conn.close()
+
+    return context
+</pre>
+</div>
+
+<p>连接本地 Postgres → 用嵌入模型为问题生成嵌入 → 相似度搜索取最相关的三部电影（<code>%s::vector</code> 把参数转成 vector 类型）→ 把结果拼成给 LLM 的上下文。</p>
+
+<h3>用 RAG 回答问题</h3>
+
+<div class="code" data-lang="python" data-file="清单 8.17 · 用 RAG 回答用户问题">
+<pre>
+# 准备一个示例问题
+question = "I'd like to watch the best movies about pirates." + \
+    "Any suggestions?"
+
+# 根据问题从 Postgres 检索上下文
+context = retrieve_context_from_postgres(question)
+
+print("Context from Postgres:")
+print(context)
+
+# 用上下文让 LLM 回答问题
+answer = answer_question(question, context)
+
+print("LLM's answer:")
+print(answer)
+</pre>
+</div>
+
+<p>问“我想看最好的海盗电影，有什么推荐？”，Postgres 相似度搜索返回的上下文：</p>
+
+<div class="code out"><pre>
+Context from Postgres:
+Movie title: Pirates of the Caribbean: The Curse of the Black Pearl,
+  Vote Average: 6.8974356651, Budget: 140000000, Revenue: 655011224,
+  Release Date: 2003-07-09
+Movie title: Pirates of the Caribbean: Dead Man's Chest,
+  Vote Average: 6.6551699638, Budget: 110000000, Revenue: 1065659812,
+  Release Date: 2006-07-07
+Movie title: Pirates of the Caribbean: At World's End,
+  Vote Average: 6.482758522, Budget: 110000000, Revenue: 401055000,
+  Release Date: 2007-05-19
+</pre></div>
+
+<p>TinyLlama 据此生成的回答大意如下：</p>
+
+<div class="box note">
+  <div class="t">&#128172; LLM 的回答（节译）</div>
+  <p>当然！推荐《加勒比海盗：黑珍珠号的诅咒》和《加勒比海盗：聚魂棺》，都由戈尔·维宾斯基执导。第一部是经典冒险故事，阵容强大：约翰尼·德普饰演杰克·斯派洛船长、奥兰多·布鲁姆饰演威尔·特纳、杰弗里·拉什饰演巴博萨船长……第二部讲杰克踏上危险的旅程，从臭名昭著的海盗<strong>黑胡子</strong>手中夺回失落的宝藏……两部都充满动作、冒险和幽默，别错过！</p>
+</div>
+
+<p>
+  LLM 遵循了指示，推荐了上下文中的前两部电影，语气生动，还补充了上下文里没有的细节（剧情、导演是戈尔·维宾斯基）—— 这些来自它的训练数据。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 小模型的幻觉</div>
+  <p>
+    TinyLlama 非常小，适合在普通开发机上快速做原型，代价是更容易<strong>幻觉</strong>、不一定遵循指示或给出准确结果。
+    比如它对《聚魂棺》的描述完全是错的：黑胡子只出现在第四部《惊涛怪浪》里。可以通过改进提示词、调整 temperature，或在 Ollama 里换一个参数更多的模型（需要更多资源）来改善。
+  </p>
+</div>
+
+<h3>下一步</h3>
+
+<p>
+  先选好要用的编程语言和该语言生态里的 gen AI 框架，再深入了解框架如何与 Postgres 集成。
+  本节用的是 Python + LangChain，它原生支持 Postgres 和 pgvector；LangChain 也是很多 JavaScript 开发者的默认选择；Java 开发者可以考虑 Spring AI。
+</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 纯 SQL 的 RAG</div>
+  <p>不想用应用层框架？可以看看 <strong>pgai</strong> 扩展，它能用纯 SQL 实现 RAG 流程，完全在数据库内执行。</p>
+</div>
+
+<h2 id="repo">仓库里的 AI 示例代码</h2>
+
+<p>本书仓库的 <code>ai_samples/</code> 目录有三个 Jupyter 笔记本和更多示例，下面是它们的要点。</p>
+
+<h3>embeddings_generator.ipynb：生成数据集里的嵌入</h3>
+
+<p>这就是清单 8.4 伪代码的真实版本：每处理 100 部电影提交一次事务。</p>
+
+<div class="code" data-lang="python" data-file="ai_samples/embeddings_generator.ipynb（摘录）">
+<pre>
+from langchain_ollama import OllamaEmbeddings
+import psycopg2
+
+embedding_model = OllamaEmbeddings(model="mxbai-embed-large:335m")
+conn = psycopg2.connect(host="localhost", port=5432, dbname="postgres",
+                        user="postgres", password="password")
+cursor = conn.cursor()
+
+# 先清空旧的嵌入
+cursor.execute("UPDATE omdb.movies SET movie_embedding = NULL")
+conn.commit()
+
+cursor.execute("SELECT id, name, description FROM omdb.movies")
+movies = cursor.fetchall()
+
+counter = 0
+for movie in movies:
+    id, name, description = movie
+    combined_text = f"{name} {description}"
+    embedding = embedding_model.embed_query(combined_text)
+
+    cursor.execute(
+        "UPDATE omdb.movies SET movie_embedding = %s WHERE id = %s",
+        (embedding, id)
+    )
+
+    counter += 1
+    if counter % 100 == 0:      # 每 100 部提交一次
+        print(f"Processed {counter} movies")
+        conn.commit()
+
+conn.commit()
+
+# 再为字典表里的 4 个短语生成嵌入
+phrases = [
+    'May the force be with you',
+    'A movie about a Jedi who fights against the dark side of the force',
+    'A pirate captain who sails the seven seas in search of treasure',
+    'A clown fish who gets lost in the ocean and tries to find his way home'
+]
+for phrase in phrases:
+    embedding = embedding_model.embed_query(phrase)
+    cursor.execute(
+        "INSERT INTO omdb.phrases_dictionary (phrase, phrase_embedding) VALUES (%s, %s)",
+        (phrase, embedding)
+    )
+conn.commit()
+</pre>
+</div>
+
+<h3>similarity_search.ipynb：用任意短语搜索</h3>
+
+<div class="code" data-lang="python" data-file="ai_samples/similarity_search.ipynb（摘录）">
+<pre>
+# 输入任意搜索短语
+phrase = "A team of superheroes come together to save the world"
+
+embedding = embedding_model.embed_query(phrase)
+
+query = """
+SELECT id, name, description
+FROM omdb.movies
+ORDER BY movie_embedding <=> %s::vector LIMIT 3
+"""
+cursor.execute(query, (embedding, ))
+for row in cursor.fetchall():
+    print(row)
+</pre>
+</div>
+
+<h3>rag.ipynb 与更多示例</h3>
+
+<p>rag.ipynb 就是上面清单 8.15–8.17 的完整版。<code>ai_samples/more_samples.md</code> 还列出了两个视频教程：</p>
+
+<ul>
+  <li><strong>使用 Text-to-SQL 接口的 AI 智能体</strong>：智能体接收自然语言问题，转换成 SQL 在 Postgres 上执行，获取信息或执行操作。（<a href="https://youtu.be/SWr9w96iBnM">视频</a> · <a href="https://github.com/dmagda/DevMastersDb/tree/main/postgres/sql_agent">代码</a>）</li>
+  <li><strong>基于 Postgres pgvector 的 ChatGPT 插件</strong>：从一个用 LLM + pgvector + Spring AI 的 RAG 应用开始，加入让 AI 按用户提示执行操作（比如管理“想看”清单）的能力，最后做成插件发布到 OpenAI 市场。（<a href="https://youtu.be/4vz02j9wvDc">视频</a> · <a href="https://github.com/dmagda/openai-gpt-plugin-pgvector">代码</a>）</li>
+</ul>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Postgres 可以和 LLM、嵌入模型配合，构建推荐服务、自主 AI 智能体等新型 gen AI 应用。</li>
+  <li><strong>向量嵌入</strong>是文本含义的数值坐标；相似的内容在高维空间里离得近。</li>
+  <li><strong>pgvector</strong> 把 Postgres 变成向量数据库：<code>vector</code> 类型、<code>&lt;=&gt;</code> 等距离运算符、专用索引。</li>
+  <li>向量索引做<strong>近似</strong>搜索，要关注<strong>召回率</strong>。<strong>IVFFlat</strong>（lists / probes）小而快建、适合静态数据；<strong>HNSW</strong>（m / ef_construction / ef_search）准而快查、适合持续增长的数据。</li>
+  <li>Postgres 是实现 <strong>RAG</strong> 等 gen AI 场景的强大向量数据库：检索上下文 → 增强提示词 → LLM 生成回答。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用字典表里的另外两个短语（海盗船长、迷路的小丑鱼）做相似度搜索，看看结果是否符合直觉。</li>
+    <li>把清单 8.5 的 <code>&lt;=&gt;</code> 换成 <code>&lt;-&gt;</code>（欧氏距离）和 <code>&lt;#&gt;</code>（负内积），比较结果顺序。为什么对归一化的向量，三者排序基本一致？</li>
+    <li>用不同的 <code>lists</code>（比如 1、5、20、65）重建 IVFFlat 索引，配合不同的 <code>ivfflat.probes</code>，记录召回结果和耗时。</li>
+    <li>用 <code>pg_relation_size</code> 比较 IVFFlat 和 HNSW 索引的大小。</li>
+    <li>（需要 Ollama）运行 rag.ipynb，把问题换成“推荐几部关于恐龙的电影”，并尝试修改提示词，让 LLM 只基于上下文回答、不要编造。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

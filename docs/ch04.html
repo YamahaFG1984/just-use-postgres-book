@@ -1,0 +1,1418 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 4 章 · 索引 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="4">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 4 章</span>
+<h1>索引</h1>
+<p class="lede">
+  遇到慢查询，人们第一个想到的优化手段往往就是索引。它在很多场景下效果太好了，以至于我们常常忘了别的优化办法。
+  所以索引大概是仅次于表、我们创建得最多的数据库对象。
+  这一章以一款全球玩家同场竞技的多人在线游戏为例，学习何时、如何使用各种索引，让玩家即使在高峰期也能流畅游戏。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解索引为什么快：O(N) 与 O(log N) 的差别，B-tree 长什么样</li>
+    <li>分清索引的两种分类：“索引什么”和“怎么索引”</li>
+    <li>学会用 <code>EXPLAIN</code> 读懂执行计划，认识 Seq Scan、Index Scan、Index Only Scan、Bitmap Scan</li>
+    <li>会建单列（B-tree / 哈希）、复合、覆盖、部分、表达式索引，并知道它们的坑</li>
+    <li>警惕过度索引</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="why">索引为什么这么受欢迎</h2>
+
+<p>
+  假设一张表有 100 行，要找 ID 等于 5 的那一行。没有索引时，Postgres 只能做<strong>顺序扫描（全表扫描）</strong>，
+  从头到尾逐行检查，最坏要看完全部 N 行，复杂度 <strong>O(N)</strong>。100 行最多看 100 次；可如果表涨到几百万行呢？
+</p>
+
+<p>
+  <strong>索引</strong>是一种把被索引的值<strong>按顺序</strong>存储的数据结构，用来加速数据访问。
+  Postgres 支持很多种索引，默认的通用类型是 <strong>B-tree</strong>（平衡树）。假设 ID 列上有一个 B-tree 索引，它大概长这样：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="一个 B-tree 索引示例，高亮显示查找 ID=5 的路径">
+  <!-- root -->
+  <text class="sm" x="380" y="18" text-anchor="middle">根节点</text>
+  <rect class="bx-a" x="290" y="26" width="180" height="36" rx="6"/>
+  <text class="mono on-a b" x="320" y="49" text-anchor="middle">10</text>
+  <text class="mono" x="380" y="49" text-anchor="middle">40</text>
+  <text class="mono" x="440" y="49" text-anchor="middle">100</text>
+
+  <!-- branches -->
+  <text class="sm" x="62" y="108">分支节点 1</text>
+  <rect class="bx-a" x="60" y="116" width="120" height="36" rx="6"/>
+  <text class="mono on-a b" x="95" y="139" text-anchor="middle">6</text>
+  <text class="mono" x="145" y="139" text-anchor="middle">10</text>
+  <text class="sm" x="445" y="108" text-anchor="middle">分支节点 2</text>
+  <rect class="bx" x="300" y="116" width="160" height="36" rx="6"/>
+  <text class="mono" x="335" y="139" text-anchor="middle">12</text>
+  <text class="mono" x="380" y="139" text-anchor="middle">25</text>
+  <text class="mono" x="425" y="139" text-anchor="middle">40</text>
+  <text class="sm" x="695" y="108" text-anchor="middle">分支节点 3</text>
+  <rect class="bx" x="560" y="116" width="160" height="36" rx="6"/>
+  <text class="mono" x="595" y="139" text-anchor="middle">45</text>
+  <text class="mono" x="640" y="139" text-anchor="middle">70</text>
+  <text class="mono" x="685" y="139" text-anchor="middle">100</text>
+
+  <path class="ln-a" d="M320 64 L130 114" marker-end="url(#ar-a)"/>
+  <path class="ln" d="M380 64 V114" marker-end="url(#ar)"/>
+  <path class="ln" d="M440 64 L630 114" marker-end="url(#ar)"/>
+
+  <!-- leaves -->
+  <text class="sm" x="36" y="200" text-anchor="middle">叶子 1</text>
+  <rect class="bx-a" x="14" y="208" width="116" height="34" rx="6"/>
+  <text class="mono" x="30" y="230" text-anchor="middle">1</text>
+  <text class="mono" x="58" y="230" text-anchor="middle">4</text>
+  <text class="mono on-a b" x="86" y="230" text-anchor="middle">5</text>
+  <text class="mono" x="114" y="230" text-anchor="middle">6</text>
+  <text class="sm" x="30" y="258" text-anchor="middle">tr1</text>
+  <text class="sm" x="58" y="258" text-anchor="middle">tr22</text>
+  <text class="sm on-a b" x="86" y="258" text-anchor="middle">tr31</text>
+  <text class="sm" x="114" y="258" text-anchor="middle">tr56</text>
+
+  <text class="sm" x="232" y="200" text-anchor="middle">叶子 2</text>
+  <rect class="bx" x="150" y="208" width="100" height="34" rx="6"/>
+  <text class="mono" x="170" y="230" text-anchor="middle">7</text>
+  <text class="mono" x="200" y="230" text-anchor="middle">9</text>
+  <text class="mono" x="230" y="230" text-anchor="middle">10</text>
+  <text class="sm" x="170" y="258" text-anchor="middle">tr5</text>
+  <text class="sm" x="200" y="258" text-anchor="middle">tr61</text>
+  <text class="sm" x="230" y="258" text-anchor="middle">tr78</text>
+
+  <text class="sm" x="348" y="200" text-anchor="middle">叶子 3</text>
+  <rect class="bx" x="280" y="208" width="80" height="34" rx="6"/>
+  <text class="mono" x="300" y="230" text-anchor="middle">11</text>
+  <text class="mono" x="340" y="230" text-anchor="middle">12</text>
+  <text class="sm" x="300" y="258" text-anchor="middle">tr15</text>
+  <text class="sm" x="340" y="258" text-anchor="middle">tr97</text>
+
+  <text class="ttl" x="470" y="230" text-anchor="middle">……</text>
+
+  <text class="sm" x="680" y="200" text-anchor="middle">叶子 N</text>
+  <rect class="bx" x="620" y="208" width="120" height="34" rx="6"/>
+  <text class="mono" x="645" y="230" text-anchor="middle">86</text>
+  <text class="mono" x="680" y="230" text-anchor="middle">88</text>
+  <text class="mono" x="718" y="230" text-anchor="middle">100</text>
+  <text class="sm" x="645" y="258" text-anchor="middle">tr3</text>
+  <text class="sm" x="680" y="258" text-anchor="middle">tr5</text>
+  <text class="sm" x="718" y="258" text-anchor="middle">tr33</text>
+
+  <path class="ln-a" d="M95 154 L72 206" marker-end="url(#ar-a)"/>
+  <path class="ln" d="M145 154 L195 206" marker-end="url(#ar)"/>
+  <path class="ln" d="M335 154 L320 206" marker-end="url(#ar)"/>
+
+  <path class="ln-d" d="M132 225 H148"/><path class="ln-d" d="M252 225 H278"/><path class="ln-d" d="M362 225 H440"/><path class="ln-d" d="M500 225 H618"/>
+  <text class="sm" x="560" y="216" text-anchor="middle">叶子之间按顺序链接</text>
+
+  <rect class="bx-d" x="14" y="282" width="726" height="40" rx="8"/>
+  <text class="sm" x="377" y="300" text-anchor="middle">查找 ID = 5：根节点（5 ≤ 10，走左边）→ 分支 1（5 ≤ 6，走左边）→ 叶子 1 找到 5，拿到表引用 tr31</text>
+  <text class="sm" x="377" y="316" text-anchor="middle">tr = table reference，指向表中真实行的“地址”。只用 3 次查找，而不是扫描 100 行</text>
+</svg>
+<figcaption>图 4-1　B-tree 索引示例，橙色是查找 ID = 5 的路径（对应原书图 4.1）</figcaption>
+</figure>
+
+<ul>
+  <li><strong>根节点</strong>指向分支节点，分支节点指向叶子节点，<strong>叶子节点</strong>里存着指向表中真实行的引用（tr）。</li>
+  <li>上层节点指向下层节点，表示下层节点里的条目都 <strong>≤</strong> 指针出发的那个条目。比如根节点的 10 指向分支 1（6 和 10），分支 1 的 6 指向叶子 1（1、4、5、6）。</li>
+  <li><strong>叶子节点之间按顺序链成链表</strong>，所以不用回到树顶就能顺序遍历 —— 这让范围查询和有序读取特别快。</li>
+</ul>
+
+<p>
+  在索引中搜索的复杂度是 <strong>O(log<sub>b</sub>N)</strong>，N 是条目数，b 是<strong>分支因子</strong>（每个分支节点平均有多少条目）。
+  分支因子为 10 时：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="表的大小从 100 行增长到 10 亿行，B-tree 查找次数只从 2 增长到 9">
+  <text class="ttl" x="20" y="22">表越来越大，B-tree 查找次数几乎不变（分支因子 b = 10）</text>
+  <text class="sm" x="160" y="58" text-anchor="end">100 行</text>
+  <rect class="fill-a" x="170" y="44" width="80" height="20" rx="3"/><text class="mono" x="258" y="59">2 次</text>
+  <text class="sm" x="160" y="92" text-anchor="end">1,000 行</text>
+  <rect class="fill-a" x="170" y="78" width="120" height="20" rx="3"/><text class="mono" x="298" y="93">3 次</text>
+  <text class="sm" x="160" y="126" text-anchor="end">1,000,000 行</text>
+  <rect class="fill-a" x="170" y="112" width="240" height="20" rx="3"/><text class="mono" x="418" y="127">6 次</text>
+  <text class="sm" x="160" y="160" text-anchor="end">10,000,000 行</text>
+  <rect class="fill-a" x="170" y="146" width="280" height="20" rx="3"/><text class="mono" x="458" y="161">7 次</text>
+  <text class="sm" x="160" y="194" text-anchor="end">1,000,000,000 行</text>
+  <rect class="fill-a" x="170" y="180" width="360" height="20" rx="3"/><text class="mono" x="538" y="195">9 次</text>
+
+  <rect class="bx-r" x="560" y="60" width="180" height="120" rx="10"/>
+  <text class="ttl on-r" x="650" y="86" text-anchor="middle">对比：全表扫描</text>
+  <text class="sm" x="650" y="110" text-anchor="middle">10 亿行</text>
+  <text class="sm" x="650" y="128" text-anchor="middle">最坏要看</text>
+  <text class="ttl on-r" x="650" y="154" text-anchor="middle">1,000,000,000 次</text>
+  <text class="sm" x="380" y="232" text-anchor="middle">真实的 B-tree 分支因子通常是几百甚至几千，需要的查找次数还要更少</text>
+</svg>
+<figcaption>图 4-2　O(log<sub>10</sub>N)：数据量涨了一千万倍，查找次数只多了 7 次（对应原书表 4.1）</figcaption>
+</figure>
+
+<p>这就是索引如此受欢迎的原因：从几行涨到几百万行，通过索引查找的性能几乎不变。</p>
+
+<h2 id="types">Postgres 的索引类型</h2>
+
+<p>
+  深入 Postgres 索引时，你会遇到一大堆术语：单列、复合、部分、函数，B-tree、HNSW……没有分类很容易乱。
+  把它们分成两大类就清楚了：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="索引的两种分类：索引什么（范围）和怎么索引（数据结构）">
+  <rect class="bx-b" x="20" y="20" width="350" height="200" rx="12"/>
+  <text class="ttl on-b" x="195" y="46" text-anchor="middle">按范围 / 用途：索引“什么”</text>
+  <text class="sm" x="195" y="66" text-anchor="middle">由你决定：索引哪些列、哪些行、是否套函数</text>
+  <rect class="bx" x="40" y="80" width="150" height="28" rx="6"/><text class="sm" x="115" y="99" text-anchor="middle">单列索引</text>
+  <rect class="bx" x="200" y="80" width="150" height="28" rx="6"/><text class="sm" x="275" y="99" text-anchor="middle">复合（多列）索引</text>
+  <rect class="bx" x="40" y="116" width="150" height="28" rx="6"/><text class="sm" x="115" y="135" text-anchor="middle">覆盖索引 INCLUDE</text>
+  <rect class="bx" x="200" y="116" width="150" height="28" rx="6"/><text class="sm" x="275" y="135" text-anchor="middle">部分索引 WHERE</text>
+  <rect class="bx" x="40" y="152" width="310" height="28" rx="6"/><text class="sm" x="195" y="171" text-anchor="middle">函数 / 表达式索引</text>
+  <text class="sm on-b" x="195" y="206" text-anchor="middle">本章全部讲解</text>
+
+  <rect class="bx-g" x="390" y="20" width="350" height="200" rx="12"/>
+  <text class="ttl on-g" x="565" y="46" text-anchor="middle">按数据结构 / 访问方法：“怎么”索引</text>
+  <text class="sm" x="565" y="66" text-anchor="middle">可选，默认 B-tree；用 USING 指定</text>
+  <rect class="bx-a" x="410" y="80" width="100" height="28" rx="6"/><text class="sm on-a b" x="460" y="99" text-anchor="middle">B-tree 默认</text>
+  <rect class="bx" x="516" y="80" width="100" height="28" rx="6"/><text class="sm" x="566" y="99" text-anchor="middle">Hash 第 4 章</text>
+  <rect class="bx" x="622" y="80" width="100" height="28" rx="6"/><text class="sm" x="672" y="99" text-anchor="middle">GIN 第 5/6 章</text>
+  <rect class="bx" x="410" y="116" width="100" height="28" rx="6"/><text class="sm" x="460" y="135" text-anchor="middle">GiST 第 6/10 章</text>
+  <rect class="bx" x="516" y="116" width="100" height="28" rx="6"/><text class="sm" x="566" y="135" text-anchor="middle">BRIN 第 9 章</text>
+  <rect class="bx" x="622" y="116" width="100" height="28" rx="6"/><text class="sm" x="672" y="135" text-anchor="middle">SP-GiST</text>
+  <rect class="bx" x="410" y="152" width="100" height="28" rx="6"/><text class="sm" x="460" y="171" text-anchor="middle">HNSW 第 8 章</text>
+  <rect class="bx" x="516" y="152" width="100" height="28" rx="6"/><text class="sm" x="566" y="171" text-anchor="middle">IVFFlat 第 8 章</text>
+  <rect class="bx" x="622" y="152" width="100" height="28" rx="6"/><text class="sm" x="672" y="171" text-anchor="middle">bloom · RUM</text>
+
+  <rect class="bx-d" x="20" y="232" width="720" height="30" rx="8"/>
+  <text class="mono" x="380" y="252" text-anchor="middle">CREATE INDEX 名字 ON 表 USING 怎么(索引什么);</text>
+</svg>
+<figcaption>图 4-3　每个 <code>CREATE INDEX</code> 都要回答两个问题：索引什么？怎么索引？</figcaption>
+</figure>
+
+<p>不写 <code>USING</code> 时默认 B-tree：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 在 tableA 的 columnA 上建单列索引，默认 B-tree
+CREATE INDEX new_index_name ON tableA(columnA);
+
+-- 指定用 GIN（通用倒排索引），常用于数组、JSON、全文搜索
+CREATE INDEX new_index_name ON tableA USING GIN (columnA);
+</pre></div>
+
+<h2 id="dataset">加载多人游戏数据集</h2>
+
+<p>数据集只有一张表，但足够我们把“索引什么”这一类全部讲完：</p>
+
+<div class="code" data-lang="sql" data-file="data/gaming/gaming_ddl.sql">
+<pre>
+CREATE TABLE game.player_stats (
+    player_id BIGINT PRIMARY KEY,              -- 玩家 ID
+    username TEXT NOT NULL UNIQUE,             -- 用户名
+    level INTEGER NOT NULL CHECK (level BETWEEN 1 AND 10),  -- 等级 1~10
+    score INTEGER DEFAULT 0,                   -- 生涯总积分，同等级内排名用
+    champion_title TEXT,                       -- 冠军头衔，只有极少数人有
+    join_date DATE NOT NULL,                   -- 注册日期
+    last_active TIMESTAMP,                     -- 最后活跃时间
+    region TEXT CHECK (region IN ('NA', 'EMEA', 'APAC')),   -- 地区
+    play_time INTERVAL DEFAULT '0 seconds',    -- 总游戏时长
+    win_count INTEGER DEFAULT 0,               -- 胜场
+    loss_count INTEGER DEFAULT 0               -- 负场
+);
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 地区缩写</div>
+  <p>NA = 北美，EMEA = 欧洲、中东和非洲，APAC = 亚太。<code>INTERVAL</code> 是表示“一段时长”的类型，比如 <code>'50 hours'</code>。</p>
+</div>
+
+<ol class="steps">
+  <li>克隆仓库（如果第 3 章已经克隆过就跳过）：
+    <div class="code" data-lang="bash"><pre>
+git clone https://github.com/dmagda/just-use-postgres-book
+</pre></div></li>
+  <li>复制数据并导入：
+    <div class="code" data-lang="bash"><pre>
+cd just-use-postgres-book/
+docker cp data/gaming/. postgres:/home/.
+
+docker exec -it postgres psql -U postgres -c "\i /home/gaming_ddl.sql"
+docker exec -it postgres psql -U postgres -c "\i /home/gaming_data.sql"
+</pre></div></li>
+  <li>确认表已创建：
+    <div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U postgres
+\dt game.*
+</pre></div>
+    <div class="code out"><pre>
+            List of relations
+ Schema |     Name     | Type  |  Owner
+--------+--------------+-------+----------
+ game   | player_stats | table | postgres
+(1 row)
+</pre></div></li>
+</ol>
+
+<h2 id="explain">学会使用 EXPLAIN</h2>
+
+<p>
+  有慢查询时，<strong>先用 <code>EXPLAIN</code></strong>，再决定要不要建索引。
+  它返回 Postgres 查询规划器为这条查询生成的<strong>执行计划</strong>，让你看清现在是怎么执行的、到底需不需要索引。
+</p>
+
+<p>比如统计胜场超过 100 的玩家数（结果是 8061）。在查询前加上 <code>EXPLAIN</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN
+SELECT count(*)
+FROM game.player_stats
+WHERE win_count > 100;
+</pre></div>
+<div class="code out"><pre>
+                              QUERY PLAN
+-----------------------------------------------------------------------
+ Aggregate (cost=282.18..282.19 rows=1 width=8)
+   -> Seq Scan on player_stats (cost=0.00..262.00 rows=8070 width=0)
+         Filter: (win_count > 100)
+(3 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="如何阅读执行计划：树形结构，从最里层往外执行">
+  <rect class="bx-a" x="20" y="20" width="330" height="56" rx="10"/>
+  <text class="mono on-a b" x="36" y="44">Aggregate</text>
+  <text class="sm" x="36" y="64">② 对下层送上来的行做 count(*)</text>
+  <path class="ln" d="M60 78 V100 H80"/>
+  <rect class="bx-b" x="80" y="88" width="330" height="76" rx="10"/>
+  <text class="mono on-b b" x="96" y="112">-&gt; Seq Scan on player_stats</text>
+  <text class="sm" x="96" y="132">① 先执行：逐行扫描整张表</text>
+  <text class="mono" x="96" y="152">Filter: (win_count &gt; 100)</text>
+
+  <path class="ln-d" d="M412 126 H460"/>
+  <rect class="bx" x="460" y="20" width="280" height="226" rx="10"/>
+  <text class="ttl" x="474" y="44">读计划的诀窍</text>
+  <text class="sm" x="474" y="68">• 计划是一棵树，<tspan class="b">缩进越深越先执行</tspan></text>
+  <text class="sm" x="474" y="90">• <tspan class="mono">-&gt;</tspan> 表示“子步骤”，结果往上送</text>
+  <text class="sm" x="474" y="112">• <tspan class="mono">cost=启动..总</tspan>：规划器估算的代价</text>
+  <text class="sm" x="474" y="134">• <tspan class="mono">rows</tspan>：估计返回多少行</text>
+  <text class="sm" x="474" y="156">• <tspan class="mono">Filter</tspan>：读出来之后再过滤</text>
+  <text class="sm" x="474" y="178">• <tspan class="mono">Index Cond</tspan>：在索引里就过滤</text>
+  <text class="sm" x="474" y="200">• <tspan class="mono">Rows Removed by Filter</tspan>：</text>
+  <text class="sm" x="474" y="218">  白读了多少行 —— 越大越浪费</text>
+
+  <text class="sm" x="20" y="200">这条计划说：没有索引可用，</text>
+  <text class="sm" x="20" y="218">只好把整张表读一遍，</text>
+  <text class="sm" x="20" y="236">边读边检查 win_count &gt; 100。</text>
+</svg>
+<figcaption>图 4-4　执行计划是一棵树：从最里层开始执行，结果逐层向上传递</figcaption>
+</figure>
+
+<p>
+  <code>Seq Scan</code> 表示对 player_stats 做了<strong>全表顺序扫描</strong>：访问每一行，检查 <code>win_count &gt; 100</code>。
+  原因很简单：<code>win_count</code> 列上还没有索引。
+</p>
+
+<h3>主键自带索引</h3>
+
+<p>再看另一个场景：每位玩家的个人面板要显示自己的积分和等级：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN
+SELECT username, level, score
+FROM game.player_stats
+WHERE player_id = 250;
+</pre></div>
+<div class="code out"><pre>
+                         QUERY PLAN
+--------------------------------------------------------------
+ Index Scan using player_stats_pkey on player_stats
+   (cost=0.29..8.30 rows=1 width=18)
+   Index Cond: (player_id = 250)
+(2 rows)
+</pre></div>
+
+<p>
+  假设监控显示过去半小时个人面板加载变慢了，我们先检查这条查询。计划里是 <code>Index Scan</code> —— 已经在用索引了。
+  这个 <code>player_stats_pkey</code> 是主键自动创建的索引：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.1 · 主键索引详情">
+<pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'game'
+  AND tablename = 'player_stats'
+  AND indexdef LIKE '%player_id%';
+</pre>
+</div>
+<div class="code out"><pre>
+     indexname     |                    indexdef
+-------------------+-------------------------------------------------
+ player_stats_pkey | CREATE UNIQUE INDEX player_stats_pkey
+                   | ON game.player_stats USING btree (player_id)
+(1 row)
+</pre></div>
+
+<h3>EXPLAIN ANALYZE：真的跑一遍</h3>
+
+<p><code>EXPLAIN</code> 只显示计划，<strong>并不真正执行</strong>。要看实际耗时，用 <code>EXPLAIN ANALYZE</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN ANALYZE
+SELECT username, level, score
+FROM game.player_stats
+WHERE player_id = 250;
+</pre></div>
+<div class="code out"><pre>
+                            QUERY PLAN
+-----------------------------------------------------------------
+ Index Scan using player_stats_pkey on player_stats
+   (cost=0.29..8.30 rows=1 width=18)
+   (actual time=0.046..0.049 rows=1 loops=1)
+   Index Cond: (player_id = 250)
+ Planning Time: 0.119 ms
+ Execution Time: 0.077 ms
+(4 rows)
+</pre></div>
+
+<ul>
+  <li><strong>Planning Time</strong>：规划器挑选最优计划花的时间。</li>
+  <li><strong>Execution Time</strong>：按选定计划执行花的时间。</li>
+  <li>查询总耗时 = 两者之和。</li>
+</ul>
+
+<div class="box tip">
+  <div class="t">&#128161; 多跑几次</div>
+  <p>用 <code>EXPLAIN ANALYZE</code> 执行几次，直到 Planning Time 和 Execution Time 稳定下来。头几次可能偏慢，因为数据还没进缓存，规划器也还没选定最优计划。</p>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; ANALYZE 会真的执行</div>
+  <p><code>EXPLAIN (analyze) UPDATE …</code> 不只是返回计划，还会<strong>真的修改数据</strong>！对写操作用 ANALYZE 时，可以包在 <code>BEGIN; … ROLLBACK;</code> 里。</p>
+</div>
+
+<h3>EXPLAIN 的选项：看看数据是否来自内存</h3>
+
+<p>EXPLAIN 支持在括号里传选项：<code>EXPLAIN ( option [, ...] ) statement</code>。查询变慢不一定是计划不好或缺索引，也可能是内存不够、频繁读磁盘。加上 <code>buffers on</code> 就能看到：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, buffers on)
+SELECT username, level, score
+FROM game.player_stats
+WHERE player_id = 250;
+</pre></div>
+<div class="code out"><pre>
+ Index Scan using player_stats_pkey on player_stats
+   (cost=0.29..8.30 rows=1 width=18)
+   (actual time=0.042..0.044 rows=1 loops=1)
+   Index Cond: (player_id = 250)
+   Buffers: shared hit=3
+ Planning Time: 0.119 ms
+ Execution Time: 0.076 ms
+</pre></div>
+
+<p>
+  <code>Buffers: shared hit=3</code>：Postgres 从<strong>共享缓冲区</strong>（预先分配、用来缓存表和索引数据的内存）读了 3 个<strong>页</strong>，完全没碰磁盘。
+  如果显示 <code>shared hit=3 read=4</code>，就是 3 页来自内存、4 页要从磁盘读。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 写法说明</div>
+  <ul>
+    <li><code>EXPLAIN ANALYZE</code> 是 <code>EXPLAIN (analyze)</code> 的简写，但简写不支持再加别的选项。</li>
+    <li>本书大多用 <code>EXPLAIN (analyze, costs off)</code>：去掉 cost 估算，输出更紧凑，适合放进书里。这并不是“最佳实践”，只是方便阅读。</li>
+    <li>更多选项见官方文档：<a href="https://www.postgresql.org/docs/current/sql-explain.html">sql-explain</a>。</li>
+  </ul>
+</div>
+
+<p>结论：这条查询已经走索引、数据都在内存里、耗时合理 —— 它不是面板变慢的元凶，得去应用栈的其他地方继续排查。<strong>EXPLAIN 帮我们排除了一个嫌疑。</strong></p>
+
+<h3>几种扫描方式一览</h3>
+
+<p>本章会反复遇到下面这几种访问方法，先建立直观印象：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="四种扫描方式对比：Seq Scan、Index Scan、Index Only Scan、Bitmap Scan">
+  <!-- Seq Scan -->
+  <text class="ttl on-r" x="20" y="22">Seq Scan 顺序扫描</text>
+  <rect class="bx" x="20" y="32" width="340" height="40" rx="6"/>
+  <g>
+    <rect class="cell-r" x="30" y="40" width="30" height="24"/><rect class="cell-r" x="62" y="40" width="30" height="24"/><rect class="cell-r" x="94" y="40" width="30" height="24"/><rect class="cell-r" x="126" y="40" width="30" height="24"/><rect class="cell-r" x="158" y="40" width="30" height="24"/><rect class="cell-r" x="190" y="40" width="30" height="24"/><rect class="cell-r" x="222" y="40" width="30" height="24"/><rect class="cell-r" x="254" y="40" width="30" height="24"/><rect class="cell-r" x="286" y="40" width="30" height="24"/><rect class="cell-r" x="318" y="40" width="30" height="24"/>
+  </g>
+  <text class="sm" x="20" y="90">表的每一页都读。没有可用索引，或要读的行很多时</text>
+
+  <!-- Index Scan -->
+  <text class="ttl on-b" x="400" y="22">Index Scan 索引扫描</text>
+  <rect class="bx-b" x="400" y="32" width="100" height="40" rx="6"/><text class="sm on-b" x="450" y="56" text-anchor="middle">索引</text>
+  <rect class="bx" x="530" y="32" width="210" height="40" rx="6"/>
+  <rect class="cell" x="540" y="40" width="30" height="24"/><rect class="cell-b" x="572" y="40" width="30" height="24"/><rect class="cell" x="604" y="40" width="30" height="24"/><rect class="cell" x="636" y="40" width="30" height="24"/><rect class="cell-b" x="668" y="40" width="30" height="24"/><rect class="cell" x="700" y="40" width="30" height="24"/>
+  <path class="ln-b" d="M502 46 Q540 20 584 38" marker-end="url(#ar-b)"/>
+  <path class="ln-b" d="M502 60 Q600 96 680 66" marker-end="url(#ar-b)"/>
+  <text class="sm" x="400" y="90">在索引里找到条目，再逐个回表取其他列</text>
+
+  <!-- Index Only Scan -->
+  <text class="ttl on-g" x="20" y="140">Index Only Scan 仅索引扫描</text>
+  <rect class="bx-g" x="20" y="150" width="140" height="40" rx="6"/><text class="sm on-g" x="90" y="174" text-anchor="middle">索引（数据齐全）</text>
+  <rect class="bx-d" x="190" y="150" width="170" height="40" rx="6"/><text class="sm" x="275" y="174" text-anchor="middle">表：完全不用碰</text>
+  <text class="sm" x="20" y="208">需要的列全在索引里 → <tspan class="mono">Heap Fetches: 0</tspan></text>
+
+  <!-- Bitmap -->
+  <text class="ttl on-p" x="400" y="140">Bitmap Index Scan + Bitmap Heap Scan</text>
+  <rect class="bx-p" x="400" y="150" width="90" height="40" rx="6"/><text class="sm on-p" x="445" y="174" text-anchor="middle">① 扫索引</text>
+  <path class="ln-p" d="M492 170 H514" marker-end="url(#ar-p)"/>
+  <rect class="bx-p" x="518" y="150" width="70" height="40" rx="6"/><text class="sm on-p" x="553" y="166" text-anchor="middle">位图</text><text class="mono" x="553" y="182" text-anchor="middle">0110…</text>
+  <path class="ln-p" d="M590 170 H612" marker-end="url(#ar-p)"/>
+  <rect class="bx" x="616" y="150" width="124" height="40" rx="6"/><text class="sm" x="678" y="166" text-anchor="middle">② 按页顺序</text><text class="sm" x="678" y="182" text-anchor="middle">批量回表</text>
+  <text class="sm" x="400" y="208">先攒齐“要读哪些行”，再一次性按物理顺序回表</text>
+
+  <rect class="bx-a" x="20" y="236" width="720" height="82" rx="10"/>
+  <text class="ttl on-a" x="36" y="260">规划器会自己挑</text>
+  <text class="sm" x="36" y="282">要的行很少 → Index Scan；要的列都在索引里 → Index Only Scan；</text>
+  <text class="sm" x="36" y="300">要的行中等偏多，或要合并多个条件 → Bitmap Scan；要的行占了表的一大半 → Seq Scan 反而最快。</text>
+</svg>
+<figcaption>图 4-5　执行计划里最常见的四种表访问方式</figcaption>
+</figure>
+
+<h2 id="single">单列索引</h2>
+
+<p>主键上的索引就是 Postgres 自动创建的<strong>单列索引</strong>。下面学习自己创建单列索引，并比较 B-tree 和哈希索引的区别。</p>
+
+<h3>单列 B-tree 索引</h3>
+
+<p>
+  目前游戏里有 10,000 名玩家。分支因子取 10，B-tree 找到某个玩家需要 log<sub>10</sub>10,000 = 4 次查找；
+  就算游戏爆火，玩家涨到一百万，也只需要 6 次。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么 B-tree 是默认类型</div>
+  <p>它支持的数据类型很广，而且既能做<strong>等值查找</strong>（<code>=</code>），也能做<strong>范围查询</strong>（<code>&gt;</code>、<code>&gt;=</code>、<code>&lt;</code>、<code>&lt;=</code>、<code>BETWEEN</code>），还能直接提供<strong>有序</strong>结果。</p>
+</div>
+
+<p>我们要做一个实时的<strong>积分排行榜</strong>。先看按积分过滤时 Postgres 怎么执行（积分在 5000~6000 之间的有 970 人）：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT count(*) FROM game.player_stats
+WHERE score BETWEEN 5000 AND 6000;
+</pre></div>
+<div class="code out"><pre>
+                                 QUERY PLAN
+----------------------------------------------------------------------------
+ Aggregate (actual time=1.702..1.703 rows=1 loops=1)
+   -> Seq Scan on player_stats (actual time=0.762..1.615 rows=970 loops=1)
+         Filter: ((score >= 5000) AND (score <= 6000))
+         Rows Removed by Filter: 9030
+ Planning Time: 0.246 ms
+ Execution Time: 1.753 ms
+</pre></div>
+
+<p>
+  全表扫描，检查了每一行，970 行符合，9030 行白读了。现在只有一万行，1 毫秒多一点，没什么问题；
+  但玩家越来越多，耗时会<strong>线性</strong>增长。在 score 上建索引：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX idx_score
+ON game.player_stats(score DESC);
+</pre></div>
+
+<p><code>idx_score</code> 是我们起的名字，<code>DESC</code> 让索引按积分从高到低排列。虽然没写，它默认就是 B-tree：</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.2 · 积分索引详情">
+<pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'game'
+  AND tablename = 'player_stats'
+  AND indexdef LIKE '%idx_score%';
+</pre>
+</div>
+<div class="code out"><pre>
+ indexname |                   indexdef
+-----------+----------------------------------------------
+ idx_score | CREATE INDEX idx_score ON game.player_stats
+           |    USING btree (score DESC)
+(1 row)
+</pre></div>
+
+<p>再看执行计划：</p>
+
+<div class="code out"><pre>
+                          QUERY PLAN
+--------------------------------------------------------------
+ Aggregate (actual time=0.303..0.303 rows=1 loops=1)
+   -> Index Only Scan using idx_score on player_stats
+        (actual time=0.078..0.198 rows=970 loops=1)
+         Index Cond: ((score >= 5000) AND (score <= 6000))
+         Heap Fetches: 0
+ Planning Time: 0.164 ms
+ Execution Time: 0.350 ms
+</pre></div>
+
+<p>
+  这次是 <strong>Index Only Scan</strong>：查询只需要计数，索引里已经有全部所需信息，根本不用访问表（<code>Heap Fetches: 0</code>，heap 指表本身）。
+  耗时从 1.75 ms 降到 0.35 ms，快了 5 倍。（你机器上的数字会不同，取决于数据量、资源和运行状况。）
+</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 建完索引后跑一下 ANALYZE</div>
+  <p>生产环境里，建完索引最好执行一次 <code>ANALYZE 表名;</code>。新索引建好后，规划器可能还在用旧的统计信息，不一定马上用上新索引。<code>ANALYZE</code> 会更新表的统计信息，让规划器充分利用新索引。</p>
+  <div class="code" data-lang="sql"><pre>
+CREATE INDEX on tableA(columnB);
+ANALYZE tableA;
+</pre></div>
+</div>
+
+<p>现在可以生成前五名排行榜了：</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.3 · 玩家排行榜">
+<pre>
+SELECT username, score, level
+FROM game.player_stats
+ORDER BY score DESC
+LIMIT 5;
+</pre>
+</div>
+<div class="code out"><pre>
+    username    | score | level
+----------------+-------+-------
+ kfowler        | 10000 |    10
+ tvillegas      | 10000 |    10
+ ashley18       | 10000 |    10
+ brookecampbell | 10000 |    10
+ harrisoscar    |  9999 |    10
+(5 rows)
+</pre></div>
+<div class="code out"><pre>
+ Limit (actual time=0.044..0.047 rows=5 loops=1)
+   -> Index Scan using idx_score on player_stats
+        (actual time=0.042..0.044 rows=5 loops=1)
+ Planning Time: 0.311 ms
+ Execution Time: 0.105 ms
+</pre></div>
+
+<p>
+  索引本身已经按积分降序排好，Postgres 沿着索引读出前 5 条就停，<strong>连排序都省了</strong>。
+  有意思的是规划时间（0.311 ms）比执行时间（0.105 ms）还长 —— 规划器需要时间评估可用索引和统计信息。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 索引也有写入成本</div>
+  <p>
+    索引也能加速修改数据：比如按 player_id 更新某人的积分，主键索引能帮你快速定位那一行。
+    但因为更新改了 score，Postgres 还要<strong>同时更新 idx_score 索引</strong>，这会让更新稍微变慢一点。
+  </p>
+</div>
+
+<h3>单列哈希索引</h3>
+
+<p>
+  哈希索引和编程语言里的哈希表（hash map）原理一样：对列值计算哈希，映射到某个<strong>桶（bucket）</strong>。
+  计算和查找都是 <strong>O(1)</strong> 常数时间 —— 表从几千行涨到几百万行，检查某个值是否存在的耗时基本不变。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="哈希索引：值经过哈希函数映射到桶，桶里存着表行引用">
+  <rect class="bx" x="20" y="40" width="170" height="40" rx="8"/><text class="mono" x="105" y="65" text-anchor="middle">'Naval Warlord'</text>
+  <rect class="bx" x="20" y="100" width="170" height="40" rx="8"/><text class="mono" x="105" y="125" text-anchor="middle">'Land Warlord'</text>
+  <rect class="bx" x="20" y="160" width="170" height="40" rx="8"/><text class="mono" x="105" y="185" text-anchor="middle">'Space Warlord'</text>
+
+  <rect class="bx-a" x="240" y="60" width="140" height="120" rx="12"/>
+  <text class="ttl on-a" x="310" y="112" text-anchor="middle">hash( )</text>
+  <text class="sm" x="310" y="134" text-anchor="middle">哈希函数</text>
+  <path class="ln" d="M192 60 L236 100" marker-end="url(#ar)"/>
+  <path class="ln" d="M192 120 H236" marker-end="url(#ar)"/>
+  <path class="ln" d="M192 180 L236 142" marker-end="url(#ar)"/>
+
+  <text class="ttl" x="430" y="30">桶</text>
+  <rect class="cell-h" x="430" y="40" width="60" height="32"/><text class="mono" x="460" y="61" text-anchor="middle">0</text>
+  <rect class="cell" x="490" y="40" width="160" height="32"/>
+  <rect class="cell-h" x="430" y="72" width="60" height="32"/><text class="mono" x="460" y="93" text-anchor="middle">1</text>
+  <rect class="cell-b" x="490" y="72" width="160" height="32"/><text class="sm" x="500" y="93">Naval → 行引用</text>
+  <rect class="cell-h" x="430" y="104" width="60" height="32"/><text class="mono" x="460" y="125" text-anchor="middle">2</text>
+  <rect class="cell-b" x="490" y="104" width="160" height="32"/><text class="sm" x="500" y="125">Land → 行引用</text>
+  <rect class="cell-h" x="430" y="136" width="60" height="32"/><text class="mono" x="460" y="157" text-anchor="middle">3</text>
+  <rect class="cell" x="490" y="136" width="160" height="32"/>
+  <rect class="cell-h" x="430" y="168" width="60" height="32"/><text class="mono" x="460" y="189" text-anchor="middle">4</text>
+  <rect class="cell-b" x="490" y="168" width="160" height="32"/><text class="sm" x="500" y="189">Space → 行引用</text>
+  <path class="ln-a" d="M382 100 L428 88" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M382 120 H428" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M382 140 L428 182" marker-end="url(#ar-a)"/>
+
+  <text class="sm on-g" x="670" y="80">✓ =</text>
+  <text class="sm on-g" x="670" y="98">✓ IN (…)</text>
+  <text class="sm on-r" x="670" y="130">✗ &gt; &lt; BETWEEN</text>
+  <text class="sm on-r" x="670" y="148">✗ ORDER BY</text>
+  <text class="sm on-r" x="670" y="166">✗ 多列</text>
+  <text class="sm" x="380" y="228" text-anchor="middle">哈希打乱了顺序，所以只能回答“等于谁”，回答不了“大于谁”</text>
+</svg>
+<figcaption>图 4-6　哈希索引：O(1) 的等值查找，但不支持范围和排序</figcaption>
+</figure>
+
+<p>哈希索引<strong>只支持单列</strong>，<strong>只能用于等值（<code>=</code>）比较</strong>。范围查询用不了，得用 B-tree。</p>
+
+<p>游戏里有五个可转让的冠军头衔：Airforce Warlord、Naval Warlord、Land Warlord、Cyber Warlord、Space Warlord。几千名玩家里只有五人持有头衔。找 Naval Warlord 是谁：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT username, score, level
+FROM game.player_stats
+WHERE champion_title = 'Naval Warlord';
+</pre></div>
+<div class="code out"><pre>
+                             QUERY PLAN
+--------------------------------------------------------------------
+ Seq Scan on player_stats (actual time=0.064..1.429 rows=1 loops=1)
+   Filter: (champion_title = 'Naval Warlord'::text)
+   Rows Removed by Filter: 9999
+ Planning Time: 0.154 ms
+ Execution Time: 1.463 ms
+</pre></div>
+
+<p>
+  为了找一行，扫了全表、过滤掉 9999 行（这一列没有 UNIQUE 约束，所以也没有自动创建的 B-tree）。
+  冠军很少，而且只用 <code>=</code> 和 <code>IN</code> 查找 —— 哈希索引正合适：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.4 · 创建哈希索引">
+<pre>
+CREATE INDEX idx_champion_title
+ON game.player_stats
+USING hash(champion_title);
+</pre>
+</div>
+<div class="code out"><pre>
+ Index Scan using idx_champion_title on player_stats
+   (actual time=0.037..0.038 rows=1 loops=1)
+   Index Cond: (champion_title = 'Naval Warlord'::text)
+ Planning Time: 0.151 ms
+ Execution Time: 0.073 ms
+</pre></div>
+
+<p>用 <code>IN</code> 一次查出全部五位冠军，也能用上这个索引：</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.5 · 查出所有冠军">
+<pre>
+SELECT username, champion_title, score, level
+FROM game.player_stats
+WHERE champion_title IN (
+  'Airforce Warlord', 'Naval Warlord',
+  'Land Warlord', 'Cyber Warlord',
+  'Space Warlord');
+</pre>
+</div>
+<div class="code out"><pre>
+   username   |  champion_title  | score | level
+--------------+------------------+-------+-------
+ gregoryscott | Land Warlord     |  9790 |    10
+ rcastillo    | Space Warlord    |  9772 |    10
+ kenneth50    | Naval Warlord    |  9739 |    10
+ bpope        | Cyber Warlord    |  9684 |    10
+ ldorsey      | Airforce Warlord |  9309 |    10
+(5 rows)
+</pre></div>
+<div class="code out"><pre>
+ Bitmap Heap Scan on player_stats (actual time=0.068..0.082 rows=5 loops=1)
+   Recheck Cond: (champion_title = ANY ('{"Airforce Warlord",...}'::text[]))
+   Heap Blocks: exact=4
+   -> Bitmap Index Scan on idx_champion_title
+        (actual time=0.047..0.047 rows=5 loops=1)
+         Index Cond: (champion_title = ANY ('{"Airforce Warlord",...}'::text[]))
+ Planning Time: 0.242 ms
+ Execution Time: 0.166 ms
+</pre></div>
+
+<h4>位图扫描（bitmap scan）是怎么回事</h4>
+
+<p>这次用的是<strong>位图索引扫描</strong>，它总是分两个阶段：</p>
+
+<ol>
+  <li><strong>Bitmap Index Scan</strong>：在索引里找出所有匹配的条目。每找到一个，<em>不</em>立刻回表取数据，而是在一个<strong>位图</strong>结构里标记“这一行待会儿要读”—— 相当于为“批量读取”做准备。</li>
+  <li><strong>Bitmap Heap Scan</strong>：拿着位图访问表，只读取被标记的行。表只被访问一次，而不是每找到一个索引条目就回表一次。</li>
+</ol>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="位图里的 exact 与 lossy 信息">
+  <text class="ttl" x="20" y="22">表的数据页（每页存很多行）</text>
+  <rect class="bx" x="20" y="34" width="160" height="90" rx="6"/><text class="sm" x="30" y="52">页 1</text>
+  <rect class="cell" x="30" y="60" width="140" height="18"/><rect class="cell-g" x="30" y="78" width="140" height="18"/><rect class="cell" x="30" y="96" width="140" height="18"/>
+  <rect class="bx" x="200" y="34" width="160" height="90" rx="6"/><text class="sm" x="210" y="52">页 2</text>
+  <rect class="cell-g" x="210" y="60" width="140" height="18"/><rect class="cell" x="210" y="78" width="140" height="18"/><rect class="cell-g" x="210" y="96" width="140" height="18"/>
+  <rect class="bx" x="380" y="34" width="160" height="90" rx="6"/><text class="sm" x="390" y="52">页 3</text>
+  <rect class="cell-a" x="390" y="60" width="140" height="18"/><rect class="cell-a" x="390" y="78" width="140" height="18"/><rect class="cell-a" x="390" y="96" width="140" height="18"/>
+  <rect class="bx" x="560" y="34" width="180" height="90" rx="6"/><text class="sm" x="570" y="52">页 4</text>
+  <rect class="cell" x="570" y="60" width="160" height="18"/><rect class="cell" x="570" y="78" width="160" height="18"/><rect class="cell" x="570" y="96" width="160" height="18"/>
+
+  <rect class="bx-g" x="20" y="146" width="340" height="94" rx="10"/>
+  <text class="ttl on-g" x="36" y="170">exact（精确）</text>
+  <text class="sm" x="36" y="192">位图记的是“哪一页的哪几行”。</text>
+  <text class="sm" x="36" y="210">页 1、2 只读绿色行。</text>
+  <text class="mono" x="36" y="230">Heap Blocks: exact=X</text>
+
+  <rect class="bx-a" x="380" y="146" width="360" height="94" rx="10"/>
+  <text class="ttl on-a" x="396" y="170">lossy（有损）</text>
+  <text class="sm" x="396" y="192">匹配太多、位图太占内存时，只记“哪一页”。</text>
+  <text class="sm" x="396" y="210">页 3 的每一行都要重新检查条件（Recheck Cond）。</text>
+  <text class="mono" x="396" y="230">Heap Blocks: lossy=Y</text>
+</svg>
+<figcaption>图 4-7　位图可以精确到行，也可以退化到只记页；两者可能同时出现：<code>exact=X, lossy=Y</code></figcaption>
+</figure>
+
+<div class="box deep">
+  <div class="t">&#9670; 位图中的 exact 与 lossy</div>
+  <p>
+    如果匹配的行很多、位图开始吃内存，Postgres 就改为只记录整页的位置，位图变成<strong>有损的（lossy）</strong>。
+    有些索引类型（比如第 9 章的 BRIN）本来就只记录页。对有损的页，Bitmap Heap Scan 阶段要重新检查页内每一行。
+    上例中 <code>Heap Blocks: exact=4</code> 表示访问了 4 页，而且准确知道每页要取哪几行。
+  </p>
+</div>
+
+<h2 id="composite">复合索引</h2>
+
+<p>
+  <strong>复合索引</strong>（也叫多列索引）建在多个列上。目前 Postgres 支持用 B-tree、GIN、GiST、BRIN 或 bloom 来建复合索引。
+  原理很直接：对于 <code>(region, score)</code> 上的索引，先按 region 排序，同一 region 内再按 score 排序。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 前导列</div>
+  <p>
+    第一列叫<strong>前导列（leading column）</strong>，查询里必须用到它，Postgres 才会考虑这个索引。
+    如果 <code>WHERE</code> 里只有 score 没有 region，这个索引通常用不上 —— 因为它首先是按 region 排的。
+    就像电话簿先按姓、再按名排序：知道姓好查，只知道名就只能从头翻。
+  </p>
+</div>
+
+<p>有两条查询在游戏里执行得非常频繁，都需要索引。同时我们也希望索引尽量少，因为每个索引都需要维护：</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.6 · 每个地区的头号玩家">
+<pre>
+SELECT DISTINCT ON (region)
+username, region, score, win_count
+FROM game.player_stats
+ORDER BY region, score DESC, win_count DESC;
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; DISTINCT ON</div>
+  <p><code>DISTINCT ON (region)</code> 是 Postgres 特有的写法：对每个不同的 region，只返回按 <code>ORDER BY</code> 排序后的<strong>第一行</strong>。这里就是每个地区积分最高（积分相同时胜场最多）的玩家。</p>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 4.7 · 某地区积分和胜场满足条件的玩家">
+<pre>
+SELECT username, region, score, win_count
+FROM game.player_stats
+WHERE region = 'NA' and score > 5000 and win_count > 10
+ORDER BY score DESC, win_count DESC;
+</pre>
+</div>
+
+<h3>先试试再加一个单列索引</h3>
+
+<p>清单 4.7 的执行计划：</p>
+
+<div class="code out"><pre>
+ Incremental Sort (actual time=0.186..2.107 rows=1580 loops=1)
+   Sort Key: score DESC, win_count DESC
+   Presorted Key: score
+   -> Index Scan using idx_score on player_stats
+        (actual time=0.066..1.575 rows=1580 loops=1)
+         Index Cond: (score > 5000)
+         Filter: ((win_count > 10) AND (region = 'NA'::text))
+         Rows Removed by Filter: 3361
+ Planning Time: 0.203 ms
+ Execution Time: 2.220 ms
+</pre></div>
+
+<p>
+  它用了之前建的 idx_score：先在索引里找出 score &gt; 5000 的行，再过滤掉 3361 行，最后排序。尽管多了过滤和排序，还是比扫一万行划算。
+  但如果把条件改成 <code>score &gt; 1000</code>：
+</p>
+
+<div class="code out"><pre>
+ Sort (actual time=2.905..3.066 rows=2916 loops=1)
+   Sort Key: score DESC, win_count DESC
+   -> Seq Scan on player_stats (actual time=0.028..2.031 rows=2916 loops=1)
+         Filter: ((score > 1000) AND (win_count > 10) AND (region = 'NA'::text))
+         Rows Removed by Filter: 7084
+ Planning Time: 0.234 ms
+ Execution Time: 3.210 ms
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 有索引 ≠ 一定用索引</div>
+  <p>
+    积分超过 1000 的玩家太多了，用索引会返回大量记录再逐个回表，规划器判断这还不如直接全表扫描。
+    <strong>索引在“只需要表中一小部分数据”时最有效。</strong>
+  </p>
+</div>
+
+<p>可以再给 region 建一个单列索引：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX idx_region ON game.player_stats (region);
+</pre></div>
+<div class="code out"><pre>
+ Sort (actual time=1.880..1.995 rows=2916 loops=1)
+   Sort Key: score DESC, win_count DESC
+   -> Bitmap Heap Scan on player_stats (actual time=0.128..1.388 rows=2916 loops=1)
+         Recheck Cond: (region = 'NA'::text)
+         Filter: ((score > 1000) AND (win_count > 10))
+         Rows Removed by Filter: 391
+         Heap Blocks: exact=137
+         -> Bitmap Index Scan on idx_region (actual time=0.098..0.098 rows=3307 loops=1)
+               Index Cond: (region = 'NA'::text)
+ Execution Time: 2.112 ms
+</pre></div>
+
+<p>比全表扫描快了。但清单 4.6（每个地区的头号玩家）还是用不上任何现有的单列索引：</p>
+
+<div class="code out"><pre>
+ Unique (actual time=13.148..14.314 rows=3 loops=1)
+   -> Sort (actual time=13.145..13.591 rows=10000 loops=1)
+         Sort Key: region, score DESC, win_count DESC
+         Sort Method: quicksort Memory: 881kB
+         -> Seq Scan on player_stats (actual time=0.065..1.969 rows=10000 loops=1)
+ Planning Time: 0.183 ms
+ Execution Time: 14.357 ms
+</pre></div>
+
+<p>为了最后找出 3 个人，读了全部 10,000 行再排序。与其为每个查询各建一个单列索引，不如建一个复合索引同时服务两条查询。先删掉 idx_region：</p>
+
+<div class="code" data-lang="sql"><pre>
+DROP INDEX game.idx_region;
+</pre></div>
+
+<h3>创建复合索引</h3>
+
+<div class="code" data-lang="sql" data-file="清单 4.8 · 创建复合索引">
+<pre>
+CREATE INDEX idx_region_score_win_count
+ON game.player_stats (region, score DESC, win_count DESC);
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="复合索引的排序方式：先按 region，再按 score 降序，再按 win_count 降序">
+  <text class="ttl" x="20" y="22">索引内部的排列顺序：(region, score DESC, win_count DESC)</text>
+  <rect class="cell-h" x="20" y="34" width="360" height="24"/>
+  <text class="sm b" x="30" y="51">region ①</text><text class="sm b" x="140" y="51">score ② ↓</text><text class="sm b" x="260" y="51">win_count ③ ↓</text>
+  <rect class="cell-b" x="20" y="58" width="360" height="24"/><text class="mono" x="30" y="75">APAC</text><text class="mono" x="140" y="75">10000</text><text class="mono" x="260" y="75">482</text>
+  <rect class="cell-b" x="20" y="82" width="360" height="24"/><text class="mono" x="30" y="99">APAC</text><text class="mono" x="140" y="99">10000</text><text class="mono" x="260" y="99">294</text>
+  <rect class="cell-b" x="20" y="106" width="360" height="24"/><text class="mono" x="30" y="123">APAC</text><text class="mono" x="140" y="123">9998</text><text class="mono" x="260" y="123">…</text>
+  <rect class="cell-g" x="20" y="130" width="360" height="24"/><text class="mono" x="30" y="147">EMEA</text><text class="mono" x="140" y="147">9999</text><text class="mono" x="260" y="147">438</text>
+  <rect class="cell-g" x="20" y="154" width="360" height="24"/><text class="mono" x="30" y="171">EMEA</text><text class="mono" x="140" y="171">…</text><text class="mono" x="260" y="171">…</text>
+  <rect class="cell-p" x="20" y="178" width="360" height="24"/><text class="mono" x="30" y="195">NA</text><text class="mono" x="140" y="195">10000</text><text class="mono" x="260" y="195">500</text>
+  <rect class="cell-p" x="20" y="202" width="360" height="24"/><text class="mono" x="30" y="219">NA</text><text class="mono" x="140" y="219">10000</text><text class="mono" x="260" y="219">186</text>
+  <rect class="cell-p" x="20" y="226" width="360" height="24"/><text class="mono" x="30" y="243">NA</text><text class="mono" x="140" y="243">…</text><text class="mono" x="260" y="243">…</text>
+
+  <path class="ln-a" d="M384 70 H420" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M384 142 H420" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M384 190 H420" marker-end="url(#ar-a)"/>
+  <rect class="bx-a" x="424" y="54" width="316" height="150" rx="10"/>
+  <text class="ttl on-a" x="440" y="78">DISTINCT ON (region) 直接受益</text>
+  <text class="sm" x="440" y="102">每个地区的第一条就是头号玩家，</text>
+  <text class="sm" x="440" y="120">顺着索引读，每组取第一行即可，</text>
+  <text class="sm" x="440" y="138">不需要额外的排序步骤。</text>
+  <text class="sm" x="440" y="166">WHERE region='NA' AND score&gt;… 也能用：</text>
+  <text class="sm" x="440" y="184">直接跳到紫色那一段，再按积分往下找。</text>
+
+  <text class="sm" x="20" y="280">先排①；①相同再排②；①②都相同再排③。所以“只给②③不给①”就没法利用这个顺序。</text>
+</svg>
+<figcaption>图 4-8　复合索引像多级排序后的列表</figcaption>
+</figure>
+
+<p>它同样默认用 B-tree（可以用 <code>pg_indexes</code> 确认：<code>USING btree (region, score DESC, win_count DESC)</code>）。再看两条查询的执行计划。清单 4.7（score &gt; 1000 版本）：</p>
+
+<div class="code out"><pre>
+ Sort (actual time=2.517..2.682 rows=2916 loops=1)
+   Sort Key: score DESC, win_count DESC
+   -> Bitmap Heap Scan on player_stats (actual time=0.472..1.812 rows=2916 loops=1)
+         Recheck Cond: ((region = 'NA'::text) AND (score > 1000) AND (win_count > 10))
+         Heap Blocks: exact=124
+         -> Bitmap Index Scan on idx_region_score_win_count
+              (actual time=0.434..0.434 rows=2916 loops=1)
+               Index Cond: ((region = 'NA'::text) AND (score > 1000) AND (win_count > 10))
+ Execution Time: 2.844 ms
+</pre></div>
+
+<p>和单列 region 索引一样高效。而对清单 4.6 的效果就显著多了：</p>
+
+<div class="code out"><pre>
+ Result (actual time=0.038..3.994 rows=3 loops=1)
+   -> Unique (actual time=0.034..3.984 rows=3 loops=1)
+         -> Index Scan using idx_region_score_win_count on player_stats
+              (actual time=0.032..2.698 rows=10000 loops=1)
+ Planning Time: 0.147 ms
+ Execution Time: 4.038 ms
+</pre></div>
+
+<p>没有 Sort 步骤了 —— 索引里 score 和 win_count 已经按降序排好。<strong>一个复合索引，同时优化了两条查询。</strong></p>
+
+<h3>复合索引的注意事项</h3>
+
+<p><strong>坑一：列的顺序决定了 ORDER BY 的写法。</strong>现在每个地区的排行是先比积分、再比胜场。如果改成先比胜场、再比积分：</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.9 · 按胜场和积分找出各地区头号玩家">
+<pre>
+SELECT DISTINCT ON (region)
+username, region, score, win_count
+FROM game.player_stats
+ORDER BY region, win_count DESC, score DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+ username  | region | score | win_count
+-----------+--------+-------+-----------
+ foxdavid  | APAC   |  9694 |       500
+ rcastillo | EMEA   |  9772 |       500
+ kfowler   | NA     | 10000 |       500
+(3 rows)
+</pre></div>
+<div class="code out"><pre>
+ Unique (actual time=17.596..19.245 rows=3 loops=1)
+   -> Sort (actual time=17.593..18.300 rows=10000 loops=1)
+         Sort Key: region, win_count DESC, score DESC
+         -> Seq Scan on player_stats (actual time=0.025..2.282 rows=10000 loops=1)
+ Execution Time: 19.287 ms
+</pre></div>
+
+<p>结果变了是意料之中的；意料之外的是 Postgres <strong>用不上复合索引了</strong>：排序顺序 <code>region, win_count, score</code> 和索引定义 <code>region, score, win_count</code> 不一致。</p>
+
+<p><strong>坑二：只用了部分列时。</strong>用复合索引里的一部分列过滤，能不能用上索引？</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="复合索引 (region, score, win_count) 在不同查询条件下能否被使用">
+  <text class="ttl" x="20" y="22">索引 (region, score DESC, win_count DESC)，以下查询能用吗？</text>
+  <rect class="cell-h" x="20" y="34" width="720" height="26"/>
+  <text class="sm b" x="30" y="52">WHERE 条件</text><text class="sm b" x="330" y="52">region</text><text class="sm b" x="400" y="52">score</text><text class="sm b" x="470" y="52">win_count</text><text class="sm b" x="560" y="52">结果</text>
+
+  <rect class="cell" x="20" y="60" width="720" height="34"/>
+  <text class="mono" x="30" y="82">region = 'EMEA'</text>
+  <circle class="dot-g" cx="350" cy="77" r="6"/><circle class="dot" cx="420" cy="77" r="3"/><circle class="dot" cx="495" cy="77" r="3"/>
+  <text class="sm on-g" x="560" y="82">✓ Index Only Scan</text>
+
+  <rect class="cell" x="20" y="94" width="720" height="34"/>
+  <text class="mono" x="30" y="116">region = 'EMEA' AND score &gt; 1000</text>
+  <circle class="dot-g" cx="350" cy="111" r="6"/><circle class="dot-g" cx="420" cy="111" r="6"/><circle class="dot" cx="495" cy="111" r="3"/>
+  <text class="sm on-g" x="560" y="116">✓ Index Only Scan</text>
+
+  <rect class="cell" x="20" y="128" width="720" height="34"/>
+  <text class="mono" x="30" y="150">region = 'EMEA' AND win_count &gt; 30</text>
+  <circle class="dot-g" cx="350" cy="145" r="6"/><circle class="dot" cx="420" cy="145" r="3"/><circle class="dot-g" cx="495" cy="145" r="6"/>
+  <text class="sm on-a" x="560" y="150">✓ 用了（跳过了 score）</text>
+
+  <rect class="cell-r" x="20" y="162" width="720" height="34"/>
+  <text class="mono" x="30" y="184">score &gt; 1000 AND win_count &gt; 30</text>
+  <circle class="dot" cx="350" cy="179" r="3"/><circle class="dot-g" cx="420" cy="179" r="6"/><circle class="dot-g" cx="495" cy="179" r="6"/>
+  <text class="sm on-r" x="560" y="184">✗ Seq Scan（缺前导列）</text>
+
+  <text class="sm" x="20" y="222">“跳过中间列”这种情况能否用上索引，取决于具体数据和版本，不要依赖。</text>
+  <text class="sm" x="20" y="240">Postgres 18 起，B-tree 复合索引支持 skip scan（跳跃扫描），缺少前导列时也有更多机会用上索引。</text>
+</svg>
+<figcaption>图 4-9　复合索引的“最左前缀”规律：前导列是钥匙</figcaption>
+</figure>
+
+<div class="code" data-lang="sql"><pre>
+-- ✓ 只用前导列：Index Only Scan，Index Cond: (region = 'EMEA')
+SELECT count(*) FROM game.player_stats WHERE region = 'EMEA';
+
+-- ✓ 前两列：Index Only Scan，Index Cond: (region = 'EMEA' AND score > 1000)
+SELECT count(*) FROM game.player_stats WHERE region = 'EMEA' and score > 1000;
+
+-- ✗ 缺前导列 region：Seq Scan
+SELECT count(*) FROM game.player_stats WHERE score > 1000 and win_count > 30;
+
+-- ✓ 第一列 + 第三列（跳过 score）：仍然用了 Index Only Scan
+SELECT count(*) FROM game.player_stats WHERE region = 'EMEA' and win_count > 30;
+</pre></div>
+
+<p>
+  最后一种情况能用上，是因为 Postgres 可以先快速定位 region = EMEA 的那一段索引，再在这段里找满足 win_count &gt; 30 的条目，仍比全表扫描划算。
+  但这不适用于所有复合索引：一般来说，如果查询跳过了前导列或中间列，在 Postgres 17 及更早版本里用上索引的几率会降低。
+  <strong>Postgres 18 起支持 B-tree 复合索引的 skip scan</strong>，跳过前导列也能在更多场景下用索引。
+</p>
+
+<h2 id="covering">覆盖索引</h2>
+
+<p>
+  <strong>覆盖索引（covering index）</strong>额外存储表里的一些列，让数据库能<strong>直接从索引取值、不用回表</strong>。额外的列用 <code>INCLUDE</code> 添加：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX index_name ON table_name(columnA)
+INCLUDE(columnB, columnC [, additional_columns]);
+</pre></div>
+
+<p>
+  索引按 columnA 构建和排序；columnB、columnC <strong>不参与排序</strong>，只是“顺便存着”。
+  比如 <code>SELECT columnB FROM table_name WHERE columnA &gt; 50 ORDER BY columnC;</code> 就完全不需要访问表。
+  代价是：这些列被修改时，Postgres 也要更新索引，写入会变慢一些。
+</p>
+
+<p>回到游戏。清单 4.7（score &gt; 5000 版本）现在的计划是：</p>
+
+<div class="code out"><pre>
+ Sort (actual time=1.574..1.662 rows=1580 loops=1)
+   Sort Key: score DESC, win_count DESC
+   -> Bitmap Heap Scan on player_stats (actual time=0.249..1.005 rows=1580 loops=1)
+         Recheck Cond: ((region = 'NA'::text) AND (score > 5000) AND (win_count > 10))
+         Heap Blocks: exact=68
+         -> Bitmap Index Scan on idx_region_score_win_count
+              (actual time=0.225..0.225 rows=1580 loops=1)
+ Execution Time: 1.856 ms
+</pre></div>
+
+<p>
+  它还要访问表里的 68 个页（<code>Heap Blocks: exact=68</code>），原因只有一个：查询要返回 <code>username</code>，而它不在索引里。
+  这是一条执行非常频繁的“热”查询，值得进一步优化。先删掉旧的复合索引，避免两个相似的索引并存，再建一个带上 username 的覆盖索引：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.10 · 创建覆盖索引">
+<pre>
+DROP INDEX game.idx_region_score_win_count;
+
+CREATE INDEX idx_composite_covering_index
+ON game.player_stats (region, score DESC, win_count DESC)
+INCLUDE (username);
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="覆盖索引在叶子节点额外存储 username，查询无需回表">
+  <text class="ttl" x="190" y="22" text-anchor="middle">普通复合索引</text>
+  <rect class="bx-b" x="20" y="34" width="340" height="60" rx="10"/>
+  <text class="sm on-b b" x="36" y="56">叶子条目：(region, score, win_count) → 行引用</text>
+  <text class="sm" x="36" y="78">username 不在这里</text>
+  <path class="ln-r" d="M190 96 V128" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="200" y="116">要 username，只能回表</text>
+  <rect class="bx-r" x="20" y="132" width="340" height="50" rx="10"/>
+  <text class="sm" x="190" y="162" text-anchor="middle">表：访问 68 个页（Bitmap Heap Scan）</text>
+  <text class="mono" x="190" y="210" text-anchor="middle">1.86 ms</text>
+
+  <text class="ttl on-g" x="570" y="22" text-anchor="middle">覆盖索引 INCLUDE (username)</text>
+  <rect class="bx-g" x="400" y="34" width="340" height="60" rx="10"/>
+  <text class="sm on-g b" x="416" y="56">叶子条目：(region, score, win_count)</text>
+  <text class="sm on-g b" x="416" y="78">　　　　 + username → 行引用</text>
+  <path class="ln-d" d="M570 96 V128"/>
+  <rect class="bx-d" x="400" y="132" width="340" height="50" rx="10"/>
+  <text class="sm" x="570" y="162" text-anchor="middle">表：完全不用访问（Heap Fetches: 0）</text>
+  <text class="mono on-g" x="570" y="210" text-anchor="middle">0.60 ms · 快 3 倍</text>
+</svg>
+<figcaption>图 4-10　覆盖索引把查询需要的列“顺带”存进索引，换来 Index Only Scan</figcaption>
+</figure>
+
+<div class="code out"><pre>
+ Index Only Scan using idx_composite_covering_index on player_stats
+   (actual time=0.076..0.497 rows=1580 loops=1)
+   Index Cond: ((region = 'NA'::text) AND (score > 5000) AND (win_count > 10))
+   Heap Fetches: 0
+ Planning Time: 0.320 ms
+ Execution Time: 0.602 ms
+</pre></div>
+
+<p>
+  这次是 Index Only Scan，完全不访问表。0.6 ms，比之前的 1.8 ms 快了 3 倍。
+  而且玩家很少改用户名，把 username 放进覆盖索引对写入的影响微乎其微。
+</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 什么列适合 INCLUDE</div>
+  <p>适合：查询经常要返回、但<strong>很少被修改</strong>、不需要参与过滤或排序的列。不适合：频繁更新的列、很大的列（会让索引膨胀）。</p>
+</div>
+
+<h2 id="partial">部分索引</h2>
+
+<p>
+  <strong>部分索引（partial index）</strong>，也叫过滤索引，只为表中<strong>满足某个条件的子集</strong>建立索引。条件写在 <code>WHERE</code> 里，可以很简单也可以涉及多列：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX partial_index_name ON table_name(columnA) WHERE condition;
+</pre></div>
+
+<p>
+  它适合“表很大，但应用总是只查其中一小块”的场景。好处是索引<strong>更小</strong>，表更新也<strong>更快</strong>（不满足条件的行变动时，不用维护索引），更省内存和磁盘。
+</p>
+
+<p>
+  游戏想追踪新手和休闲玩家（总游戏时长不超过 50 小时的人）并给他们发奖励，研究他们为什么流失。一万名玩家里只有 74 位休闲玩家，不到 1%：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*) FROM game.player_stats WHERE play_time <= '50 hours';
+-- 74
+</pre></div>
+
+<div class="code" data-lang="sql" data-file="清单 4.11 · 查询休闲玩家">
+<pre>
+SELECT username, play_time, score, last_active
+FROM game.player_stats
+WHERE play_time <= '50 hours'
+ORDER BY play_time;
+</pre>
+</div>
+<div class="code out"><pre>
+    username     | play_time | score |        last_active
+-----------------+-----------+-------+----------------------------
+ justinrodriguez | 04:00:00  |    34 | 2025-07-07 03:29:23.05813
+ clifford28      | 04:00:00  |    16 | 2023-06-17 03:29:22.068583
+ robinsonanne    | 05:00:00  |    57 | 2024-03-20 03:29:22.274161
+ pattonkristen   | 07:00:00  |    25 | 2025-03-08 03:29:21.133161
+ elizabethrhodes | 08:00:00  |    76 | 2025-05-08 03:29:22.559829
+</pre></div>
+<div class="code out"><pre>
+ Sort (actual time=2.125..2.129 rows=74 loops=1)
+   Sort Key: play_time
+   -> Seq Scan on player_stats (actual time=2.015..2.085 rows=74 loops=1)
+         Filter: (play_time <= '50:00:00'::interval)
+         Rows Removed by Filter: 9926
+ Execution Time: 2.168 ms
+</pre></div>
+
+<p>全表扫描 + 排序。耗时现在还能接受，但会随玩家数线性增长。建一个只覆盖休闲玩家的部分索引：</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.12 · 创建部分索引">
+<pre>
+CREATE INDEX idx_occasional_players
+ON game.player_stats (play_time)
+WHERE play_time <= '50 hours';
+</pre>
+</div>
+<div class="code out"><pre>
+ Index Scan using idx_occasional_players on player_stats
+   (actual time=0.036..0.128 rows=74 loops=1)
+ Planning Time: 0.334 ms
+ Execution Time: 0.168 ms
+</pre></div>
+
+<p>从 2 ms 降到 0.1 ms 左右，<strong>快了 20 倍</strong>；而且这个索引只有 74 个条目，比给整张表建 play_time 索引小得多。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="部分索引只为满足条件的行建立条目">
+  <text class="ttl" x="20" y="22">player_stats：10,000 行</text>
+  <rect class="bx" x="20" y="34" width="460" height="120" rx="10"/>
+  <g>
+    <rect class="cell" x="34" y="48" width="430" height="14"/>
+    <rect class="cell-a" x="34" y="62" width="430" height="14"/>
+    <rect class="cell" x="34" y="76" width="430" height="14"/>
+    <rect class="cell" x="34" y="90" width="430" height="14"/>
+    <rect class="cell-a" x="34" y="104" width="430" height="14"/>
+    <rect class="cell" x="34" y="118" width="430" height="14"/>
+    <rect class="cell" x="34" y="132" width="430" height="14"/>
+  </g>
+  <text class="sm" x="250" y="176" text-anchor="middle">橙色：play_time ≤ 50 小时（74 行，&lt;1%）</text>
+
+  <path class="ln-a" d="M482 94 H540" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="511" y="86" text-anchor="middle">WHERE</text>
+  <rect class="bx-a" x="544" y="54" width="196" height="80" rx="10"/>
+  <text class="ttl on-a" x="642" y="80" text-anchor="middle">部分索引</text>
+  <text class="sm" x="642" y="100" text-anchor="middle">只有 74 个条目</text>
+  <text class="sm" x="642" y="118" text-anchor="middle">小、快、省维护</text>
+
+  <rect class="bx-r" x="544" y="146" width="196" height="54" rx="10"/>
+  <text class="sm on-r" x="642" y="168" text-anchor="middle">查询 ≤ '50 hours 1 second'</text>
+  <text class="sm on-r" x="642" y="186" text-anchor="middle">超出索引范围 → 不能用</text>
+</svg>
+<figcaption>图 4-11　部分索引：只给“经常被查的那一小块”建索引</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; 条件必须被索引条件“包含”</div>
+  <p>只要查询条件是 <code>play_time &lt;= '50 hours'</code> 或者更窄，Postgres 就会考虑这个索引。哪怕只超出 1 秒：</p>
+  <div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT username, play_time, score, last_active
+FROM game.player_stats
+WHERE play_time <= '50 hours 1 second'
+ORDER BY play_time;
+-- -> Seq Scan on player_stats ... Filter: (play_time <= '50:00:01'::interval)
+</pre></div>
+  <p>部分索引里没有这些可能存在的行，Postgres 只能退回全表扫描。</p>
+</div>
+
+<h2 id="expression">函数索引与表达式索引</h2>
+
+<p>
+  <strong>函数索引</strong>（也叫<strong>表达式索引</strong>）为“对一列或多列套用函数或表达式后的<strong>结果</strong>”建立索引：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX functional_index_name
+ON table_name(function_or_expression(columnA [, additional_columns]));
+</pre></div>
+
+<p>
+  函数可以是内置的（比如 <code>lower(text)</code>），也可以是你自己定义的函数或表达式。
+  只要查询的 <code>WHERE</code> 或 <code>ORDER BY</code> 里出现了<strong>完全相同</strong>的表达式，Postgres 就会考虑用这个索引。
+</p>
+
+<p>游戏要按<strong>胜负差</strong>（胜场 − 负场）筛选玩家：</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.13 · 按胜负差筛选玩家">
+<pre>
+SELECT username, win_count, loss_count, (win_count - loss_count) as margin
+FROM game.player_stats
+WHERE (win_count - loss_count) BETWEEN 300 and 450
+ORDER BY margin DESC;
+</pre>
+</div>
+<div class="code out"><pre>
+ Sort (actual time=2.387..2.459 rows=731 loops=1)
+   Sort Key: ((win_count - loss_count)) DESC
+   -> Seq Scan on player_stats (actual time=0.079..2.188 rows=731 loops=1)
+         Filter: (((win_count - loss_count) >= 300) AND ((win_count - loss_count) <= 450))
+         Rows Removed by Filter: 9269
+ Execution Time: 2.524 ms
+</pre></div>
+
+<p>
+  全表扫描，对每一行都算一遍 <code>win_count - loss_count</code>。即使 win_count 和 loss_count 上各有索引也没用 —— 索引里存的是原始列值，不是差值。
+  这条查询很常用，那就为这个表达式建索引：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 4.14 · 创建表达式索引">
+<pre>
+CREATE INDEX idx_perf_margin
+ON game.player_stats ((win_count - loss_count));
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 注意双层括号</div>
+  <p>表达式索引要把表达式再包一层括号：<code>((win_count - loss_count))</code>。只有单个函数调用（如 <code>lower(email)</code>）时可以省掉外层括号。</p>
+</div>
+
+<div class="code out"><pre>
+ Sort (actual time=1.029..1.090 rows=731 loops=1)
+   Sort Key: ((win_count - loss_count)) DESC
+   -> Bitmap Heap Scan on player_stats (actual time=0.093..0.853 rows=731 loops=1)
+         Recheck Cond: (((win_count - loss_count) >= 300) AND ((win_count - loss_count) <= 450))
+         Heap Blocks: exact=136
+         -> Bitmap Index Scan on idx_perf_margin (actual time=0.061..0.061 rows=731 loops=1)
+               Index Cond: (((win_count - loss_count) >= 300) AND ((win_count - loss_count) <= 450))
+ Execution Time: 1.200 ms
+</pre></div>
+
+<p>已经比全表扫描快了一倍，玩家越多差距越大。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 180" role="img" aria-label="表达式索引存储的是计算结果而不是原始列值">
+  <rect class="cell-h" x="20" y="30" width="250" height="26"/>
+  <text class="sm b" x="30" y="48">win_count · loss_count（表里的列）</text>
+  <rect class="cell" x="20" y="56" width="250" height="26"/><text class="mono" x="30" y="74">500 · 203</text>
+  <rect class="cell" x="20" y="82" width="250" height="26"/><text class="mono" x="30" y="100">482 · 142</text>
+  <rect class="cell" x="20" y="108" width="250" height="26"/><text class="mono" x="30" y="126">294 · 427</text>
+
+  <path class="ln-a" d="M276 94 H360" marker-end="url(#ar-a)"/>
+  <text class="mono on-a" x="318" y="84" text-anchor="middle">win − loss</text>
+
+  <rect class="bx-a" x="366" y="24" width="190" height="124" rx="10"/>
+  <text class="ttl on-a" x="461" y="46" text-anchor="middle">idx_perf_margin</text>
+  <text class="mono" x="461" y="74" text-anchor="middle">340 → 行</text>
+  <text class="mono" x="461" y="96" text-anchor="middle">297 → 行</text>
+  <text class="mono" x="461" y="118" text-anchor="middle">−133 → 行</text>
+  <text class="sm" x="461" y="140" text-anchor="middle">（有序存储计算结果）</text>
+
+  <rect class="bx" x="580" y="30" width="160" height="112" rx="10"/>
+  <text class="sm" x="592" y="54">常见用法：</text>
+  <text class="mono" x="592" y="76">lower(email)</text>
+  <text class="mono" x="592" y="96">date(created_at)</text>
+  <text class="mono" x="592" y="116">(a + b)</text>
+  <text class="mono" x="592" y="136">(data-&gt;&gt;'key')</text>
+  <text class="sm" x="380" y="172" text-anchor="middle">查询里必须写出一模一样的表达式，规划器才会匹配上</text>
+</svg>
+<figcaption>图 4-12　表达式索引：提前算好，按结果排序存储</figcaption>
+</figure>
+
+<h2 id="over-indexing">当心过度索引</h2>
+
+<p>本章我们给 player_stats 加了不少索引，现在一共有七个：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT count(*) FROM pg_indexes
+WHERE schemaname = 'game' AND tablename = 'player_stats';
+-- 7
+</pre></div>
+
+<p>学习时这没问题，但在实际项目里，这就是典型的<strong>过度索引（over-indexing）</strong>：一张表索引太多，说明应该重新审视索引策略了。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="一次 UPDATE 可能需要同时更新多个索引">
+  <rect class="bx-p" x="20" y="90" width="150" height="50" rx="10"/>
+  <text class="mono on-p" x="95" y="120" text-anchor="middle">UPDATE 一行</text>
+  <path class="ln-p" d="M172 115 H220" marker-end="url(#ar-p)"/>
+  <rect class="bx" x="224" y="80" width="110" height="70" rx="10"/>
+  <text class="ttl" x="279" y="112" text-anchor="middle">表</text>
+  <text class="sm" x="279" y="130" text-anchor="middle">写入新版本</text>
+
+  <path class="ln-r" d="M336 100 L420 30"/><path class="ln-r" d="M336 105 L420 60"/><path class="ln-r" d="M336 110 L420 90"/><path class="ln-r" d="M336 118 L420 120"/><path class="ln-r" d="M336 124 L420 150"/><path class="ln-r" d="M336 128 L420 180"/><path class="ln-r" d="M336 132 L420 210"/>
+  <rect class="bx-r" x="420" y="18" width="200" height="22" rx="4"/><text class="sm" x="430" y="34">player_stats_pkey</text>
+  <rect class="bx-r" x="420" y="48" width="200" height="22" rx="4"/><text class="sm" x="430" y="64">username UNIQUE</text>
+  <rect class="bx-r" x="420" y="78" width="200" height="22" rx="4"/><text class="sm" x="430" y="94">idx_score</text>
+  <rect class="bx-r" x="420" y="108" width="200" height="22" rx="4"/><text class="sm" x="430" y="124">idx_champion_title</text>
+  <rect class="bx-r" x="420" y="138" width="200" height="22" rx="4"/><text class="sm" x="430" y="154">idx_composite_covering_index</text>
+  <rect class="bx-r" x="420" y="168" width="200" height="22" rx="4"/><text class="sm" x="430" y="184">idx_occasional_players</text>
+  <rect class="bx-r" x="420" y="198" width="200" height="22" rx="4"/><text class="sm" x="430" y="214">idx_perf_margin</text>
+
+  <text class="sm" x="636" y="80">索引越多：</text>
+  <text class="sm" x="636" y="100">• 写得越慢</text>
+  <text class="sm" x="636" y="120">• 占的空间越多</text>
+  <text class="sm" x="636" y="140">• 规划器要评估的</text>
+  <text class="sm" x="636" y="158">  选项越多</text>
+</svg>
+<figcaption>图 4-13　索引不是免费的：被索引的列一变，相关索引都要跟着更新</figcaption>
+</figure>
+
+<ul>
+  <li>每个索引都要维护：被索引的列在表里一改，索引结构就要跟着更新，才能保持一致、继续提供 O(log N) 等性能。索引越多、表更新越频繁，开销越大。</li>
+  <li>索引越多，规划器在规划阶段要花越多时间去挑选最优计划。</li>
+</ul>
+
+<p>附录 A 会更详细地讨论过度索引和索引不足。</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>索引通过只访问被索引数据的一小部分来加速查询，很多索引的复杂度是 O(log<sub>b</sub>N)。</li>
+  <li>索引有两种分类：按范围/用途（<strong>索引什么</strong>）和按数据结构/访问方法（<strong>怎么索引</strong>）。默认数据结构是 <strong>B-tree</strong>。</li>
+  <li><code>EXPLAIN</code> 让我们看清执行计划，从而选择最有效的优化方式；<code>EXPLAIN ANALYZE</code> 会真正执行并给出实际耗时。</li>
+  <li><strong>单列</strong>和<strong>复合</strong>索引优化按一列或多列过滤、排序的查询；复合索引要注意列顺序和前导列。</li>
+  <li><strong>哈希</strong>索引只适合等值查找。</li>
+  <li><strong>覆盖</strong>索引把额外的列存进索引，减少回表。</li>
+  <li><strong>部分</strong>索引只为数据子集建索引。</li>
+  <li><strong>函数/表达式</strong>索引为计算结果建索引。</li>
+  <li>索引不是越多越好，警惕过度索引。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>对 <code>SELECT count(*) FROM game.player_stats WHERE win_count &gt; 100;</code> 建一个索引，用 EXPLAIN 观察：规划器用了吗？为什么？（提示：8061 行 / 10000 行）</li>
+    <li>把 <code>idx_champion_title</code> 换成 B-tree 索引，比较执行计划和 <code>pg_relation_size('game.idx_champion_title')</code> 的大小差异。</li>
+    <li>建一个 <code>lower(username)</code> 的表达式索引，然后分别用 <code>WHERE lower(username) = 'kfowler'</code> 和 <code>WHERE username ILIKE 'kfowler'</code> 查询，看哪个用上了索引。</li>
+    <li>为“每个地区按胜场排名”的清单 4.9 建一个合适的复合索引，确认 Sort 步骤消失了。</li>
+    <li>用 <code>EXPLAIN (analyze, buffers on)</code> 跑一次全表扫描，观察 <code>shared hit</code> 和 <code>read</code> 的数字；重启容器后再跑一次，看看有什么变化。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

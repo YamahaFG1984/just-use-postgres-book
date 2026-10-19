@@ -1,0 +1,1391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 10 章 · 地理空间数据 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="10">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 10 章</span>
+<h1>地理空间数据</h1>
+<p class="lede">
+  <strong>空间数据</strong>描述物体在几何空间中的位置和形状，比如二维或三维欧氏空间里的点、线、多边形。
+  <strong>地理空间数据</strong>是其中的一个子集，专指和地球表面位置相关的地理信息（geodata）：一辆车的实际位置、一场雷暴的范围，都用经纬度坐标表示。
+  这一章我们用美国“阳光之州”佛罗里达的 OpenStreetMap 数据，一边规划一场从坦帕到迪士尼再到迈阿密的家庭旅行，一边学习在 Postgres 里存储、查询和处理地理数据。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解地理数据的三种基本形状（点、线、面）和“图层”的概念</li>
+    <li>了解 Postgres 内置的几何类型，以及为什么还需要 PostGIS</li>
+    <li>分清 <code>geometry</code> 与 <code>geography</code>、SRID 3857 与 4326、WKT 与 WKB</li>
+    <li>导入 OSM 数据，用 QGIS 可视化</li>
+    <li>熟练使用 ST_Transform、ST_DWithin、ST_Distance、ST_Within、ST_Intersects 等函数</li>
+    <li>理解 GiST（R-tree）空间索引，知道哪些函数能用上索引</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="geodata">Postgres 如何处理地理数据</h2>
+
+<p>
+  地理空间数据存储的是物体在地球表面的位置和附加信息。根据位置或属性是否变化，它可以是静态的、动态的，甚至是有时间性的。
+  想象你周日早上在迈阿密的酒店醒来，打开 Google 地图规划一天的行程 —— 你看到的地图其实是好几层地理数据叠在一起：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="地图由多层地理数据叠加而成：面、线、点">
+  <!-- layer stack -->
+  <path class="area-b" d="M60 210 L320 210 L380 260 L120 260 Z" style="fill-opacity:.8"/>
+  <path class="ln-b" d="M140 222 L200 222 L210 240 L150 240 Z M240 218 L300 218 L330 250 L260 250 Z"/>
+  <text class="sm on-b b" x="400" y="248">多边形（面）Polygon</text>
+  <text class="sm" x="400" y="264">城市边界、街区、建筑、公园、湖泊</text>
+
+  <path class="area-g" d="M60 140 L320 140 L380 190 L120 190 Z" style="fill-opacity:.8"/>
+  <path class="ln-g" d="M90 160 L180 170 L250 158 L350 178" style="stroke-width:2.5"/>
+  <path class="ln-g" d="M200 145 L215 186" style="stroke-width:2.5"/>
+  <text class="sm on-g b" x="400" y="178">线（LineString）</text>
+  <text class="sm" x="400" y="194">道路、小径、河流、铁路</text>
+
+  <path class="area-a" d="M60 70 L320 70 L380 120 L120 120 Z" style="fill-opacity:.8"/>
+  <circle class="dot-a" cx="160" cy="90" r="5"/><circle class="dot-a" cx="220" cy="100" r="5"/><circle class="dot-a" cx="280" cy="86" r="5"/><circle class="dot-a" cx="300" cy="108" r="5"/>
+  <text class="sm on-a b" x="400" y="108">点（Point）</text>
+  <text class="sm" x="400" y="124">餐厅、咖啡馆、公交站、地标</text>
+
+  <path class="ln-d" d="M120 260 V60 M380 260 V40"/>
+  <text class="ttl" x="220" y="40" text-anchor="middle">叠起来 = 你看到的地图</text>
+  <text class="sm" x="560" y="40">• 静态：建筑边界、城市边界</text>
+  <text class="sm" x="560" y="58">• 时间性：店铺开开关关</text>
+  <text class="sm" x="560" y="76">• 动态：实时路况</text>
+</svg>
+<figcaption>图 10-1　地图 = 多层地理数据的叠加</figcaption>
+</figure>
+
+<ul>
+  <li><strong>面</strong>：区域、建筑、公园等的位置和形状用<strong>闭合多边形</strong>表示。多边形是由直线首尾相连围成的二维图形 —— 附近的楼可能是矩形，公园和湖泊则由很多长短方向各异的线段围成。缩小地图，还能看到迈阿密的城市边界、佛罗里达的州界，以及和它相邻的墨西哥湾、大西洋。它们基本不变（建筑边界）或很少变化（街区边界），是<strong>静态</strong>地理数据。</li>
+  <li><strong>点</strong>：兴趣点、设施、地标是另一层，通常用带两个坐标的<strong>点</strong>表示，附带名称、地址、评论、评分等信息。这些点往往位于建筑（多边形）之内，一栋楼里可能有好几家店。这类数据可以算静态的，也可以算有时间性的 —— 有些店开了几代人，有些来了又走。</li>
+  <li><strong>线</strong>：从酒店到景点的道路和小径用一串<strong>线段</strong>表示。道路信息通常是静态或有时间性的，但<strong>实时路况</strong>是动态的地理数据。</li>
+</ul>
+
+<p>
+  同样的地理对象还能关联其他数据，供不同的人用于不同目的：迈阿密每个街区都关联着<strong>社会人口统计数据</strong>（年龄、性别、族裔、教育、收入）；
+  迈阿密地处佛罗里达南部，属热带季风气候，有飓风季，还有气温、海平面、风力等随时间变化的自然数据，粒度可以细到街区甚至单栋建筑。
+</p>
+
+<p>
+  这些信息常常<strong>一层叠一层</strong>地组合起来。有一类专门的软件叫<strong>地理信息系统（GIS）</strong>，能加载、分析、编辑和可视化地理数据。
+  比如有机食品连锁超市 Whole Foods 打算在迈阿密开新店，就可以用 GIS 叠加这些图层来选址：
+</p>
+
+<ol>
+  <li><strong>基础图层</strong>：迈阿密的边界、行政区、道路和建筑，其他图层都叠在它上面。</li>
+  <li>现有 Whole Foods 门店和竞争对手的位置，帮助判断想扩张、或愿意竞争的区域。</li>
+  <li>社会人口统计数据，找出核心客群所在的区域，以及人口正在变化、可能影响经营的街区。</li>
+  <li>附近道路的实时负载和拥堵情况，评估顾客到店的便利程度，以及从最近仓库送货的效率。</li>
+  <li>在候选区域上叠加历史洪水和浪涌数据，预估和规划飓风风险。</li>
+</ol>
+
+<h3>Postgres 内置的几何能力</h3>
+
+<p>建筑、湖泊、城市边界、兴趣点都可以用几何形状表示。Postgres 内置了 7 种处理二维空间数据的几何类型：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="Postgres 内置的七种几何类型">
+  <g>
+    <rect class="bx" x="10" y="20" width="100" height="120" rx="8"/>
+    <circle class="dot-a" cx="60" cy="70" r="6"/>
+    <text class="mono b" x="60" y="112" text-anchor="middle">point</text><text class="sm" x="60" y="130" text-anchor="middle">(x, y)</text>
+
+    <rect class="bx" x="118" y="20" width="100" height="120" rx="8"/>
+    <path class="ln-a" d="M124 92 L212 46" style="stroke-dasharray:3 3"/><path class="ln-a" d="M140 84 L196 54"/>
+    <text class="mono b" x="168" y="112" text-anchor="middle">line</text><text class="sm" x="168" y="130" text-anchor="middle">无限长直线</text>
+
+    <rect class="bx" x="226" y="20" width="100" height="120" rx="8"/>
+    <path class="ln-a" d="M250 86 L302 52"/><circle class="dot-a" cx="250" cy="86" r="4"/><circle class="dot-a" cx="302" cy="52" r="4"/>
+    <text class="mono b" x="276" y="112" text-anchor="middle">lseg</text><text class="sm" x="276" y="130" text-anchor="middle">线段</text>
+
+    <rect class="bx" x="334" y="20" width="100" height="120" rx="8"/>
+    <rect class="bx-a" x="356" y="46" width="56" height="40"/>
+    <text class="mono b" x="384" y="112" text-anchor="middle">box</text><text class="sm" x="384" y="130" text-anchor="middle">两个对角定矩形</text>
+
+    <rect class="bx" x="442" y="20" width="100" height="120" rx="8"/>
+    <path class="ln-a" d="M456 88 L478 54 L504 74 L528 46"/>
+    <text class="mono b" x="492" y="112" text-anchor="middle">path</text><text class="sm" x="492" y="130" text-anchor="middle">开放或闭合路径</text>
+
+    <rect class="bx" x="550" y="20" width="100" height="120" rx="8"/>
+    <path class="bx-a" d="M566 86 L580 46 L620 52 L634 78 L604 92 Z"/>
+    <text class="mono b" x="600" y="112" text-anchor="middle">polygon</text><text class="sm" x="600" y="130" text-anchor="middle">闭合多边形 ≥3 点</text>
+
+    <rect class="bx" x="658" y="20" width="92" height="120" rx="8"/>
+    <circle class="bx-a" cx="704" cy="68" r="24"/><circle class="dot-a" cx="704" cy="68" r="3"/>
+    <text class="mono b" x="704" y="112" text-anchor="middle">circle</text><text class="sm" x="704" y="130" text-anchor="middle">&lt;(x, y), r&gt;</text>
+  </g>
+  <text class="sm" x="380" y="170" text-anchor="middle">运算符示例：(10,15) &lt;-&gt; (20,17) 算两点距离；(10,15) &lt;@ ((0,0),(0,30),(50,30),(50,0)) 判断点是否在多边形内</text>
+  <text class="sm" x="380" y="190" text-anchor="middle">但这些都只是“平面几何”：没有坐标参考系、不考虑地球曲率、不能和 GIS 工具集成</text>
+</svg>
+<figcaption>图 10-2　Postgres 内置的几何类型（对应原书表 10.1）</figcaption>
+</figure>
+
+<p>
+  比如城市边界可以存成 polygon，道路存成 lseg，兴趣点存成 point。Postgres 还有专门的运算符和函数，比如 <code>&lt;-&gt;</code> 算两个对象的距离，<code>&lt;@</code> 判断前者是否被后者包含：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 酒店在 (10,15)，咖啡店在 (20,17)，相距多远？
+SELECT point(10,15) <-> point(20,17);
+
+-- 咖啡店在这栋楼里吗？
+SELECT point(10,15) <@ polygon '((0,0),(0,30),(50,30),(50,0))';
+</pre></div>
+
+<p>
+  但对真实的地理应用来说这还不够：它们需要使用标准的<strong>空间参考系</strong>中的坐标、计算时考虑<strong>地球曲率</strong>、能和 GIS 无缝集成……这些超出了内置几何类型的能力，而 <strong>PostGIS</strong> 扩展可以轻松实现。
+</p>
+
+<h3>PostGIS 的扩展能力</h3>
+
+<p>
+  PostGIS 把 Postgres 变成地理空间数据库。它实现了<strong>开放地理空间联盟（OGC）</strong>的标准，支持基础的 <code>geometry</code> 和 <code>geography</code> 类型，
+  增加了大量地理数据查询分析函数，借助 Postgres 的索引能力加速搜索，还能和第三方可视化、处理工具集成。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="geometry 在平面上计算，geography 在球面上计算">
+  <rect class="bx-b" x="20" y="20" width="350" height="236" rx="12"/>
+  <text class="ttl on-b" x="195" y="46" text-anchor="middle">geometry · 平面（欧氏）</text>
+  <g>
+    <path class="ln-d" d="M60 80 H330 M60 110 H330 M60 140 H330 M60 170 H330 M90 66 V184 M150 66 V184 M210 66 V184 M270 66 V184"/>
+    <circle class="dot-b" cx="120" cy="150" r="5"/><circle class="dot-b" cx="280" cy="90" r="5"/>
+    <path class="ln-b" d="M120 150 L280 90"/>
+    <text class="sm" x="196" y="112">直线距离</text>
+  </g>
+  <text class="sm" x="36" y="208">常用 SRID 3857（Web Mercator）</text>
+  <text class="sm" x="36" y="226">单位：米 · 笛卡尔数学 → 简单、快</text>
+  <text class="sm" x="36" y="244">远距离时因地球曲率而不够准 · <tspan class="b">本章主要用它</tspan></text>
+
+  <rect class="bx-g" x="390" y="20" width="350" height="236" rx="12"/>
+  <text class="ttl on-g" x="565" y="46" text-anchor="middle">geography · 球面</text>
+  <circle class="bx" cx="565" cy="125" r="60"/>
+  <ellipse class="ln-d" cx="565" cy="125" rx="60" ry="20"/>
+  <ellipse class="ln-d" cx="565" cy="125" rx="22" ry="60"/>
+  <circle class="dot-g" cx="530" cy="100" r="5"/><circle class="dot-g" cx="608" cy="140" r="5"/>
+  <path class="ln-g" d="M530 100 Q580 96 608 140"/>
+  <text class="sm" x="640" y="100">大圆弧距离</text>
+  <text class="sm" x="406" y="208">默认 SRID 4326（WGS 84，和 GPS 一样）</text>
+  <text class="sm" x="406" y="226">坐标是经度、纬度（度）· 结果单位：米</text>
+  <text class="sm" x="406" y="244">考虑地球曲率 → 更准，但计算更复杂、更慢</text>
+</svg>
+<figcaption>图 10-3　geometry 与 geography 的区别</figcaption>
+</figure>
+
+<p>
+  <strong>geometry</strong> 类型在欧几里得平面上表示地理对象，计算距离、面积、相交等。它需要指定几何子类型（Point、LineString、Polygon…），还可以指定坐标系。
+  比如用 Web Mercator 投影存兴趣点：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE coordinates_plane (
+    location geometry(Point, 3857)
+);
+
+-- 迈阿密市中心，Web Mercator 坐标（单位：米）
+INSERT INTO coordinates_plane (location)
+VALUES (
+   ST_MakePoint(-8930649.94197805, 2972156.8479390536)
+);
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; SRID：空间参考系标识符</div>
+  <p>
+    <strong>SRID</strong>（spatial reference system identifier）告诉数据库“这些数字是在哪个坐标系里”。
+    <strong>3857</strong> 是 Web Mercator 投影，Google 地图、OpenStreetMap 等很多应用用它在平面上渲染地图，单位是米。
+    <strong>4326</strong> 是 WGS 84（1984 世界大地坐标系），用经度、纬度表示位置，和 GPS 一样。
+    同一个地点，在不同 SRID 下的数字完全不同，混用会出错。
+  </p>
+</div>
+
+<p>
+  <strong>geography</strong> 类型用球面模型计算，考虑了地球曲率。默认坐标系就是 WGS 84（SRID 4326，可以省略），坐标是<strong>经度在前、纬度在后</strong>：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE coordinates_sphere (
+    location geography(Point, 4326)
+);
+
+-- 迈阿密市中心：经度 -80.2253934，纬度 25.782414
+INSERT INTO coordinates_sphere (location)
+VALUES (
+   ST_MakePoint(-80.2253934, 25.782414)
+);
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 经纬度的顺序</div>
+  <p>日常说“北纬 25.78°、西经 80.23°”是纬度在前，但 PostGIS 的 <code>ST_MakePoint(x, y)</code> 是 <strong>x = 经度、y = 纬度</strong>。写反了，迈阿密就跑到南极洲附近的海里去了。</p>
+</div>
+
+<h2 id="start">启动带 PostGIS 的 Postgres</h2>
+
+<div class="box warn">
+  <div class="t">&#9888; 先停掉之前的容器</div>
+  <p>用 <code>docker ps --filter "name=postgres" --filter "publish=5432"</code> 找到占用 5432 端口的容器，再 <code>docker container stop &lt;container-name&gt;</code>。</p>
+</div>
+
+<p>写书时还没有同时支持 amd64（x86_64）和 arm64 的官方 PostGIS 多架构镜像，只有 amd64 版。按你的系统和 CPU 选一条命令：</p>
+
+<div class="code" data-lang="bash" data-file="清单 10.1 · 在 Unix（amd64）上启动带 PostGIS 的 Postgres">
+<pre>
+docker volume create postgres-postgis-volume
+
+docker run --name postgres-postgis \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password \
+    -p 5432:5432 \
+    -v postgres-postgis-volume:/var/lib/postgresql/data \
+    -d postgis/postgis:17-3.5
+</pre>
+</div>
+
+<div class="code" data-lang="bash" data-file="清单 10.2 · 在 Apple Silicon（arm64）Mac 上启动">
+<pre>
+docker volume create postgres-postgis-volume
+
+docker run --platform linux/amd64 --name postgres-postgis \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password \
+    -p 5432:5432 \
+    -v postgres-postgis-volume:/var/lib/postgresql/data \
+    -d postgis/postgis:17-3.5
+</pre>
+</div>
+
+<p><code>--platform linux/amd64</code> 让容器以 amd64 模拟模式运行，依赖 macOS 的 <strong>Rosetta 2</strong>（让 amd64 应用在 Apple 芯片上运行的动态二进制翻译器）。</p>
+
+<div class="code" data-lang="powershell" data-file="清单 10.3 · 在 Windows 上启动">
+<pre>
+docker volume create postgres-postgis-volume
+
+docker run --name postgres-postgis `
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password `
+    -p 5432:5432 `
+    -v postgres-postgis-volume:/var/lib/postgresql/data `
+    -d postgis/postgis:17-3.5
+</pre>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 10.4 · 查看可用的 PostGIS 版本">
+<pre>
+-- docker exec -it postgres-postgis psql -U postgres
+SELECT * FROM pg_available_extensions
+WHERE name = 'postgis';
+</pre>
+</div>
+<div class="code out"><pre>
+  name   | default_version | installed_version |          comment
+---------+-----------------+-------------------+----------------------------
+ postgis | 3.5.2           | 3.5.2             | PostGIS geometry and
+         |                 |                   | geography spatial types
+         |                 |                   | and functions
+</pre></div>
+
+<p>和 TimescaleDB 镜像一样，PostGIS 已经在 postgres 数据库里启用了。</p>
+
+<h2 id="osm">导入 OpenStreetMap 数据集</h2>
+
+<p>
+  假设你一周后要和家人去佛罗里达度一个期待已久的假：从墨西哥湾畔的宝藏城市<strong>坦帕</strong>出发，一路开车横穿全州，到大西洋沿岸的繁华都市<strong>迈阿密</strong>。
+  你想提前规划好每一站 —— 用开发者的方式：分析佛罗里达的 OpenStreetMap 数据。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 什么是 OpenStreetMap</div>
+  <p>
+    OpenStreetMap（OSM）是一个由全球志愿者维护的开源项目，绘制并持续更新一张免费的世界地图，你可以在 <a href="https://www.openstreetmap.org">openstreetmap.org</a> 浏览甚至编辑它。
+    除了交互式地图，还可以下载底层数据：全世界、某个国家地区，甚至单个建筑或道路。<a href="https://download.geofabrik.de">Geofabrik</a> 网站能方便地按大洲、国家、地区下载数据。
+  </p>
+</div>
+
+<p>用开源工具 <strong>osm2pgsql</strong> 把佛罗里达的 OSM 数据导入带 PostGIS 的 Postgres。它可以作为 Docker 容器运行，从给定的 URL 下载并导入。先建一个 schema：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE SCHEMA florida;
+</pre></div>
+
+<div class="code" data-lang="bash" data-file="清单 10.5 · 在 Unix 上导入 OSM 数据集">
+<pre>
+docker volume create osm2pgsql-volume
+
+docker run --name osm2pgsql --network="host" \
+ -e PGPASSWORD=password \
+ -v osm2pgsql-volume:/data \
+ iboates/osm2pgsql:2.1.1 \
+ -H 127.0.0.1 -P 5432 -d postgres -U postgres --schema florida \
+ http://d3e4uq6jj8ld3m.cloudfront.net/florida-250501.osm.pbf
+</pre>
+</div>
+
+<div class="code" data-lang="powershell" data-file="清单 10.6 · 在 Windows 上导入 OSM 数据集">
+<pre>
+docker volume create osm2pgsql-volume
+
+docker run --name osm2pgsql --network="host" `
+ -e PGPASSWORD=password `
+ -v osm2pgsql-volume:/data `
+ iboates/osm2pgsql:2.1.1 `
+ -H 127.0.0.1 -P 5432 -d postgres -U postgres --schema florida `
+ http://d3e4uq6jj8ld3m.cloudfront.net/florida-250501.osm.pbf
+</pre>
+</div>
+
+<p>
+  容器会下载 2025 年 5 月 1 日版本的佛罗里达数据并导入，视机器性能大约需要 10 分钟。
+  （数据最初来自 Geofabrik；想用最新版，或书里的 URL 失效了，可以去 <a href="https://download.geofabrik.de/north-america/us/florida.html">这个页面</a>下载。）
+  <code>--network="host"</code> 让容器使用宿主机网络，从而能通过 127.0.0.1:5432 连到 Postgres 容器。
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.7 · 列出为数据集创建的表">
+<pre>
+SELECT tablename
+FROM pg_catalog.pg_tables
+WHERE schemaname = 'florida';
+</pre>
+</div>
+<div class="code out"><pre>
+      tablename
+----------------------
+ osm2pgsql_properties
+ planet_osm_roads
+ planet_osm_point
+ planet_osm_line
+ planet_osm_polygon
+(5 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="osm2pgsql 创建的四张数据表及其 way 列类型">
+  <rect class="bx-a" x="20" y="20" width="170" height="160" rx="10"/>
+  <text class="ttl on-a" x="105" y="44" text-anchor="middle">planet_osm_point</text>
+  <circle class="dot-a" cx="70" cy="80" r="5"/><circle class="dot-a" cx="110" cy="70" r="5"/><circle class="dot-a" cx="140" cy="92" r="5"/>
+  <text class="sm" x="105" y="122" text-anchor="middle">餐厅、学校、公交站、</text>
+  <text class="sm" x="105" y="138" text-anchor="middle">山峰、红绿灯……</text>
+  <text class="mono" x="105" y="166" text-anchor="middle">Point, 3857</text>
+
+  <rect class="bx-g" x="205" y="20" width="170" height="160" rx="10"/>
+  <text class="ttl on-g" x="290" y="44" text-anchor="middle">planet_osm_line</text>
+  <path class="ln-g" d="M230 92 L270 70 L310 86 L350 66" style="stroke-width:2.5"/>
+  <text class="sm" x="290" y="122" text-anchor="middle">不闭合的路径：公路、</text>
+  <text class="sm" x="290" y="138" text-anchor="middle">道路、小径、河流、铁路</text>
+  <text class="mono" x="290" y="166" text-anchor="middle">LineString, 3857</text>
+
+  <rect class="bx-g" x="390" y="20" width="170" height="160" rx="10" style="stroke-dasharray:5 4"/>
+  <text class="ttl on-g" x="475" y="44" text-anchor="middle">planet_osm_roads</text>
+  <path class="ln-g" d="M415 86 L470 66 L535 80" style="stroke-width:4"/>
+  <text class="sm" x="475" y="122" text-anchor="middle">line 的子集，为低缩放</text>
+  <text class="sm" x="475" y="138" text-anchor="middle">级别渲染优化</text>
+  <text class="mono" x="475" y="166" text-anchor="middle">LineString, 3857</text>
+
+  <rect class="bx-b" x="575" y="20" width="165" height="160" rx="10"/>
+  <text class="ttl on-b" x="657" y="44" text-anchor="middle">planet_osm_polygon</text>
+  <path class="bx-b" d="M610 96 L626 62 L676 58 L700 86 L666 104 Z"/>
+  <text class="sm" x="657" y="122" text-anchor="middle">闭合区域：城市、</text>
+  <text class="sm" x="657" y="138" text-anchor="middle">公园、湖泊、建筑</text>
+  <text class="mono" x="657" y="166" text-anchor="middle">Geometry, 3857</text>
+
+  <text class="sm" x="380" y="208" text-anchor="middle">每张表都有几十列描述 OSM 对象的特征（name、amenity、shop、tourism、highway、place……），不相关的列为 NULL</text>
+  <text class="sm" x="380" y="226" text-anchor="middle">位置都存在 way 列里，而且 osm2pgsql 已经自动为每张表的 way 列建好了 GiST 索引</text>
+</svg>
+<figcaption>图 10-4　OSM 数据导入后的四张表</figcaption>
+</figure>
+
+<p>
+  osm2pgsql_properties 存的是导入时用的参数，另外四张表存真正的地理数据。这些表都有几十列，比如 <code>\d florida.planet_osm_point</code> 能看到 osm_id、access、addr:housename、admin_level…… 但不是每条记录都用到所有列，只有和该 OSM 对象相关的列才有值（各列的含义见 <a href="https://wiki.openstreetmap.org/wiki/Map_features">OSM Wiki</a>）。
+  所有表都有一个 <code>way</code> 列存储坐标，但数据类型不同。
+</p>
+
+<h3>点表</h3>
+
+<p>planet_osm_point 存所有能表示为单个点的 OSM 节点：餐厅、学校、公交站、山峰、交通信号灯…… way 列的类型是 <code>geometry(Point,3857)</code>，还有一个 GiST 索引：</p>
+
+<div class="code out"><pre>
+ way | geometry(Point,3857) |
+Indexes:
+    "planet_osm_point_way_idx" gist (way) WITH (fillfactor='100')
+</pre></div>
+
+<p>看看佛罗里达随便三家 Whole Foods 的坐标（<code>\x on</code>）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.8 · 获取三家门店的坐标">
+<pre>
+SELECT name, shop, way as WKB, ST_AsText(way) as WKT
+FROM florida.planet_osm_point
+WHERE name = 'Whole Foods Market' LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+-[ RECORD 1 ]--------------------------------------------
+name | Whole Foods Market
+shop | supermarket
+wkb  | 0101000020110F0000ABD7121A209161C11F4787E7DDCD4841
+wkt  | POINT(-9210112.814800104 3251131.8088158513)
+-[ RECORD 2 ]--------------------------------------------
+name | Whole Foods Market
+shop | supermarket
+wkb  | 0101000020110F00008EBF1DA1A20761C114742A951F7D4741
+wkt  | POINT(-8928533.03488138 3078719.165358076)
+...
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 150" role="img" aria-label="同一个点的 WKB 和 WKT 表示">
+  <rect class="bx-p" x="20" y="20" width="340" height="110" rx="10"/>
+  <text class="ttl on-p" x="190" y="44" text-anchor="middle">WKB（well-known binary）</text>
+  <text class="mono" x="190" y="74" text-anchor="middle">0101000020110F0000ABD712…</text>
+  <text class="sm" x="190" y="98" text-anchor="middle">二进制（以十六进制显示），紧凑、机器友好</text>
+  <text class="sm" x="190" y="116" text-anchor="middle">数据库内部存储和传输用</text>
+  <rect class="bx-g" x="400" y="20" width="340" height="110" rx="10"/>
+  <text class="ttl on-g" x="570" y="44" text-anchor="middle">WKT（well-known text）</text>
+  <text class="mono" x="570" y="74" text-anchor="middle">POINT(-9210112.81 3251131.81)</text>
+  <text class="sm" x="570" y="98" text-anchor="middle">人类可读的文本</text>
+  <text class="sm" x="570" y="116" text-anchor="middle">ST_AsText(way) 把 WKB 转成 WKT</text>
+  <path class="ln" d="M362 75 H396" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 10-5　OGC 标准定义的两种几何表示格式</figcaption>
+</figure>
+
+<h3>线表</h3>
+
+<p>
+  planet_osm_line 存<strong>不构成闭合环</strong>的 OSM 路径（way）：公路、道路、小径、河流、铁路。planet_osm_roads 是它的子集，为低缩放级别的渲染做了优化。
+  两张表的 way 列都是 <code>geometry(LineString, 3857)</code>。<strong>LineString</strong> 用两个或更多有序的点定义一条从起点到终点的路径。找出最短的几条有名字的路径：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.9 · 获取最短的有名路径">
+<pre>
+SELECT name, ST_AsText(way)
+FROM florida.planet_osm_line
+WHERE name IS NOT NULL
+ORDER BY ST_Length(way) ASC LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+-[ RECORD 1 ]-------------------------------------------------------------
+name      | Rice Creek Conservation Area
+st_astext | LINESTRING(-9103060.734422492 3455483.5395689947,
+            -9103060.845741984 3455483.731658956,
+            -9103060.734422492 3455483.731658956,
+            -9103060.734422492 3455483.5395689947)
+-[ RECORD 2 ]-------------------------------------------------------------
+name      | Federal Highway
+st_astext | LINESTRING(-8913795.280516023 3051428.9145732434,
+            -8913795.369571615 3051428.330344116)
+-[ RECORD 3 ]-------------------------------------------------------------
+name      | Embassy Drive
+st_astext | LINESTRING(-8937543.523896862 3003115.226359022,
+            -8937543.112014748 3003115.6723581622)
+</pre></div>
+
+<p><code>ST_Length</code> 计算二维笛卡尔长度，<code>ST_AsText</code> 把 WKB 转成可读的 WKT。</p>
+
+<h3>多边形表</h3>
+
+<p>
+  planet_osm_polygon 存可以表示为闭合路径或多边形的数据：城市、公园、湖泊、建筑。它的 way 列类型是 <code>geometry(Geometry, 3857)</code> ——
+  <strong>Geometry</strong> 是一个通用子类型，可以存 Point、LineString、Polygon、MultiPolygon 等更具体的类型。这张表里通常是 <strong>Polygon</strong>（二维闭合平面区域）和 <strong>MultiPolygon</strong>（一组互不重叠、互不相邻的多边形，比如由好几个岛组成的区域）。
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.10 · 获取面积最小的有名区域">
+<pre>
+SELECT name, ST_AsText(way)
+FROM florida.planet_osm_polygon
+WHERE name IS NOT NULL
+ORDER BY ST_Area(way) ASC LIMIT 3;
+</pre>
+</div>
+<div class="code out"><pre>
+-[ RECORD 1 ]---------------------------------------------------------
+name      | Apalachicola River Wildlife and Environmental Area
+st_astext | POLYGON((-9453576.600696124 3472118.429214709,
+            -9453576.511640532 3472118.480504914,-9453576.600696124
+            3472118.6087304275,-9453576.600696124 3472118.429214709))
+...
+</pre></div>
+
+<p><code>ST_Area</code> 计算面积，单位由 SRID 决定 —— 3857 下是平方米。注意多边形首尾两个点相同，表示闭合。</p>
+
+<h2 id="qgis">可视化地理数据</h2>
+
+<p>
+  PostGIS 能和很多带图形界面的系统和工具集成。其中 <strong>QGIS</strong> 是一款开源 GIS，可以加载、分析、处理和可视化地理数据，支持 Windows、Linux、macOS（<a href="https://qgis.org/download/">下载</a>）。
+  安装后启动，在数据源列表里找到 PostgreSQL，右键新建一个 PostGIS 连接：
+</p>
+
+<div class="tw"><table>
+<tr><th>设置</th><th>值</th></tr>
+<tr><td>Name</td><td>postgres_docker（随意）</td></tr>
+<tr><td>Host / Port</td><td>localhost / 5432</td></tr>
+<tr><td>Database</td><td>postgres</td></tr>
+<tr><td>User name / Password</td><td>postgres / password</td></tr>
+</table></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 认证方式</div>
+  <p>这里用的基础认证会把用户名和密码以明文存在项目文件里。学习时可以，正式使用 QGIS 时应该换成它提供的<a href="https://docs.qgis.org/latest/en/docs/user_manual/auth_system/auth_overview.html">更安全的认证方式</a>。</p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="在 QGIS 中把表作为图层叠加">
+  <rect class="bx" x="20" y="20" width="200" height="170" rx="10"/>
+  <text class="ttl" x="120" y="44" text-anchor="middle">QGIS 浏览面板</text>
+  <text class="sm" x="36" y="70">▾ PostgreSQL</text>
+  <text class="sm" x="50" y="90">▾ postgres_docker</text>
+  <text class="sm" x="64" y="110">▾ florida</text>
+  <rect class="cell-b" x="74" y="118" width="140" height="20"/><text class="sm" x="80" y="132">planet_osm_polygon</text>
+  <rect class="cell-a" x="74" y="140" width="140" height="20"/><text class="sm" x="80" y="154">planet_osm_point</text>
+  <text class="sm" x="80" y="178">右键 → Add Layer to Project</text>
+
+  <path class="ln" d="M222 105 H270" marker-end="url(#ar)"/>
+  <rect class="bx-d" x="274" y="20" width="466" height="170" rx="10"/>
+  <text class="ttl" x="507" y="44" text-anchor="middle">地图画布：图层自下而上叠加</text>
+  <path class="area-b" d="M330 70 L440 66 L470 100 L520 120 L560 170 L540 180 L500 150 L460 130 L420 110 L380 100 L340 92 Z"/>
+  <g>
+    <circle class="dot-a" cx="400" cy="90" r="3"/><circle class="dot-a" cx="430" cy="95" r="3"/><circle class="dot-a" cx="460" cy="112" r="3"/><circle class="dot-a" cx="480" cy="118" r="3"/><circle class="dot-a" cx="505" cy="135" r="3"/><circle class="dot-a" cx="530" cy="160" r="3"/><circle class="dot-a" cx="545" cy="172" r="3"/><circle class="dot-a" cx="360" cy="84" r="3"/><circle class="dot-a" cx="450" cy="104" r="3"/><circle class="dot-a" cx="515" cy="150" r="3"/>
+  </g>
+  <text class="sm on-b" x="600" y="100">■ 多边形图层（680 万+）</text>
+  <text class="sm on-a" x="600" y="122">● 点图层叠在上面</text>
+  <text class="sm" x="600" y="150">大区域会盖住小区域，</text>
+  <text class="sm" x="600" y="166">数据量大时逐步渲染</text>
+</svg>
+<figcaption>图 10-6　用 QGIS 连接 PostGIS 并按图层显示（示意；原书图 10.1–10.3 为实际截图）</figcaption>
+</figure>
+
+<p>
+  连接后打开 florida 模式，选中 planet_osm_polygon 表，选择 <strong>Add Layer to Project</strong> 就能看到渲染结果。这张表有 680 多万个多边形，大的区域会盖住小的，地图会随着 QGIS 加载几何数据逐步显示出来（如果看到转圈，说明还在处理）。
+  再把 planet_osm_point 也加为图层，它会叠在多边形图层上面。QGIS 的更多功能见 <a href="https://qgis.org/">官网</a>。
+</p>
+
+<h2 id="query">查询地理数据</h2>
+
+<p>PostGIS 提供了几十个查询和处理地理数据的函数和运算符。我们回到旅行计划，依次探索三个区域：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="佛罗里达旅行路线示意：坦帕、迪士尼世界、迈阿密">
+  <!-- stylized florida -->
+  <path class="area-g" d="M40 40 L330 34 L380 60 L420 64 L440 90 L470 140 L500 190 L530 240 L545 290 L520 310 L490 300 L470 270 L440 250 L420 225 L395 200 L385 170 L370 140 L330 110 L300 90 L250 80 L200 78 L120 70 L40 64 Z" style="fill-opacity:.55"/>
+  <text class="sm on-g" x="110" y="58">佛罗里达（示意轮廓，非真实比例）</text>
+  <text class="sm" x="230" y="200">墨西哥湾</text>
+  <text class="sm" x="560" y="160">大西洋</text>
+
+  <circle class="fill-a" cx="370" cy="160" r="9"/>
+  <text class="ttl on-a" x="352" y="164" text-anchor="end">① 坦帕 Tampa</text>
+  <text class="sm" x="352" y="182" text-anchor="end">点：市中心、酒店、附近餐厅</text>
+
+  <circle class="fill-p" cx="440" cy="132" r="9"/>
+  <text class="ttl on-p" x="456" y="118">② 迪士尼世界</text>
+  <text class="sm" x="456" y="136">面：乐园边界、园内设施</text>
+
+  <circle class="fill-b" cx="530" cy="266" r="9"/>
+  <text class="ttl on-b" x="548" y="262">③ 迈阿密 Miami</text>
+  <text class="sm" x="548" y="280">线：穿过城市的道路</text>
+
+  <path class="ln-r" d="M378 156 Q410 136 432 134" marker-end="url(#ar-r)" style="stroke-dasharray:6 4"/>
+  <path class="ln-r" d="M446 140 Q500 190 524 256" marker-end="url(#ar-r)" style="stroke-dasharray:6 4"/>
+  <text class="sm on-r" x="478" y="214" text-anchor="end">自驾</text>
+</svg>
+<figcaption>图 10-7　本节的旅行路线，每一站练习一类几何（对应原书图 10.4，此处为示意图）</figcaption>
+</figure>
+
+<h3>处理点：坦帕</h3>
+
+<p>这一部分用到的函数：</p>
+
+<div class="tw"><table>
+<tr><th>函数</th><th>作用</th></tr>
+<tr><td><code>ST_Transform(geom, to_srid)</code></td><td>把几何对象的坐标转换到另一个空间参考系，返回新对象</td></tr>
+<tr><td><code>ST_X(point)</code> / <code>ST_Y(point)</code></td><td>取点的 X / Y 坐标</td></tr>
+<tr><td><code>ST_DWithin(g1, g2, distance)</code></td><td>两个几何对象是否在给定距离以内（单位由 SRID 决定）</td></tr>
+<tr><td><code>ST_Distance(g1, g2)</code></td><td>两个几何对象之间的最小二维笛卡尔（平面）距离</td></tr>
+<tr><td><code>ST_MakePoint(x, y)</code></td><td>用 X、Y 坐标创建点</td></tr>
+<tr><td><code>ST_SetSRID(geom, srid)</code></td><td>给几何对象<strong>标记</strong> SRID（不转换坐标，只是声明它是哪个坐标系），常和 ST_MakePoint 配合</td></tr>
+</table></div>
+
+<h4>转换和读取坐标</h4>
+
+<p>旅行从坦帕开始。先找到代表市中心的那个点（通常对应城市的行政中心，而不是城市边界多边形的几何中心）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.11 · 查找坦帕市中心">
+<pre>
+SELECT name, ST_AsText(way) AS coordinates
+FROM florida.planet_osm_point
+WHERE name = 'Tampa' and place = 'city';
+</pre>
+</div>
+<div class="code out"><pre>
+ name  |                 coordinates
+-------+---------------------------------------------
+ Tampa | POINT(-9179231.997685665 3242389.052874039)
+(1 row)
+</pre></div>
+
+<p>这是 Web Mercator 坐标。想换成 GPS 用的经纬度？转换到 SRID 4326：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.12 · 把坐标转换为经纬度">
+<pre>
+SELECT name, ST_AsText(ST_Transform(way, 4326)) AS coordinates
+FROM florida.planet_osm_point
+WHERE name = 'Tampa' and place = 'city';
+</pre>
+</div>
+<div class="code out"><pre>
+ name  |             coordinates
+-------+--------------------------------------
+ Tampa | POINT(-82.458444 27.947759499952074)
+(1 row)
+</pre></div>
+
+<p>经度在前，纬度在后。可以用它生成一个 OSM 链接，在浏览器里打开就能看到标记：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.13 · 生成 OSM 链接">
+<pre>
+WITH tampa_city_point AS (
+  SELECT ST_Transform(way, 4326) AS coordinate
+  FROM florida.planet_osm_point
+  WHERE name = 'Tampa' AND place = 'city'
+)
+SELECT 'https://www.openstreetmap.org/?mlat=' ||
+  ST_Y(coordinate) || '&mlon=' || ST_X(coordinate) AS osm_url
+FROM tampa_city_point;
+</pre>
+</div>
+<div class="code out"><pre>
+                                osm_url
+-----------------------------------------------------------------------
+ https://www.openstreetmap.org/?mlat=27.947759499952074&mlon=-82.458444
+(1 row)
+</pre></div>
+
+<p>CTE 找到点并转换成经纬度，主查询用 <code>ST_Y</code> 取纬度（mlat）、<code>ST_X</code> 取经度（mlon）拼出链接。打开后地图上的标记就是坦帕市中心。</p>
+
+<h4>点与点之间的距离</h4>
+
+<p>
+  你订了水街区（Water Street District）中心的 Roost Apartment Hotel —— 坦帕市中心一个充满活力的滨水街区，有公共空间、一流餐厅，步行就能到文化场馆和公园。现在想找步行可达的餐厅：
+</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.14 · 查找最近的餐厅">
+<pre>
+WITH roost_hotel AS (
+  SELECT way FROM florida.planet_osm_point
+  WHERE name = 'Roost Apartment Hotel' AND tourism='hotel'
+)
+SELECT p.name, p.amenity,
+  round(ST_Distance(h.way,p.way)) as distance_meters,
+  round(ST_Distance(h.way,p.way) * 3.28) as distance_feet
+FROM roost_hotel as h
+JOIN florida.planet_osm_point AS p
+  ON ST_DWithin(h.way, p.way, 500)
+WHERE p.amenity = 'restaurant'
+ORDER BY distance_meters LIMIT 5;
+</pre>
+</div>
+
+<ol>
+  <li>CTE <code>roost_hotel</code> 找到酒店的坐标。</li>
+  <li>用 <code>ST_DWithin(h.way, p.way, 500)</code> 作为 JOIN 条件，找出离酒店 500 米以内的点，WHERE 再筛出餐厅。</li>
+  <li>对每家餐厅用 <code>ST_Distance</code> 算距离，换算成米和英尺，<code>round</code> 取整。</li>
+  <li>按距离排序，取最近的 5 家。</li>
+</ol>
+
+<div class="code out"><pre>
+          name           |  amenity   | distance_meters | distance_feet
+-------------------------+------------+-----------------+---------------
+ Wagamama                | restaurant |              68 |           224
+ Boulon Brasserie        | restaurant |             132 |           435
+ The Pearl               | restaurant |             173 |           567
+ 3 Corners               | restaurant |             252 |           825
+ Fabrica Woodfired Pizza | restaurant |             293 |           962
+(5 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="ST_DWithin 以酒店为中心画出 500 米范围，ST_Distance 计算每家餐厅的距离">
+  <circle class="area-a" cx="250" cy="130" r="110" style="fill-opacity:.4"/>
+  <text class="sm on-a" x="250" y="34" text-anchor="middle">ST_DWithin(…, 500)：500 米以内</text>
+  <rect class="fill-p" x="242" y="122" width="16" height="16" rx="3"/>
+  <text class="sm b on-p" x="250" y="156" text-anchor="middle">Roost 酒店</text>
+  <circle class="dot-b" cx="300" cy="110" r="6"/><text class="sm" x="308" y="106">Wagamama 68 m</text>
+  <circle class="dot-b" cx="200" cy="90" r="6"/><text class="sm" x="120" y="82">Boulon 132 m</text>
+  <circle class="dot-b" cx="190" cy="190" r="6"/><text class="sm" x="96" y="204">The Pearl 173 m</text>
+  <circle class="dot-b" cx="330" cy="200" r="6"/><text class="sm" x="338" y="210">3 Corners 252 m</text>
+  <circle class="dot-b" cx="160" cy="140" r="6"/>
+  <circle class="dot" cx="400" cy="60" r="5"/><circle class="dot" cx="440" cy="236" r="5"/><circle class="dot" cx="80" cy="40" r="5"/>
+  <text class="sm" x="430" y="64">范围外的餐厅被排除</text>
+  <path class="ln-p" d="M258 128 L294 112" style="stroke-dasharray:3 3"/>
+
+  <rect class="bx" x="470" y="90" width="270" height="130" rx="10"/>
+  <text class="ttl" x="486" y="114">为什么用 ST_DWithin 过滤？</text>
+  <text class="sm" x="486" y="138">它能利用<tspan class="b">空间索引</tspan>快速缩小范围；</text>
+  <text class="sm" x="486" y="158">ST_Distance 则必须逐个计算真实距离，</text>
+  <text class="sm" x="486" y="178">用不上索引（10.6 节有实测对比）。</text>
+  <text class="sm" x="486" y="202">所以：DWithin 负责筛，Distance 负责算</text>
+</svg>
+<figcaption>图 10-8　“附近的餐厅”= 先圈范围，再算距离</figcaption>
+</figure>
+
+<p>3857 投影下，ST_DWithin 和 ST_Distance 的单位都是米。</p>
+
+<h4>用坐标直接创建点</h4>
+
+<p>如果已经知道酒店的坐标（<code>SELECT ST_AsText(way) … WHERE name = 'Roost Apartment Hotel'</code> 得到 <code>POINT(-9178356.224987695 3242002.0503882724)</code>），就不用每次去表里查了：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.15 · 查找离给定坐标最近的餐厅">
+<pre>
+WITH roost_hotel AS (
+  SELECT ST_SetSRID(
+    ST_MakePoint(-9178356.224987695, 3242002.0503882724), 3857) as point
+)
+SELECT p.name, p.amenity,
+  round(ST_Distance(h.point,p.way)) as distance_meters,
+  round(ST_Distance(h.point,p.way) * 3.28) as distance_feet
+FROM roost_hotel as h
+JOIN florida.planet_osm_point AS p
+  ON ST_DWithin(h.point, p.way, 500)
+WHERE p.amenity = 'restaurant'
+ORDER BY distance_meters LIMIT 5;
+</pre>
+</div>
+
+<p><code>ST_MakePoint</code> 用坐标创建点，<code>ST_SetSRID</code> 声明它属于 3857 坐标系，结果和清单 10.14 一样。</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 用 EWKT 创建几何对象</div>
+  <p>也可以一步到位：<code>ST_GeomFromEWKT('SRID=3857;POINT(-9178356.224987695 3242002.0503882724)')</code>。EWKT 是 PostGIS 在 WKT 前面加上 SRID 的扩展格式。</p>
+</div>
+
+<p>你在坦帕待了几天：逛了水街、海德公园、伊博城，在布希花园坐过山车，在冒险岛玩水，还开车跨海去了双子城圣彼得堡，在墨西哥湾海滩放松、在码头散步、参观萨尔瓦多·达利博物馆。下一站呢？</p>
+
+<h3>处理多边形：迪士尼世界</h3>
+
+<p>接下来几天你要沉浸在魔法世界里：华特迪士尼世界、环球影城、乐高乐园，离坦帕的酒店都不到 1.5 小时车程。先从迪士尼世界开始了解。这一部分用 planet_osm_polygon 表和四个新函数：</p>
+
+<div class="tw"><table>
+<tr><th>函数</th><th>作用</th></tr>
+<tr><td><code>ST_NPoints(g)</code></td><td>几何对象由多少个点组成</td></tr>
+<tr><td><code>ST_Area(g)</code></td><td>多边形的面积，单位由 SRID 决定</td></tr>
+<tr><td><code>ST_Within(A, B)</code></td><td>A 是否<strong>完全</strong>在 B 之内（A 的所有点都在 B 里）</td></tr>
+<tr><td><code>ST_Equals(A, B)</code></td><td>A 和 B 是否拓扑相等（维度相同、点集占据同样的空间）</td></tr>
+</table></div>
+
+<div class="code" data-lang="sql" data-file="清单 10.16 · 查找多边形及其点数">
+<pre>
+SELECT name, tourism, ST_NPoints(way)
+FROM florida.planet_osm_polygon
+WHERE name = 'Walt Disney World';
+</pre>
+</div>
+<div class="code out"><pre>
+       name        |  tourism   | st_npoints
+-------------------+------------+------------
+ Walt Disney World | theme_park |        473
+(1 row)
+</pre></div>
+
+<p>边界由 473 个点组成，看来面积不小：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.17 · 计算迪士尼世界的面积">
+<pre>
+SELECT name, tourism,
+  ST_Area(way) / 1000000.0 AS area_sq_km,
+  ST_Area(way) / 4046.86 AS area_acres
+FROM florida.planet_osm_polygon
+WHERE name = 'Walt Disney World';
+</pre>
+</div>
+<div class="code out"><pre>
+       name        |  tourism   |    area_sq_km     |     area_acres
+-------------------+------------+-------------------+--------------------
+ Walt Disney World | theme_park | 96.08026819284302 | 23741.930334343917
+(1 row)
+</pre></div>
+
+<p>平方米除以 100 万是平方公里，除以 4046.86 是英亩。96 平方公里！它其实不是一个乐园，而是由几个主题乐园组成的迪士尼宇宙。找出里面的各个乐园：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.18 · 查找迪士尼世界内的各个乐园">
+<pre>
+WITH disney_world AS (
+  SELECT way AS boundaries
+  FROM florida.planet_osm_polygon
+  WHERE name = 'Walt Disney World'
+)
+SELECT p.name, p.tourism
+FROM florida.planet_osm_polygon AS p
+JOIN disney_world AS d ON ST_Within(p.way, d.boundaries)
+WHERE p.name IS NOT NULL
+  AND p.tourism = 'theme_park'
+  AND NOT ST_Equals(p.way, d.boundaries)
+ORDER BY p.name;
+</pre>
+</div>
+
+<ul>
+  <li>CTE 取出迪士尼世界的边界。</li>
+  <li><code>ST_Within(p.way, d.boundaries)</code>：找出完全位于迪士尼世界边界内的多边形。</li>
+  <li>WHERE 只留有名字的主题乐园。</li>
+  <li>迪士尼世界自己也“完全在自己之内”，所以用 <code>NOT ST_Equals(…)</code> 把它排除。</li>
+</ul>
+
+<div class="code out"><pre>
+            name            |  tourism
+----------------------------+------------
+ Disney's Animal Kingdom    | theme_park
+ Disney's Blizzard Beach    | theme_park
+ Disney's Hollywood Studios | theme_park
+ Disney's Typhoon Lagoon    | theme_park
+ EPCOT                      | theme_park
+ Magic Kingdom              | theme_park
+(6 rows)
+</pre></div>
+
+<p>六个主题乐园，各有侧重。每个乐园本身也是多边形，可以继续用 ST_Within 查里面的景点。比如好莱坞影城：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.19 · 查找好莱坞影城里的景点">
+<pre>
+WITH disney_world AS (
+  SELECT way AS boundaries
+  FROM florida.planet_osm_polygon
+  WHERE name = 'Disney''s Hollywood Studios'
+)
+SELECT p.name, p.tourism
+FROM florida.planet_osm_polygon AS p
+JOIN disney_world AS d ON ST_Within(p.way, d.boundaries)
+WHERE p.name is NOT NULL AND p.tourism = 'attraction';
+</pre>
+</div>
+
+<p>（<code>'Disney''s …'</code> 里两个单引号表示一个单引号。乐园自己的 tourism 是 theme_park，会被 <code>= 'attraction'</code> 排除，所以这里不需要 ST_Equals。）</p>
+
+<div class="code out"><pre>
+                    name                    |  tourism
+--------------------------------------------+------------
+ Millennium Falcon: Smugglers Run           | attraction
+ Star Wars: Rise of the Resistance          | attraction
+ Star Tours: The Adventures Continue        | attraction
+ Jim Henson's Muppet*Vision 3-D             | attraction
+ Indiana Jones Epic Stunt Spectacular!      | attraction
+ ...
+ Toy Story Mania!                           | attraction
+ Slinky Dog Dash                            | attraction
+ Rock 'n' Roller Coaster Starring Aerosmith | attraction
+ The Twilight Zone Tower of Terror          | attraction
+ Theater of the Stars                       | attraction
+(17 rows)
+</pre></div>
+
+<p>看来这个乐园更吸引喜欢《星球大战》《夺宝奇兵》《玩具总动员》等电影主题体验的游客。ST_Within 不只能用于多边形，也能用于点和线。用点表找出园内的所有设施：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.20 · 查找好莱坞影城里的所有设施">
+<pre>
+WITH disney_world AS (
+  SELECT way AS boundaries
+  FROM florida.planet_osm_polygon
+  WHERE name = 'Disney''s Hollywood Studios'
+)
+SELECT p.name, p.amenity
+FROM florida.planet_osm_point AS p
+JOIN disney_world AS d ON ST_Within(p.way, d.boundaries)
+WHERE p.name IS NOT NULL AND p.amenity IS NOT NULL;
+</pre>
+</div>
+<div class="code out"><pre>
+                name                 |  amenity
+-------------------------------------+------------
+ Oga's Cantina                       | bar
+ Docking Bay 7 Food and Cargo        | fast_food
+ BaseLine Tap House                  | pub
+ Chase                               | atm
+ Jedi Training: Trials of the Temple | theatre
+ Pizza Rizzo                         | fast_food
+ Mama Melrose's Ristorante Italiano  | restaurant
+ First Aid                           | clinic
+ ...
+ Fantasmic!                          | theatre
+(25 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="多边形层层包含：迪士尼世界包含六个乐园，好莱坞影城里有景点和设施">
+  <path class="area-p" d="M30 40 L360 30 L400 120 L370 260 L60 270 L20 150 Z" style="fill-opacity:.5"/>
+  <text class="ttl on-p" x="50" y="60">Walt Disney World（96 km²，473 个点）</text>
+  <rect class="bx" x="50" y="80" width="90" height="50" rx="20"/><text class="sm" x="95" y="110" text-anchor="middle">Magic Kingdom</text>
+  <rect class="bx" x="160" y="76" width="70" height="46" rx="20"/><text class="sm" x="195" y="104" text-anchor="middle">EPCOT</text>
+  <rect class="bx" x="60" y="160" width="100" height="50" rx="20"/><text class="sm" x="110" y="190" text-anchor="middle">Animal Kingdom</text>
+  <rect class="bx" x="250" y="210" width="100" height="40" rx="18"/><text class="sm" x="300" y="234" text-anchor="middle">Typhoon Lagoon</text>
+  <rect class="bx" x="80" y="222" width="110" height="34" rx="16"/><text class="sm" x="135" y="244" text-anchor="middle">Blizzard Beach</text>
+  <rect class="bx-a" x="200" y="134" width="150" height="70" rx="20"/>
+  <text class="sm b on-a" x="275" y="152" text-anchor="middle">Hollywood Studios</text>
+  <circle class="dot-b" cx="230" cy="174" r="4"/><circle class="dot-b" cx="260" cy="186" r="4"/><circle class="dot-b" cx="300" cy="170" r="4"/>
+  <circle class="dot-g" cx="246" cy="190" r="4"/><circle class="dot-g" cx="320" cy="188" r="4"/><circle class="dot-g" cx="285" cy="192" r="4"/>
+
+  <rect class="bx" x="430" y="30" width="310" height="230" rx="10"/>
+  <text class="ttl" x="446" y="54">空间关系函数</text>
+  <path class="bx-a" d="M450 70 h60 v40 h-60 z"/><path class="bx-b" d="M462 80 h24 v18 h-24 z"/>
+  <text class="mono" x="524" y="86">ST_Within(A, B)</text><text class="sm" x="524" y="102">A 完全在 B 里面</text>
+  <path class="bx-a" d="M450 130 h60 v40 h-60 z"/>
+  <text class="mono" x="524" y="146">ST_Equals(A, B)</text><text class="sm" x="524" y="162">A 和 B 占据同一空间</text>
+  <path class="bx-a" d="M450 190 h40 v40 h-40 z"/><path class="bx-b" d="M474 200 h40 v40 h-40 z" style="fill-opacity:.6"/>
+  <text class="mono" x="524" y="206">ST_Intersects(A, B)</text><text class="sm" x="524" y="222">至少有一个公共点</text>
+  <text class="sm" x="524" y="238">（在内部或穿过边界都算）</text>
+  <text class="sm on-b" x="200" y="282">● 景点（polygon）</text>
+  <text class="sm on-g" x="310" y="282">● 设施（point）</text>
+</svg>
+<figcaption>图 10-9　用 ST_Within 一层层“钻”进多边形</figcaption>
+</figure>
+
+<h3>处理线段：迈阿密</h3>
+
+<p>
+  到了迈阿密，你打算住在迈阿密海滩的酒店，步行就能到大西洋沿岸的海滩，离市中心、布里克尔（Brickell）和设计区也很近，可以逛博物馆、精品店，吃顶级餐厅。
+  规划最后几天时，你好奇怎么处理城市里、或穿过城市边界的道路。这一部分用 planet_osm_line 表和两个函数：
+</p>
+
+<ul>
+  <li><code>ST_Length(g)</code>：几何对象（比如 LineString）的二维笛卡尔长度。</li>
+  <li><code>ST_Intersects(A, B)</code>：两个几何对象至少有一个公共点就返回 true。</li>
+</ul>
+
+<p>先看看有哪些类型的道路：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.21 · 数量最多的 10 类道路">
+<pre>
+SELECT highway, count(highway) AS total_count
+FROM florida.planet_osm_line
+WHERE highway IS NOT NULL
+GROUP BY highway ORDER BY total_count DESC LIMIT 10;
+</pre>
+</div>
+<div class="code out"><pre>
+   highway    | total_count
+--------------+-------------
+ service      |     1121448
+ residential  |      569409
+ footway      |      513955
+ track        |       62237
+ tertiary     |       61515
+ primary      |       57634
+ secondary    |       42877
+ path         |       25646
+ unclassified |       23243
+ trunk        |       15869
+(10 rows)
+</pre></div>
+
+<p>再用 ST_Intersects 找出完全位于迈阿密境内、或穿过其边界的最长的 10 条主干道和次干道：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.22 · 迈阿密境内或穿过迈阿密的最长 10 条道路">
+<pre>
+WITH miami AS (
+  SELECT way AS boundaries
+  FROM florida.planet_osm_polygon
+  WHERE name = 'Miami' AND place = 'city'
+)
+SELECT l.name, l.highway,
+  ST_NPoints(l.way) AS points_number,
+  round(ST_Length(l.way)) AS len_meters,
+  round(ST_Length(l.way) * 3.28084) AS len_feet
+FROM florida.planet_osm_line l
+JOIN miami m ON ST_Intersects(l.way, m.boundaries)
+WHERE l.highway IN ('primary', 'secondary')
+ORDER BY len_meters DESC LIMIT 10;
+</pre>
+</div>
+<div class="code out"><pre>
+         name          |  highway  | points_number | len_meters | len_feet
+-----------------------+-----------+---------------+------------+----------
+ Southwest 22nd Avenue | secondary |            31 |       1422 |     4666
+ Northwest 62nd Street | secondary |            13 |       1326 |     4350
+ Rickenbacker Causeway | primary   |             2 |       1221 |     4006
+ Rickenbacker Causeway | primary   |             2 |       1221 |     4006
+ Northwest 32nd Avenue | secondary |            30 |       1142 |     3748
+ South Miami Avenue    | secondary |            27 |       1046 |     3433
+ Southwest 37th Avenue | secondary |            22 |       1003 |     3289
+ Brickell Avenue       | primary   |            23 |       1002 |     3287
+ Northwest 62nd Street | secondary |            10 |        991 |     3250
+ Southwest 37th Avenue | secondary |            35 |        981 |     3219
+(10 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="ST_Intersects：完全在城市内的道路和穿过城市边界的道路都算">
+  <path class="area-b" d="M120 40 L380 30 L420 100 L400 170 L150 180 L100 110 Z" style="fill-opacity:.5"/>
+  <text class="ttl on-b" x="150" y="62">Miami 城市边界</text>
+  <path class="ln-g" d="M180 120 L260 110 L330 126" style="stroke-width:3"/>
+  <circle class="dot-g" cx="180" cy="120" r="3"/><circle class="dot-g" cx="260" cy="110" r="3"/><circle class="dot-g" cx="330" cy="126" r="3"/>
+  <text class="sm on-g" x="200" y="146">完全在内 ✓</text>
+  <path class="ln-a" d="M300 80 L470 50" style="stroke-width:3"/>
+  <circle class="dot-a" cx="300" cy="80" r="3"/><circle class="dot-a" cx="470" cy="50" r="3"/>
+  <text class="sm on-a" x="440" y="74">穿过边界 ✓（如 Rickenbacker</text>
+  <text class="sm on-a" x="440" y="90">Causeway，只有 2 个点）</text>
+  <path class="ln" d="M470 150 L600 130" style="stroke-width:3"/>
+  <text class="sm" x="560" y="160">完全在外 ✗</text>
+  <text class="sm" x="380" y="200" text-anchor="middle">同名道路出现多次，是因为一条路在 OSM 里被拆成了好几段，分别存储</text>
+</svg>
+<figcaption>图 10-10　ST_Intersects 匹配“在里面”和“穿过”两种情况</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#128161; 路径规划</div>
+  <p>需要计算两地之间的路线、行车距离等导航应用的典型任务时，可以用 <a href="https://pgrouting.org">pgRouting</a> 扩展补充 PostGIS。</p>
+</div>
+
+<h2 id="index">为地理数据建索引</h2>
+
+<p>
+  地理数据有点、多边形、线段等各种形状，坐标在二维甚至多维的空间参考系里。普通的 B-tree 应付不了，需要专门的<strong>空间索引</strong>。
+  空间索引<strong>不存储实际的坐标或形状</strong>，而是索引几何对象所在的<strong>外接矩形（bounding box）</strong> —— 二维空间里一个刚好框住该对象的矩形。
+  靠它就能快速找出位于某区域内、或和某区域相交的几何对象，跳过无关的。PostGIS 支持三种：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="三种空间索引：GiST、SP-GiST、BRIN">
+  <rect class="bx-a" x="20" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-a" x="135" y="44" text-anchor="middle">GiST ★ 默认选择</text>
+  <rect class="bx-b" x="40" y="58" width="110" height="80" style="fill-opacity:.5"/>
+  <rect class="bx-g" x="110" y="90" width="110" height="70" style="fill-opacity:.5"/>
+  <rect class="bx" x="52" y="70" width="40" height="30"/><rect class="bx" x="160" y="110" width="40" height="30"/>
+  <text class="sm" x="135" y="182" text-anchor="middle">大矩形递归分成小矩形，</text>
+  <text class="sm" x="135" y="198" text-anchor="middle">矩形之间可以重叠</text>
+  <text class="sm" x="135" y="222" text-anchor="middle">支持的运算符和函数最多，</text>
+  <text class="sm" x="135" y="238" text-anchor="middle">各种数据规模都表现好</text>
+
+  <rect class="bx-b" x="265" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-b" x="380" y="44" text-anchor="middle">SP-GiST</text>
+  <rect class="bx" x="300" y="58" width="160" height="110"/>
+  <path class="ln" d="M380 58 V168 M300 113 H460"/>
+  <path class="ln-d" d="M340 58 V113 M300 85 H380"/>
+  <circle class="dot-b" cx="380" cy="113" r="4"/><circle class="dot-b" cx="340" cy="85" r="3"/>
+  <text class="sm" x="380" y="190" text-anchor="middle">围绕质心切成 4 个不重叠的象限，</text>
+  <text class="sm" x="380" y="206" text-anchor="middle">再逐层细分（四叉树）</text>
+  <text class="sm" x="380" y="230" text-anchor="middle">适合不重叠、均匀分布的点；支持的运算更少</text>
+
+  <rect class="bx-g" x="510" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-g" x="625" y="44" text-anchor="middle">BRIN</text>
+  <rect class="bx" x="530" y="64" width="60" height="50" rx="4"/><text class="sm" x="560" y="94" text-anchor="middle">页 1-4</text>
+  <rect class="bx" x="600" y="64" width="60" height="50" rx="4"/><text class="sm" x="630" y="94" text-anchor="middle">页 5-8</text>
+  <rect class="bx" x="670" y="64" width="54" height="50" rx="4"/><text class="sm" x="697" y="94" text-anchor="middle">…</text>
+  <text class="sm" x="625" y="140" text-anchor="middle">每个页范围存一个能框住其中</text>
+  <text class="sm" x="625" y="156" text-anchor="middle">所有几何对象的外接矩形</text>
+  <text class="sm" x="625" y="190" text-anchor="middle">体积最小；但要求数据在表里</text>
+  <text class="sm" x="625" y="206" text-anchor="middle">按空间有序存放</text>
+  <text class="sm" x="625" y="230" text-anchor="middle">原理同第 9 章</text>
+</svg>
+<figcaption>图 10-11　PostGIS 支持的三种空间索引</figcaption>
+</figure>
+
+<ul>
+  <li><strong>GiST</strong>（通用搜索树）：把空间划分成能覆盖所有几何对象的外接矩形，大矩形递归拆成小矩形，直到最小的矩形里存着对实际几何对象的引用。<strong>地理数据的默认选择</strong>，支持的空间运算符和函数最多，各种规模和复杂度的数据都表现良好。</li>
+  <li><strong>SP-GiST</strong>（空间划分的通用搜索树）：围绕一个选定的点（<strong>质心</strong>）把空间分成四个不重叠的<strong>象限</strong>，每个象限再围绕自己的质心继续细分。适合重叠很少、分布均匀的数据，比如天然不重叠的点。但支持的运算符和函数比 GiST 少。</li>
+  <li><strong>BRIN</strong>（块范围索引）：为每个表页范围存一个能框住其中所有几何对象的外接矩形。最大的优点是<strong>小</strong>，但前提是数据在表里按某种顺序存放（原理和第 9 章的时序数据一样）。</li>
+</ul>
+
+<p>SP-GiST 和 BRIN 用于地理数据的方法见 <a href="https://postgis.net/docs/using_postgis_dbmanagement.html#build-indexes">PostGIS 文档</a>。下面细看通用的 GiST。</p>
+
+<h3>GiST 的结构</h3>
+
+<p>
+  GiST 是 Postgres 的一种基础索引框架：它实现了底层的索引能力，并暴露一组接口函数，只要为某个数据类型实现这些接口，就能支持新的类型或访问方法。
+  第 6 章用它索引 tsvector 词素；它还被用来索引网络地址 <code>inet</code>、范围类型 <code>int4range</code>/<code>daterange</code>、pg_trgm 的三元组等等。
+</p>
+
+<p>
+  PostGIS 用 GiST 为 geometry 和 geography 提供索引，实现了包含、相交等空间函数和运算符的访问方法。具体来说，它在 GiST 之上实现了一棵 <strong>R-tree</strong>：
+  R 代表 rectangular（矩形），即把空间分成能框住点、线段等数据的外接矩形。查询只需要看那些和目标矩形包含、相交或不相交的部分。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 360" role="img" aria-label="GiST R-tree：顶层矩形 R1-R5，下层矩形，叶子指向点；查找迈阿密市中心的路径">
+  <!-- map side -->
+  <text class="ttl" x="20" y="22">空间划分（示意）</text>
+  <rect class="bx-b" x="20" y="34" width="150" height="80" style="fill-opacity:.5"/><text class="sm b on-b" x="28" y="50">R1</text>
+  <rect class="bx" x="30" y="58" width="60" height="44"/><text class="sm" x="36" y="72">R6</text>
+  <rect class="bx" x="96" y="62" width="64" height="44"/><text class="sm" x="102" y="76">R7</text>
+  <rect class="bx-g" x="150" y="40" width="110" height="90" style="fill-opacity:.5"/><text class="sm b on-g" x="230" y="56">R2</text>
+  <rect class="bx-p" x="250" y="34" width="110" height="100" style="fill-opacity:.5"/><text class="sm b on-p" x="330" y="50">R3</text>
+  <rect class="bx" x="200" y="140" width="150" height="80" style="fill-opacity:.5"/><text class="sm b" x="320" y="156">R4</text>
+  <rect class="bx-a" x="150" y="190" width="140" height="150" style="fill-opacity:.55"/><text class="sm b on-a" x="158" y="206">R5（南佛罗里达）</text>
+  <rect class="bx" x="160" y="214" width="56" height="54"/><text class="sm" x="166" y="228">R22</text>
+  <rect class="bx" x="222" y="214" width="58" height="54"/><text class="sm" x="228" y="228">R23</text>
+  <rect class="bx-r" x="222" y="274" width="58" height="56" style="fill-opacity:.7"/><text class="sm b on-r" x="228" y="288">R24</text>
+  <rect class="bx" x="160" y="274" width="56" height="56"/><text class="sm" x="166" y="288">R25</text>
+  <circle class="dot-r" cx="244" cy="306" r="4"/><circle class="dot-r" cx="262" cy="316" r="4"/>
+  <text class="sm on-r" x="300" y="312">★ 迈阿密市中心</text>
+  <path class="ln-r" d="M298 308 L268 314"/>
+
+  <!-- tree side -->
+  <text class="ttl" x="400" y="22">索引结构（两层）</text>
+  <rect class="bx" x="440" y="36" width="280" height="34" rx="6"/>
+  <text class="mono" x="470" y="58" text-anchor="middle">R1</text><text class="mono" x="525" y="58" text-anchor="middle">R2</text><text class="mono" x="580" y="58" text-anchor="middle">R3</text><text class="mono" x="635" y="58" text-anchor="middle">R4</text>
+  <rect class="cell-a" x="670" y="40" width="44" height="26"/><text class="mono on-a b" x="692" y="58" text-anchor="middle">R5</text>
+  <text class="sm" x="430" y="58" text-anchor="end">根</text>
+
+  <rect class="bx" x="400" y="108" width="110" height="34" rx="6"/><text class="mono" x="455" y="130" text-anchor="middle">R6 R7 R8 R9</text>
+  <rect class="bx" x="520" y="108" width="80" height="34" rx="6"/><text class="mono" x="560" y="130" text-anchor="middle">R10…</text>
+  <rect class="bx-a" x="610" y="108" width="140" height="34" rx="6"/><text class="mono" x="628" y="130">R22 R23</text><rect class="cell-r" x="688" y="114" width="28" height="22"/><text class="mono on-r b" x="702" y="130" text-anchor="middle">R24</text><text class="mono" x="732" y="130" text-anchor="middle">R25</text>
+  <path class="ln" d="M470 72 L455 104"/><path class="ln" d="M535 72 L560 104"/><path class="ln-a" d="M692 72 L680 104" marker-end="url(#ar-a)"/>
+
+  <rect class="bx" x="400" y="180" width="110" height="50" rx="6"/><text class="mono" x="455" y="200" text-anchor="middle">p1 p20</text><text class="sm" x="455" y="220" text-anchor="middle">（R6 里的点）</text>
+  <rect class="bx-r" x="610" y="180" width="140" height="50" rx="6"/><text class="mono on-r b" x="680" y="200" text-anchor="middle">p423 p345</text><text class="sm" x="680" y="220" text-anchor="middle">（R24 里的点）</text>
+  <path class="ln" d="M430 144 L440 176"/><path class="ln-r" d="M702 144 L690 176" marker-end="url(#ar-r)"/>
+  <text class="sm" x="560" y="210" text-anchor="middle">… 叶子指向表行 …</text>
+
+  <rect class="bx-d" x="400" y="252" width="350" height="96" rx="10"/>
+  <text class="sm b" x="414" y="274">找迈阿密市中心附近的文化场所：</text>
+  <text class="sm" x="414" y="294">① 根：市中心在 R5 里（南佛罗里达）</text>
+  <text class="sm" x="414" y="312">② 只看 R5 下面的 R22–R25，发现落在 R24</text>
+  <text class="sm" x="414" y="330">③ 只扫描 R24 里的点，返回匹配的 p423、p345</text>
+</svg>
+<figcaption>图 10-12　GiST（R-tree）：从大矩形到小矩形，最终只检查少量的点（对应原书图 10.6–10.9）</figcaption>
+</figure>
+
+<ul>
+  <li>根节点条目存顶层矩形 R1–R5 的边界，它们一起覆盖整个佛罗里达，彼此可以相交。</li>
+  <li>第二层存更小的矩形，每个都位于某个上层矩形之内。比如 R6–R9 都在 R1 里，所以被 R1 引用。</li>
+  <li>第二层的矩形是<strong>叶子</strong>条目，不再引用更小的矩形，而是指向被索引的表数据（这里是点）。比如 R6 引用了 p1、p20 两行。</li>
+</ul>
+
+<h3>使用 GiST 索引</h3>
+
+<p>在迈阿密期间，家人想去布里克尔逛街。找出离 Brickell City Centre 站步行可达的商店：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.23 · 离 Brickell City Centre 最近的 10 家商店">
+<pre>
+WITH brickell AS (
+  SELECT way FROM florida.planet_osm_point
+  WHERE name = 'Brickell City Centre' and railway = 'station'
+)
+SELECT p.name, p.shop,
+  round(ST_Distance(b.way,p.way)) as distance_meters,
+  round(ST_Distance(b.way,p.way) * 3.28) as distance_feet
+FROM brickell as b
+JOIN florida.planet_osm_point AS p
+  ON ST_DWithin(b.way, p.way, 500)
+WHERE p.shop IS NOT NULL
+ORDER BY distance_meters LIMIT 10;
+</pre>
+</div>
+<div class="code out"><pre>
+        name         |   shop    | distance_meters | distance_feet
+---------------------+-----------+-----------------+---------------
+ Intimissimi         | clothes   |              63 |           207
+ Sur La Table        | houseware |              67 |           220
+ Bath & Body Works   | cosmetics |              69 |           227
+ Swarovski           | jewelry   |              69 |           228
+ Acqua di Parma      | perfumery |              76 |           250
+ Sunglass Hut        | optician  |              78 |           256
+ Santa Maria Novella | perfumery |              79 |           260
+ Vilebrequin         | clothes   |              79 |           259
+ Agent Provocateur   | clothes   |              81 |           266
+ APM Monaco          | jewelry   |              83 |           271
+(10 rows)
+</pre></div>
+
+<p>看执行计划之前，先看看已有哪些索引：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.24 · 查看已有的索引">
+<pre>
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'florida' AND tablename LIKE 'planet_osm_%';
+</pre>
+</div>
+<div class="code out"><pre>
+         indexname          |                  indexdef
+----------------------------+---------------------------------------------
+ planet_osm_line_way_idx    | CREATE INDEX planet_osm_line_way_idx ON
+                            | florida.planet_osm_line USING gist (way)
+                            | WITH (fillfactor='100')
+ planet_osm_point_way_idx   | ... florida.planet_osm_point USING gist (way) ...
+ planet_osm_polygon_way_idx | ... florida.planet_osm_polygon USING gist (way) ...
+ planet_osm_roads_way_idx   | ... florida.planet_osm_roads USING gist (way) ...
+</pre></div>
+
+<ul>
+  <li>这些 GiST 索引是 osm2pgsql 导入时自动建的：<code>USING gist (way)</code>。</li>
+  <li><code>WITH (fillfactor='100')</code>：控制索引方法把索引页填得多满（百分比）。100 是默认值，树更密、层数更少。自己建 GiST 不需要调整时可以省略。</li>
+</ul>
+
+<p>但在用 way 列的 GiST 索引之前，查询得先用 <code>WHERE name = 'Brickell City Centre' AND railway = 'station'</code> 找到车站坐标 —— name 和 railway 上都没有索引，会导致对 planet_osm_point 全表扫描。表里有 200 多万个没名字的点，所以建一个只包含有名字的点的<strong>部分索引</strong>（第 4 章）：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.25 · 在 name 列上创建 B-tree 部分索引">
+<pre>
+CREATE INDEX florida_point_name_idx
+ON florida.planet_osm_point(name)
+WHERE name IS NOT NULL;
+</pre>
+</div>
+
+<div class="code" data-lang="sql" data-file="清单 10.26 · 使用 GiST 索引的执行计划">
+<pre>
+EXPLAIN (analyze, costs off)
+WITH brickell AS (
+  SELECT way FROM florida.planet_osm_point
+  WHERE name = 'Brickell City Centre' and railway = 'station'
+)
+SELECT p.name, p.shop,
+  round(ST_Distance(b.way,p.way)) as distance_meters,
+  round(ST_Distance(b.way,p.way) * 3.28) as distance_feet
+FROM brickell as b
+JOIN florida.planet_osm_point AS p
+  ON ST_DWithin(b.way, p.way, 500)
+WHERE p.shop IS NOT NULL
+ORDER BY distance_meters LIMIT 10;
+</pre>
+</div>
+<div class="code out"><pre>
+ Limit (actual time=0.991..1.005 rows=10 loops=1)
+   -> Result (actual time=0.987..0.998 rows=10 loops=1)
+         -> Sort (actual time=0.981..0.984 rows=10 loops=1)
+               Sort Key: (round(st_distance(planet_osm_point.way, p.way)))
+               Sort Method: top-N heapsort Memory: 27kB
+               -> Nested Loop (actual time=0.456..0.948 rows=36 loops=1)
+                     -> Index Scan using florida_point_name_idx on planet_osm_point
+                          (actual time=0.074..0.078 rows=1 loops=1)
+                           Index Cond: (name = 'Brickell City Centre'::text)
+                           Filter: (railway = 'station'::text)
+                           Rows Removed by Filter: 2
+                     -> Bitmap Heap Scan on planet_osm_point p
+                          (actual time=0.370..0.831 rows=36 loops=1)
+                           Filter: ((shop IS NOT NULL) AND
+                                    st_dwithin(planet_osm_point.way, way, '500'::double precision))
+                           Rows Removed by Filter: 1169
+                           Heap Blocks: exact=21
+                           -> Bitmap Index Scan on planet_osm_point_way_idx
+                                (actual time=0.308..0.308 rows=1205 loops=1)
+                                 Index Cond: (way && st_expand(planet_osm_point.way,
+                                                               '500'::double precision))
+ Planning Time: 2.925 ms
+ Execution Time: 1.125 ms
+</pre></div>
+
+<ol>
+  <li>数据库做了一个<strong>嵌套循环连接（Nested Loop）</strong>：外层的每一行都和内层的行比较。</li>
+  <li>先算外层，也就是 brickell CTE：用 B-tree 部分索引找到 3 条名叫 Brickell City Centre 的记录，其中 2 条不是车站被过滤掉，剩下 1 行。</li>
+  <li>内层用这一行的车站坐标做 <strong>Bitmap Index Scan</strong>，遍历 GiST 索引：用<strong>外接矩形运算符 <code>&amp;&amp;</code></strong> 检查每个点是否和 <code>st_expand(车站, 500)</code> 生成的“车站周围 500 米的矩形”相交。得到 1205 个候选。</li>
+  <li><strong>Bitmap Heap Scan</strong> 访问 21 个页，用更精确的 <code>st_dwithin</code>（比较真实距离，而不只是矩形）和 <code>shop IS NOT NULL</code> 过滤，剔除 1169 行，剩 36 行。</li>
+  <li>连接完成后排序，返回最近的 10 家。</li>
+</ol>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="ST_DWithin 的两阶段过滤：先用索引按外接矩形粗筛，再按真实距离精筛">
+  <rect class="area-b" x="60" y="30" width="200" height="200" style="fill-opacity:.4"/>
+  <circle class="area-a" cx="160" cy="130" r="100" style="fill-opacity:.5"/>
+  <rect class="fill-p" x="152" y="122" width="16" height="16" rx="3"/>
+  <g>
+    <circle class="dot-g" cx="130" cy="100" r="4"/><circle class="dot-g" cx="190" cy="160" r="4"/><circle class="dot-g" cx="120" cy="170" r="4"/><circle class="dot-g" cx="200" cy="90" r="4"/>
+    <circle class="dot-r" cx="72" cy="44" r="4"/><circle class="dot-r" cx="248" cy="220" r="4"/><circle class="dot-r" cx="250" cy="42" r="4"/>
+    <circle class="dot" cx="320" cy="80" r="4"/><circle class="dot" cx="300" cy="200" r="4"/><circle class="dot" cx="30" cy="250" r="4"/>
+  </g>
+  <text class="sm on-b" x="60" y="248">st_expand(车站, 500) 生成的矩形</text>
+  <text class="sm on-a" x="160" y="22" text-anchor="middle">真正的 500 米圆</text>
+
+  <rect class="bx-b" x="380" y="30" width="360" height="80" rx="10"/>
+  <text class="ttl on-b" x="396" y="54">① 粗筛（走 GiST 索引）</text>
+  <text class="mono" x="396" y="76">way &amp;&amp; st_expand(车站, 500)</text>
+  <text class="sm" x="396" y="96">矩形相交就算候选：绿点 + 红点（1205 个），灰点被跳过</text>
+
+  <rect class="bx-a" x="380" y="126" width="360" height="80" rx="10"/>
+  <text class="ttl on-a" x="396" y="150">② 精筛（回表逐个检查）</text>
+  <text class="mono" x="396" y="172">st_dwithin(车站, way, 500)</text>
+  <text class="sm" x="396" y="192">在矩形四角、圆外的红点被剔除，只留绿点</text>
+  <text class="sm" x="560" y="236" text-anchor="middle">ST_DWithin、ST_Contains、ST_Intersects、ST_Overlaps…</text>
+  <text class="sm" x="560" y="252" text-anchor="middle">都是这种“索引感知”函数</text>
+</svg>
+<figcaption>图 10-13　索引感知函数：先用外接矩形 &amp;&amp; 走索引粗筛，再做精确计算</figcaption>
+</figure>
+
+<p>
+  ST_DWithin 是<strong>索引感知（index-aware）</strong>的函数之一：它先用外接矩形运算符 <code>&amp;&amp;</code> 配合 ST_Expand 借助 GiST 做快速初筛。
+  ST_Contains、ST_Intersects、ST_Overlaps 等也都依赖 <code>&amp;&amp;</code> 这类外接矩形运算符来利用 GiST（更多见 <a href="https://postgis.net/docs/using_postgis_query.html#using-query-indexes">PostGIS 文档</a>）。
+</p>
+
+<p>但 <strong>ST_Distance 不是索引感知的</strong>：它总是计算几何对象之间的真实距离，不使用外接矩形运算符。把 JOIN 条件换成 <code>ST_Distance(b.way, p.way) &lt;= 500</code> 试试：</p>
+
+<div class="code" data-lang="sql" data-file="清单 10.27 · 使用 ST_Distance 时的执行计划">
+<pre>
+EXPLAIN (analyze, costs off)
+WITH brickell AS (
+  SELECT way FROM florida.planet_osm_point
+  WHERE name = 'Brickell City Centre' and railway = 'station'
+)
+SELECT p.name, p.shop,
+  round(ST_Distance(b.way,p.way)) as distance_meters,
+  round(ST_Distance(b.way,p.way) * 3.28) as distance_feet
+FROM brickell as b
+JOIN florida.planet_osm_point AS p
+  ON ST_Distance(b.way, p.way) <= 500
+WHERE p.shop IS NOT NULL
+ORDER BY distance_meters LIMIT 10;
+</pre>
+</div>
+<div class="code out"><pre>
+ Limit (actual time=474.273..481.189 rows=10 loops=1)
+   -> Result (actual time=426.333..433.247 rows=10 loops=1)
+         -> Sort (actual time=426.214..433.125 rows=10 loops=1)
+               -> Nested Loop (actual time=388.195..433.100 rows=36 loops=1)
+                     Join Filter: (st_distance(planet_osm_point.way, p.way) <= '500'::double precision)
+                     Rows Removed by Join Filter: 18640
+                     -> Index Scan using florida_point_name_idx on planet_osm_point ...
+                     -> Gather (actual time=1.748..426.856 rows=18676 loops=1)
+                           Workers Planned: 2
+                           Workers Launched: 2
+                           -> Parallel Seq Scan on planet_osm_point p
+                                (actual time=103.089..300.202 rows=6225 loops=3)
+                                 Filter: (shop IS NOT NULL)
+                                 Rows Removed by Filter: 807749
+ Planning Time: 0.556 ms
+ Execution Time: 488.119 ms
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 1.1 ms vs 488 ms</div>
+  <p>
+    GiST 索引完全没用上，Postgres 只好启动多个工作进程<strong>并行全表扫描</strong>，把佛罗里达所有的商店都拿来算一遍距离。
+    结论：<strong>“在某距离之内”这种条件，永远写 <code>ST_DWithin</code>，不要写 <code>ST_Distance(…) &lt;= N</code></strong>。ST_Distance 留给 SELECT 里计算要显示的距离。
+  </p>
+</div>
+
+<p>到这里，我们已经掌握了足够的 PostGIS 能力来开发地理空间应用，也顺便逛了一遍佛罗里达那些值得一去的地方。</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li><strong>PostGIS</strong> 把 Postgres 变成地理空间数据库，引入专门的数据类型和大量查询处理函数。</li>
+  <li><strong>geometry</strong> 在欧氏平面上用笛卡尔数学计算，简单快速；<strong>geography</strong> 用球面模型考虑地球曲率，更准但更慢。</li>
+  <li>SRID 标明坐标系：3857（Web Mercator，米）、4326（WGS 84，经纬度）；<code>ST_Transform</code> 在两者之间转换。</li>
+  <li>几十个空间函数可以查询、创建、转换和处理地理数据：ST_DWithin、ST_Distance、ST_Within、ST_Equals、ST_Intersects、ST_Area、ST_Length……</li>
+  <li>PostGIS 能和 QGIS 等图形化工具集成。</li>
+  <li>地理查询可以用 GiST、SP-GiST、BRIN 索引优化，<strong>GiST 是默认选择</strong>；ST_DWithin、ST_Contains、ST_Intersects 等<strong>索引感知</strong>函数能用上 GiST。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>找出迈阿密市中心（<code>name = 'Miami' AND place = 'city'</code> 的点）1 公里内所有的咖啡馆（<code>amenity = 'cafe'</code>），并生成每家的 OSM 链接。</li>
+    <li>把清单 10.17 改用 geography 计算：<code>ST_Area(ST_Transform(way, 4326)::geography)</code>，和 Web Mercator 下的 96 km² 比较 —— 差别有多大？为什么？（提示：Web Mercator 离赤道越远面积放大越多）</li>
+    <li>统计迪士尼世界六个乐园各自的面积，按大小排序。</li>
+    <li>用 <code>ST_Intersects</code> 找出穿过迪士尼世界边界的所有道路，并按 highway 类型分组计数。</li>
+    <li>在 planet_osm_point 的 way 列上再建一个 SP-GiST 索引（<code>USING spgist (way)</code>），比较它和 GiST 索引的大小，以及清单 10.26 的执行计划。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
