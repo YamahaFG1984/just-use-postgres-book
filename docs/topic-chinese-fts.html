@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>专题 1 · 中文全文搜索 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="14">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">专题 1 · 补充内容（原书之外）</span>
+<h1>中文全文搜索</h1>
+<p class="lede">
+  第 6 章用的都是英文。如果直接把那一套用在中文上，会发现搜什么都搜不到 —— 因为中文词与词之间<strong>没有空格</strong>，Postgres 内置的解析器根本不知道该在哪里切开。
+  这一页用 <strong>zhparser</strong> 扩展给 Postgres 装上中文分词，并对比 <code>pg_trgm</code> 和第 8 章的向量搜索，帮你选对方案。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 本页的例子都实际运行过</div>
+  <p>所有输出均在 Postgres 17.2 + zhparser 2.4（SCWS 1.2.3）上实测得到。阅读前最好先读完<a href="ch06.html">第 6 章</a>，本页沿用那里的概念：词素、tsvector、tsquery、全文搜索配置、GIN。</p>
+</div>
+
+<div class="goals">
+  <h4>本页目标</h4>
+  <ul>
+    <li>理解默认配置为什么处理不了中文</li>
+    <li>构建带 zhparser 的 Postgres 镜像，创建中文全文搜索配置</li>
+    <li>用中文完成第 6 章的全套操作：生成列、查询、排序、高亮、GIN 索引</li>
+    <li>调优分词：自定义词典（以及它的一个大坑）、复合词拆分</li>
+    <li>知道 pg_trgm 对中文的局限，会在全文搜索、模糊匹配、语义搜索之间选择</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="problem">问题：默认配置不认识中文</h2>
+
+<p>拿第 6 章那句“5 explorers are traveling to a distant galaxy”的中文版试试：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT to_tsvector('simple',  '五名探险家正在前往遥远的星系');
+SELECT to_tsvector('english', '五名探险家正在前往遥远的星系');
+</pre></div>
+<div class="code out"><pre>
+           to_tsvector
+----------------------------------
+ '五名探险家正在前往遥远的星系':1
+(1 row)
+</pre></div>
+
+<p>两种配置的结果一模一样：<strong>整句话被当成了一个词素</strong>。于是搜“星系”什么也搜不到 —— 词素里只有“五名探险家正在前往遥远的星系”这一个“词”。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="英文靠空格分词，中文没有空格，默认解析器把整句当成一个词">
+  <text class="ttl" x="20" y="24">英文：空格天然就是词的边界</text>
+  <g>
+    <rect class="cell-b" x="20" y="36" width="60" height="30"/><text class="mono" x="50" y="56" text-anchor="middle">5</text>
+    <rect class="cell-b" x="84" y="36" width="96" height="30"/><text class="mono" x="132" y="56" text-anchor="middle">explorers</text>
+    <rect class="cell-b" x="184" y="36" width="54" height="30"/><text class="mono" x="211" y="56" text-anchor="middle">are</text>
+    <rect class="cell-b" x="242" y="36" width="96" height="30"/><text class="mono" x="290" y="56" text-anchor="middle">traveling</text>
+    <rect class="cell-b" x="342" y="36" width="40" height="30"/><text class="mono" x="362" y="56" text-anchor="middle">to</text>
+    <text class="sm" x="392" y="56">…</text>
+  </g>
+  <text class="sm on-g" x="440" y="56">✓ 解析器按空格切开，再交给词干字典</text>
+
+  <text class="ttl" x="20" y="104">中文：字挨着字，没有任何分隔符</text>
+  <rect class="cell-r" x="20" y="116" width="362" height="30"/><text class="mono" x="201" y="136" text-anchor="middle">五名探险家正在前往遥远的星系</text>
+  <text class="sm on-r" x="440" y="136">✗ 默认解析器只能整句当成一个“词”</text>
+
+  <text class="ttl" x="20" y="184">需要：一个懂中文的分词器</text>
+  <g>
+    <rect class="cell-g" x="20" y="196" width="50" height="30"/><text class="mono" x="45" y="216" text-anchor="middle">五名</text>
+    <rect class="cell-g" x="74" y="196" width="66" height="30"/><text class="mono" x="107" y="216" text-anchor="middle">探险家</text>
+    <rect class="cell-g" x="144" y="196" width="50" height="30"/><text class="mono" x="169" y="216" text-anchor="middle">正在</text>
+    <rect class="cell-g" x="198" y="196" width="50" height="30"/><text class="mono" x="223" y="216" text-anchor="middle">前往</text>
+    <rect class="cell-g" x="252" y="196" width="50" height="30"/><text class="mono" x="277" y="216" text-anchor="middle">遥远</text>
+    <rect class="cell" x="306" y="196" width="26" height="30"/><text class="mono" x="319" y="216" text-anchor="middle">的</text>
+    <rect class="cell-g" x="336" y="196" width="50" height="30"/><text class="mono" x="361" y="216" text-anchor="middle">星系</text>
+  </g>
+  <text class="sm on-g" x="440" y="216">✓ 基于词典切词，还能标出词性</text>
+</svg>
+<figcaption>图 S1-1　中文全文搜索的第一步，是先解决“分词”</figcaption>
+</figure>
+
+<p>
+  Postgres 的全文搜索框架是可插拔的：<strong>解析器（parser）</strong>负责切词，<strong>字典</strong>负责规范化（回顾第 6 章图 6-4）。
+  所以中文的解法就是换一个懂中文的解析器。常见的选择有基于 SCWS 词典的 <strong>zhparser</strong> 和基于结巴分词的 <strong>pg_jieba</strong>。本页用 zhparser。
+</p>
+
+<h2 id="install">构建带 zhparser 的 Postgres</h2>
+
+<p>
+  zhparser 不在官方镜像和 PGDG 软件源里，需要从源码编译（依赖 SCWS 分词库）。本书仓库的 <code>extras/zhparser/Dockerfile</code> 已经写好了：
+</p>
+
+<div class="code" data-lang="bash" data-file="extras/zhparser/Dockerfile"><pre>
+# Postgres 17 + zhparser（基于 SCWS 的中文分词扩展）
+ARG PG_IMAGE=postgres:17.2
+
+FROM ${PG_IMAGE} AS build
+ARG SCWS_VERSION=1.2.3
+ARG ZHPARSER_COMMIT=2e995c4df672563992b4d7a147b8fa2d0d4cda6c
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates git wget bzip2 \
+      postgresql-server-dev-${PG_MAJOR} \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN wget -q -O - http://www.xunsearch.com/scws/down/scws-${SCWS_VERSION}.tar.bz2 | tar xjf - \
+ && cd scws-${SCWS_VERSION} && ./configure && make && make install
+RUN git clone https://github.com/amutu/zhparser.git \
+ && cd zhparser && git checkout ${ZHPARSER_COMMIT} \
+ && make && make install
+
+FROM ${PG_IMAGE}
+COPY --from=build /usr/local/lib/libscws.so* /usr/local/lib/
+COPY --from=build /usr/lib/postgresql/${PG_MAJOR}/lib/zhparser.so /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY --from=build /usr/share/postgresql/${PG_MAJOR}/extension/zhparser* /usr/share/postgresql/${PG_MAJOR}/extension/
+COPY --from=build /usr/share/postgresql/${PG_MAJOR}/tsearch_data/dict.utf8.xdb \
+                  /usr/share/postgresql/${PG_MAJOR}/tsearch_data/rules.utf8.ini \
+                  /usr/share/postgresql/${PG_MAJOR}/tsearch_data/
+RUN ldconfig
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="多阶段构建：编译阶段装依赖并编译，最终镜像只拷贝编译产物">
+  <rect class="bx-b" x="20" y="20" width="330" height="170" rx="12"/>
+  <text class="ttl on-b" x="185" y="44" text-anchor="middle">阶段 1：build（用完即弃）</text>
+  <text class="sm" x="36" y="70">• apt 安装编译器和 postgresql-server-dev</text>
+  <text class="sm" x="36" y="92">• 下载并编译 SCWS 分词库</text>
+  <text class="sm" x="36" y="114">• 下载并编译 zhparser（固定到某次提交）</text>
+  <text class="sm" x="36" y="144">这些工具和开发包很大，</text>
+  <text class="sm" x="36" y="162">而且可能顺带升级服务器的库</text>
+
+  <path class="ln-a" d="M352 105 H406" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="379" y="96" text-anchor="middle">COPY</text>
+  <text class="sm on-a" x="379" y="122" text-anchor="middle">--from</text>
+
+  <rect class="bx-g" x="410" y="20" width="330" height="170" rx="12"/>
+  <text class="ttl on-g" x="575" y="44" text-anchor="middle">阶段 2：最终镜像</text>
+  <text class="sm" x="426" y="70">• 干净的 postgres:17.2</text>
+  <text class="sm" x="426" y="92">• libscws.so（分词库）</text>
+  <text class="sm" x="426" y="114">• zhparser.so + 扩展控制文件和 SQL</text>
+  <text class="sm" x="426" y="136">• dict.utf8.xdb（词典）、rules.utf8.ini（规则）</text>
+  <text class="sm on-g" x="426" y="166">✓ 小，且自带的 pg_trgm 等扩展不受影响</text>
+</svg>
+<figcaption>图 S1-2　为什么用多阶段构建</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; 不要在运行中的容器里直接 apt install 开发包</div>
+  <p>
+    写这一页时我们踩过这个坑：在 <code>postgres:17.2</code> 容器里直接 <code>apt install postgresql-server-dev-17</code>，apt 会把服务器包顺带升级到软件源里最新的 17.x 小版本。
+    结果正在运行的 17.2 服务器加载 pg_trgm 时报错：<code>could not load library ".../pg_trgm.so": undefined symbol: pg_mblen_unbounded</code>。
+    多阶段构建把编译环境和运行环境彻底隔开，就不会出这种问题。
+  </p>
+</div>
+
+<p>在仓库根目录构建并启动（先停掉占用 5432 端口的容器）：</p>
+
+<div class="code" data-lang="bash"><pre>
+docker build -t postgres-zhparser:17 extras/zhparser
+
+docker volume create postgres-zh-volume
+docker run --name postgres-zh \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password \
+    -p 5432:5432 \
+    -v postgres-zh-volume:/var/lib/postgresql/data \
+    -d postgres-zhparser:17
+
+docker exec -it postgres-zh psql -U postgres
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; Apple Silicon</div>
+  <p>镜像是从源码编译的，postgres 官方镜像也是多架构的，所以理论上在 arm64 上直接 <code>docker build</code> 即可（本页在 amd64 上验证）。</p>
+</div>
+
+<h2 id="config">创建中文全文搜索配置</h2>
+
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION zhparser;
+
+-- 新建一个配置，用 zhparser 作解析器
+CREATE TEXT SEARCH CONFIGURATION chinese (PARSER = zhparser);
+
+-- 指定哪些词性要保留、交给哪个字典
+ALTER TEXT SEARCH CONFIGURATION chinese
+  ADD MAPPING FOR n,v,a,i,e,l,x WITH simple;
+</pre></div>
+
+<p>
+  和第 6 章一样，<strong>配置 = 解析器 + 映射</strong>。zhparser 切出的每个词都带一个<strong>词性</strong>（token type），映射决定哪些词性要保留。没有映射的词性会被丢弃，相当于停用词。
+  <code>\dFp+ zhparser</code> 可以看到它支持的全部 26 种词性，节选：
+</p>
+
+<div class="tw"><table>
+<tr><th>代号</th><th>词性</th><th>例子</th><th>本页是否保留</th></tr>
+<tr><td><code>n</code></td><td>名词 noun</td><td>探险家、星系、地球</td><td>✓</td></tr>
+<tr><td><code>v</code></td><td>动词 verb</td><td>前往、穿越、寻找</td><td>✓</td></tr>
+<tr><td><code>a</code></td><td>形容词 adjective</td><td>遥远、巨大</td><td>✓</td></tr>
+<tr><td><code>i</code></td><td>成语 idiom</td><td>—</td><td>✓</td></tr>
+<tr><td><code>e</code></td><td>感叹词 exclamation</td><td>—</td><td>✓</td></tr>
+<tr><td><code>l</code></td><td>习用语 tmp</td><td>—</td><td>✓</td></tr>
+<tr><td><code>x</code></td><td>未知词 unknown</td><td>词典里没有的词、<strong>自定义词</strong></td><td>✓（原因见后文）</td></tr>
+<tr><td><code>u</code></td><td>助词 auxiliary</td><td>的、了</td><td>✗</td></tr>
+<tr><td><code>m</code></td><td>数词 numeral</td><td>一、五</td><td>✗</td></tr>
+<tr><td><code>p</code> <code>c</code> <code>d</code> <code>r</code></td><td>介词、连词、副词、代词</td><td>在、和、很、我</td><td>✗</td></tr>
+<tr><td><code>w</code></td><td>标点</td><td>，。</td><td>✗</td></tr>
+</table></div>
+
+<p>现在再试一次：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT to_tsvector('chinese', '五名探险家正在前往遥远的星系');
+</pre></div>
+<div class="code out"><pre>
+                       to_tsvector
+---------------------------------------------------------
+ '五名':1 '前往':4 '探险家':2 '星系':6 '正在':3 '遥远':5
+(1 row)
+</pre></div>
+
+<p>用 <code>ts_debug</code> 看看每个词的词性，以及为什么“的”消失了：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT token, description, lexemes
+FROM ts_debug('chinese', '五名探险家正在前往遥远的星系');
+</pre></div>
+<div class="code out"><pre>
+ token  |   description    | lexemes
+--------+------------------+----------
+ 五名   | noun,名词        | {五名}
+ 探险家 | noun,名词        | {探险家}
+ 正在   | noun,名词        | {正在}
+ 前往   | verb,动词        | {前往}
+ 遥远   | adjective,形容词 | {遥远}
+ 的     | auxiliary,助词   |
+ 星系   | noun,名词        | {星系}
+(7 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="zhparser 切词并标注词性，配置映射决定保留哪些">
+  <rect class="bx" x="20" y="70" width="150" height="60" rx="10"/>
+  <text class="sm b" x="95" y="96" text-anchor="middle">原文</text>
+  <text class="sm" x="95" y="116" text-anchor="middle">…遥远的星系</text>
+  <path class="ln" d="M172 100 H210" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="214" y="50" width="170" height="100" rx="10"/>
+  <text class="ttl on-b" x="299" y="74" text-anchor="middle">zhparser 解析器</text>
+  <text class="sm" x="299" y="96" text-anchor="middle">SCWS 词典切词</text>
+  <text class="mono" x="299" y="118" text-anchor="middle">遥远/a 的/u 星系/n</text>
+  <text class="sm" x="299" y="138" text-anchor="middle">每个词带词性</text>
+  <path class="ln" d="M386 100 H424" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="428" y="40" width="170" height="120" rx="10"/>
+  <text class="ttl on-a" x="513" y="64" text-anchor="middle">配置 chinese 的映射</text>
+  <text class="mono" x="513" y="88" text-anchor="middle">a → simple ✓</text>
+  <text class="mono" x="513" y="108" text-anchor="middle">n → simple ✓</text>
+  <text class="mono on-r" x="513" y="128" text-anchor="middle">u → （无映射）✗</text>
+  <text class="sm" x="513" y="150" text-anchor="middle">simple 字典只做小写化</text>
+  <path class="ln" d="M600 100 H638" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="642" y="70" width="98" height="60" rx="10"/>
+  <text class="sm b on-g" x="691" y="96" text-anchor="middle">tsvector</text>
+  <text class="mono" x="691" y="116" text-anchor="middle">遥远 星系</text>
+  <text class="sm" x="380" y="186" text-anchor="middle">中文没有词形变化（traveling → travel），所以不需要词干字典，simple 就够了</text>
+</svg>
+<figcaption>图 S1-3　中文全文搜索配置的工作方式</figcaption>
+</figure>
+
+<h2 id="search">用中文走一遍第 6 章</h2>
+
+<p>建一个小小的中文电影表：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE articles (
+  id serial PRIMARY KEY,
+  title text NOT NULL,
+  body text NOT NULL
+);
+
+INSERT INTO articles (title, body) VALUES
+('流浪地球', '太阳即将毁灭，人类在地球表面建造巨大的推进器，带着地球逃离太阳系，寻找新的家园。'),
+('三体', '物理学家汪淼卷入一系列科学家离奇自杀的事件，逐渐发现外星文明三体人即将入侵地球。'),
+('哪吒之魔童降世', '天地灵气孕育出一颗能量巨大的混元珠，哪吒生而为魔，却不认命，与敖丙一起对抗天劫。'),
+('大圣归来', '被封印五百年的孙悟空遇到小和尚江流儿，重新找回自我，大战妖王拯救孩子。'),
+('星际穿越', '地球环境恶化，一队宇航员穿越虫洞，在遥远的星系中为人类寻找新的家园。'),
+('火星救援', '宇航员在火星任务中被误认为死亡，独自一人在火星上利用科学知识种植土豆求生。');
+</pre></div>
+
+<p>照搬第 6 章清单 6.13 的做法：标题权重 A、简介权重 B，存成生成列：</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE articles ADD COLUMN tsv tsvector
+GENERATED ALWAYS AS (
+  setweight(to_tsvector('chinese', title), 'A') ||
+  setweight(to_tsvector('chinese', body), 'B')
+) STORED;
+
+SELECT id, title, tsv FROM articles WHERE id IN (1, 5);
+</pre></div>
+<div class="code out"><pre>
+ id |  title   |                          tsv
+----+----------+------------------------------------------------------------------
+  1 | 流浪地球 | '人类':5B '地球':2A,6B '太阳':3B '太阳系':15B '家园':18B '寻找':16B
+    |          | '巨大':9B '带':11B '建造':8B '推进器':10B '新':17B '毁灭':4B
+    |          | '流浪':1A '球':13B '着地':12B '表面':7B '逃离':14B
+  5 | 星际穿越 | '为人':13B '地球':3B '宇航员':7B '家园':17B '寻找':15B '恶化':5B
+    |          | '新':16B '星系':12B '星际':1A '洞':10B '环境':4B '穿越':2A,8B
+    |          | '类':14B '虫':9B '遥远':11B '队':6B
+(2 rows)
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 仔细看，分词切错了</div>
+  <p>
+    “带着地球”被切成了 <code>带 / 着地 / 球</code>，“虫洞”被切成了 <code>虫 / 洞</code>，“为人类”被切成了 <code>为人 / 类</code>。
+    这是<strong>基于词典的分词</strong>的天然局限：遇到歧义或词典里没有的词就可能切错。后果是搜“虫洞”找不到《星际穿越》。下一节专门讲怎么调优。
+  </p>
+</div>
+
+<h3>查询：三种 tsquery 函数都能用</h3>
+
+<div class="code" data-lang="sql"><pre>
+SELECT to_tsquery('chinese', '地球 & 家园');
+SELECT plainto_tsquery('chinese', '寻找新的家园');
+SELECT websearch_to_tsquery('chinese', '宇航员 -火星');
+</pre></div>
+<div class="code out"><pre>
+   to_tsquery
+-----------------
+ '地球' & '家园'
+
+    plainto_tsquery
+------------------------
+ '寻找' & '新' & '家园'
+
+ websearch_to_tsquery
+----------------------
+ '宇航员' & !'火星'
+</pre></div>
+
+<p>用户的搜索词也经过同样的中文分词，“的”被去掉了。<code>websearch_to_tsquery</code> 里的 <code>-火星</code> 变成了 NOT：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT title FROM articles
+WHERE tsv @@ websearch_to_tsquery('chinese', '宇航员 -火星');
+-- 星际穿越（《火星救援》被排除）
+
+SELECT title FROM articles
+WHERE tsv @@ websearch_to_tsquery('chinese', '火星 or 三体');
+-- 三体、火星救援
+</pre></div>
+
+<h3>短语查询</h3>
+
+<div class="code" data-lang="sql"><pre>
+SELECT phraseto_tsquery('chinese', '寻找新的家园');
+-- '寻找' <-> '新' <-> '家园'
+
+SELECT title FROM articles WHERE tsv @@ phraseto_tsquery('chinese', '寻找新的家园');
+-- 流浪地球、星际穿越
+
+SELECT title FROM articles WHERE tsv @@ phraseto_tsquery('chinese', '新的寻找家园');
+-- (0 rows) 词序不对就不匹配
+</pre></div>
+
+<div class="box note">
+  <div class="t">&#9432; 被丢弃的词不占位置</div>
+  <p>
+    看上面的 tsvector：<code>'寻找':16B '新':17B '家园':18B</code> 是连续的 —— 被丢弃的“的”<strong>没有占用位置编号</strong>。这和第 6 章英文停用词“保留位置”的行为不同，所以“寻找新的家园”能被 <code>寻找 &lt;-&gt; 新 &lt;-&gt; 家园</code> 匹配上。
+  </p>
+</div>
+
+<h3>排序与高亮</h3>
+
+<div class="code" data-lang="sql"><pre>
+SELECT id, title, ts_rank(tsv, q) AS rank
+FROM articles, to_tsquery('chinese', '地球') q
+WHERE tsv @@ q
+ORDER BY rank DESC;
+</pre></div>
+<div class="code out"><pre>
+ id |  title   |    rank
+----+----------+------------
+  1 | 流浪地球 | 0.66871977
+  2 | 三体     | 0.24317084
+  5 | 星际穿越 | 0.24317084
+(3 rows)
+</pre></div>
+
+<p>《流浪地球》片名（权重 A）里有“地球”，排在最前 —— 和第 6 章 ghost 的例子一模一样。高亮同样可用，用 HTML 的 <code>&lt;mark&gt;</code> 标签代替默认的 <code>&lt;b&gt;</code>：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT title,
+  ts_headline('chinese', body, to_tsquery('chinese', '家园'),
+              'StartSel=&lt;mark&gt;, StopSel=&lt;/mark&gt;')
+FROM articles
+WHERE tsv @@ to_tsquery('chinese', '家园');
+</pre></div>
+<div class="code out"><pre>
+  title   |                          ts_headline
+----------+---------------------------------------------------------------
+ 流浪地球 | 巨大的推进器，带着地球逃离太阳系，寻找新的&lt;mark&gt;家园&lt;/mark&gt;。
+ 星际穿越 | 穿越虫洞，在遥远的星系中为人类寻找新的&lt;mark&gt;家园&lt;/mark&gt;。
+(2 rows)
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; ts_headline 第一个参数别漏</div>
+  <p>ts_headline 会对原文重新分词，所以要显式传 <code>'chinese'</code>。不传就用默认配置（english），整句当成一个词，什么也高亮不出来。</p>
+</div>
+
+<h3>GIN 索引</h3>
+
+<p>往表里再填 2 万行无关数据，对比有无索引：</p>
+
+<div class="code" data-lang="sql"><pre>
+INSERT INTO articles (title, body)
+SELECT '填充' || g, md5(g::text) FROM generate_series(1, 20000) g;
+ANALYZE articles;
+
+EXPLAIN (analyze, costs off)
+SELECT title FROM articles WHERE tsv @@ to_tsquery('chinese', '火星');
+</pre></div>
+<div class="code out"><pre>
+ Seq Scan on articles (actual time=0.020..7.385 rows=1 loops=1)
+   Filter: (tsv @@ '''火星'''::tsquery)
+   Rows Removed by Filter: 20005
+ Execution Time: 7.399 ms
+</pre></div>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX articles_tsv_gin ON articles USING GIN (tsv);
+</pre></div>
+<div class="code out"><pre>
+ Bitmap Heap Scan on articles (actual time=0.016..0.017 rows=1 loops=1)
+   Recheck Cond: (tsv @@ '''火星'''::tsquery)
+   Heap Blocks: exact=1
+   ->  Bitmap Index Scan on articles_tsv_gin (actual time=0.010..0.010 rows=1 loops=1)
+         Index Cond: (tsv @@ '''火星'''::tsquery)
+ Execution Time: 0.040 ms
+</pre></div>
+
+<p>7.4 ms → 0.04 ms。一旦分好词，后面的一切（GIN、GiST、权重、ts_rank）都和英文完全一样。</p>
+
+<h2 id="tune">调优分词</h2>
+
+<h3>自定义词典</h3>
+
+<p>
+  词典里没有“虫洞”，所以它被切成了两个单字。zhparser 2.x 提供了一张自定义词表 <code>zhparser.zhprs_custom_word</code>，往里加词，再调用同步函数：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+INSERT INTO zhparser.zhprs_custom_word VALUES ('虫洞');
+SELECT sync_zhprs_custom_word();
+</pre></div>
+
+<p><strong>新开一个会话</strong>（词典在会话启动时加载），再试：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT to_tsvector('chinese', '一队宇航员穿越虫洞');
+</pre></div>
+<div class="code out"><pre>
+        to_tsvector
+----------------------------
+ '宇航员':2 '穿越':3 '队':1
+(1 row)
+</pre></div>
+
+<p>“虫洞”不是被正确切出来了，而是<strong>整个消失了</strong>！用 ts_debug 查原因：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT token, alias, description, lexemes
+FROM ts_debug('chinese', '一队宇航员穿越虫洞');
+</pre></div>
+<div class="code out"><pre>
+ token  | alias |  description   | lexemes
+--------+-------+----------------+----------
+ 一     | m     | numeral,数词   |
+ 队     | n     | noun,名词      | {队}
+ 宇航员 | n     | noun,名词      | {宇航员}
+ 穿越   | v     | verb,动词      | {穿越}
+ 虫洞   | x     | unknown,未知词 |
+(5 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="自定义词的词性是 x，没有映射就会被丢弃">
+  <rect class="bx" x="20" y="30" width="200" height="60" rx="10"/>
+  <text class="sm b" x="120" y="54" text-anchor="middle">加词之前</text>
+  <text class="mono" x="120" y="76" text-anchor="middle">虫/n  洞/n</text>
+  <path class="ln" d="M222 60 H270" marker-end="url(#ar)"/>
+  <rect class="bx-r" x="274" y="20" width="220" height="80" rx="10"/>
+  <text class="sm b on-r" x="384" y="44" text-anchor="middle">加词之后（只映射 n,v,a,i,e,l）</text>
+  <text class="mono" x="384" y="66" text-anchor="middle">虫洞/x</text>
+  <text class="sm on-r" x="384" y="88" text-anchor="middle">x 没有映射 → 被丢弃 ✗</text>
+  <path class="ln" d="M496 60 H544" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="548" y="20" width="192" height="80" rx="10"/>
+  <text class="sm b on-g" x="644" y="44" text-anchor="middle">再加上 x 的映射</text>
+  <text class="mono" x="644" y="66" text-anchor="middle">虫洞/x → simple</text>
+  <text class="sm on-g" x="644" y="88" text-anchor="middle">'虫洞':4 ✓</text>
+  <text class="sm" x="380" y="134" text-anchor="middle">自定义词统一被标记为 x（未知词）。很多教程只映射 n,v,a,i,e,l，</text>
+  <text class="sm" x="380" y="152" text-anchor="middle">结果加了自定义词反而搜不到 —— 这就是本页一开始就把 x 加进映射的原因</text>
+  <text class="sm" x="380" y="178" text-anchor="middle">代价：词典里真正不认识的生僻组合也会被保留下来，通常利大于弊</text>
+</svg>
+<figcaption>图 S1-4　自定义词典最常见的坑</figcaption>
+</figure>
+
+<p>自定义词的词性是 <code>x</code>（未知词）。如果配置里没映射 x，它就被当成停用词丢掉了。加上映射：</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER TEXT SEARCH CONFIGURATION chinese ADD MAPPING FOR x WITH simple;
+
+SELECT to_tsvector('chinese', '一队宇航员穿越虫洞');
+</pre></div>
+<div class="code out"><pre>
+             to_tsvector
+-------------------------------------
+ '宇航员':2 '穿越':3 '虫洞':4 '队':1
+(1 row)
+</pre></div>
+
+<h3>修改词典后，已有数据要重算</h3>
+
+<p>
+  词典只影响<strong>之后</strong>的分词。生成列里已经存好的 tsvector 不会自动变。好在存储型生成列在行被 UPDATE 时会重新计算，所以“原地更新”一下就行：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+UPDATE articles SET title = title;   -- 触发生成列重算
+
+SELECT tsv FROM articles WHERE id = 5;
+-- ... '虫洞':9B ...    之前的 '虫':9B '洞':10B 没有了
+
+SELECT title FROM articles WHERE tsv @@ to_tsquery('chinese', '虫洞');
+-- 星际穿越 ✓
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 大表怎么办</div>
+  <p>整表 UPDATE 会改写每一行、产生大量死元组（见<a href="topic-vacuum.html">专题 4</a>）。大表可以按主键分批更新，或者在低峰期执行，完成后跑一次 <code>VACUUM</code>。</p>
+</div>
+
+<h3>复合词拆分：multi_short</h3>
+
+<p>搜“人民”能找到“中华人民共和国”吗？默认不能，因为它被当成一个完整的词：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT to_tsvector('chinese', '中华人民共和国');
+--  '中华人民共和国':1
+
+SET zhparser.multi_short = on;     -- 长词再额外拆出短词
+SELECT to_tsvector('chinese', '中华人民共和国');
+</pre></div>
+<div class="code out"><pre>
+                   to_tsvector
+-------------------------------------------------
+ '中华':2 '中华人民共和国':1 '人民':3 '共和国':4
+(1 row)
+</pre></div>
+
+<p>长词保留，同时多出了“中华”“人民”“共和国”，召回率提高了。zhparser 的主要参数：</p>
+
+<div class="tw"><table>
+<tr><th>参数</th><th>作用</th></tr>
+<tr><td><code>zhparser.multi_short</code></td><td>长词再拆出短词（最常用）</td></tr>
+<tr><td><code>zhparser.multi_duality</code></td><td>把单字组合成二元词</td></tr>
+<tr><td><code>zhparser.multi_zmain</code> / <code>multi_zall</code></td><td>拆出重要单字 / 全部单字</td></tr>
+<tr><td><code>zhparser.seg_with_duality</code></td><td>词典外的散字两两组合</td></tr>
+<tr><td><code>zhparser.punctuation_ignore</code></td><td>忽略标点</td></tr>
+<tr><td><code>zhparser.dict_in_memory</code></td><td>词典全部载入内存（更快，更占内存）</td></tr>
+<tr><td><code>zhparser.extra_dicts</code></td><td>额外的词典文件</td></tr>
+</table></div>
+
+<p><code>SET</code> 只对当前会话生效。要持久化，可以设在数据库级别（新连接生效）：</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER DATABASE postgres SET zhparser.multi_short = on;
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 写入和查询要用同样的设置</div>
+  <p>如果写入时开了 multi_short、查询时没开（或反过来），两边切出来的词不一致，就会漏结果。所以要么设在数据库级别统一生效，要么写入和查询使用同一个连接配置。改设置后，同样要重算已有数据。</p>
+</div>
+
+<h2 id="trgm">另一条路：pg_trgm 模糊匹配</h2>
+
+<p>
+  不想装扩展？Postgres 自带的 <code>pg_trgm</code> 扩展（第 6 章提到过它可以做拼写纠错）能给 <code>LIKE '%关键词%'</code> 建索引。
+  它把字符串拆成<strong>三元组</strong>（连续三个字符）来比较，不需要分词，所以对中文也适用：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION pg_trgm;
+CREATE INDEX articles_body_trgm ON articles USING GIN (body gin_trgm_ops);
+
+EXPLAIN (analyze, costs off)
+SELECT title FROM articles WHERE body LIKE '%宇航员%';
+</pre></div>
+<div class="code out"><pre>
+ Bitmap Heap Scan on articles (actual time=0.033..0.034 rows=2 loops=1)
+   Recheck Cond: (body ~~ '%宇航员%'::text)
+   ->  Bitmap Index Scan on articles_body_trgm (actual time=0.010..0.010 rows=2 loops=1)
+         Index Cond: (body ~~ '%宇航员%'::text)
+ Execution Time: 0.053 ms
+</pre></div>
+
+<p>三个字的“宇航员”走了索引。但换成两个字的“火星”：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT title FROM articles WHERE body LIKE '%火星%';
+</pre></div>
+<div class="code out"><pre>
+ Seq Scan on articles (actual time=0.011..3.839 rows=1 loops=1)
+   Filter: (body ~~ '%火星%'::text)
+   Rows Removed by Filter: 20005
+ Execution Time: 3.846 ms
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="三元组需要至少三个字符，两字中文词提取不出三元组，无法用索引">
+  <text class="ttl" x="20" y="24">“宇航员”的三元组</text>
+  <rect class="cell-g" x="20" y="36" width="120" height="30"/><text class="mono" x="80" y="56" text-anchor="middle">宇航员</text>
+  <text class="sm on-g" x="160" y="56">→ 能提取出完整的三元组，可以在索引里查</text>
+
+  <text class="ttl" x="20" y="104">“火星”的三元组</text>
+  <rect class="cell-r" x="20" y="116" width="80" height="30"/><text class="mono" x="60" y="136" text-anchor="middle">火星</text>
+  <text class="sm on-r" x="120" y="136">→ 只有两个字，凑不出“中间”的三元组，索引帮不上忙 → 全表扫描</text>
+
+  <rect class="bx-a" x="20" y="166" width="720" height="54" rx="10"/>
+  <text class="sm b on-a" x="380" y="188" text-anchor="middle">而中文词汇绝大多数是两个字（地球、火星、家园、穿越……），单字查询也很常见</text>
+  <text class="sm" x="380" y="208" text-anchor="middle">所以 pg_trgm 更适合“三个字以上的模糊匹配、纠错、相似度”，不适合作为中文搜索的主力</text>
+</svg>
+<figcaption>图 S1-5　pg_trgm 做中文搜索的硬伤：两个字的查询用不上索引</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 二元组方案</div>
+  <p>
+    针对这个问题，社区有基于<strong>二元组（2-gram）</strong>的 <code>pg_bigm</code> 扩展，最初就是为日文、中文这类不分词的语言设计的，两个字的查询也能用索引。它同样需要自行编译安装，本页没有演示。
+  </p>
+</div>
+
+<p>pg_trgm 也能算相似度，适合做“你是不是要找……”：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT similarity('流浪地球', '流浪地球2');   -- 0.5714286
+SELECT similarity('流浪地球', '地球流浪');    -- 0     三元组对顺序很敏感
+
+SELECT title, similarity(title, '流浪的地球') AS sim
+FROM articles WHERE title % '流浪的地球';     -- % 表示相似度超过阈值（默认 0.3）
+--   流浪地球 | 0.375
+</pre></div>
+
+<h2 id="choose">怎么选</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="中文搜索三种方案对比：zhparser 全文搜索、pg_trgm、pgvector 语义搜索">
+  <rect class="bx-a" x="20" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-a" x="135" y="44" text-anchor="middle">zhparser 全文搜索</text>
+  <text class="sm" x="135" y="64" text-anchor="middle">按“词”匹配</text>
+  <text class="sm on-g" x="36" y="92">✓ 两字词、短语、AND/OR/NOT</text>
+  <text class="sm on-g" x="36" y="112">✓ 权重、排序、高亮</text>
+  <text class="sm on-g" x="36" y="132">✓ GIN 索引又小又快</text>
+  <text class="sm on-r" x="36" y="156">✗ 需要编译安装扩展</text>
+  <text class="sm on-r" x="36" y="176">✗ 依赖词典，新词要维护</text>
+  <text class="sm b" x="36" y="208">适合：站内搜索、文章检索</text>
+  <text class="sm b" x="36" y="226">（中文搜索的主力）</text>
+
+  <rect class="bx-b" x="265" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-b" x="380" y="44" text-anchor="middle">pg_trgm</text>
+  <text class="sm" x="380" y="64" text-anchor="middle">按“三个连续字符”匹配</text>
+  <text class="sm on-g" x="281" y="92">✓ 自带，不用分词</text>
+  <text class="sm on-g" x="281" y="112">✓ LIKE '%…%'、相似度、纠错</text>
+  <text class="sm on-r" x="281" y="136">✗ 两字以下查询用不上索引</text>
+  <text class="sm on-r" x="281" y="156">✗ 没有排序、短语等语义</text>
+  <text class="sm on-r" x="281" y="176">✗ 索引较大</text>
+  <text class="sm b" x="281" y="208">适合：人名、地址、编号等</text>
+  <text class="sm b" x="281" y="226">较长字符串的模糊匹配</text>
+
+  <rect class="bx-g" x="510" y="20" width="230" height="226" rx="12"/>
+  <text class="ttl on-g" x="625" y="44" text-anchor="middle">pgvector 语义搜索</text>
+  <text class="sm" x="625" y="64" text-anchor="middle">按“含义”匹配（第 8 章）</text>
+  <text class="sm on-g" x="526" y="92">✓ 不依赖分词和关键词</text>
+  <text class="sm on-g" x="526" y="112">✓ “宇宙冒险”能找到《星际穿越》</text>
+  <text class="sm on-g" x="526" y="132">✓ 跨语言（取决于模型）</text>
+  <text class="sm on-r" x="526" y="156">✗ 需要嵌入模型，有成本</text>
+  <text class="sm on-r" x="526" y="176">✗ 结果是近似的，难解释</text>
+  <text class="sm b" x="526" y="208">适合：推荐、问答、RAG</text>
+  <text class="sm b" x="526" y="226">（也常和全文搜索混合使用）</text>
+</svg>
+<figcaption>图 S1-6　中文搜索的三种方案，常常组合使用</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#128161; 混合搜索</div>
+  <p>实践中常把全文搜索和向量搜索结合：全文搜索保证“关键词一定命中”，向量搜索补充“意思相近”，再把两路结果的排名合并。它们都在同一个 Postgres 里，一条 SQL 就能写完。</p>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>默认的 simple / english 配置会把中文整句当成一个词素，必须换成懂中文的解析器。</li>
+  <li>zhparser 需要从源码编译，用<strong>多阶段 Dockerfile</strong>，不要在运行中的容器里装编译依赖。</li>
+  <li>中文配置 = zhparser 解析器 + 词性映射到 simple 字典；建议把 <code>x</code> 也映射上。</li>
+  <li>分好词之后，第 6 章的一切（生成列、权重、tsquery、ts_rank、ts_headline、GIN）都照常可用。</li>
+  <li>用自定义词典修正分词，记得映射 x、新开会话、重算已有数据；<code>multi_short</code> 能提高复合词的召回率，写入和查询要保持一致。</li>
+  <li>pg_trgm 对两字以下的中文查询用不上索引，适合较长字符串的模糊匹配，不适合当中文搜索主力。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>把“哪吒”“敖丙”“混元珠”加入自定义词典，验证它们能被正确切分，并重算 articles 表。</li>
+    <li>分别在 <code>multi_short</code> 开 / 关的情况下，搜索“人民”，比较对“中华人民共和国成立”这句话的命中情况。</li>
+    <li>给 articles 加一个用户评论表，用触发器或生成列为评论建立中文 tsvector，实现“片名 A、简介 B、评论 C”三档权重。</li>
+    <li>对 2 万行的表分别建 GIN（tsvector）和 GIN（gin_trgm_ops）索引，用 <code>pg_relation_size</code> 比较大小。</li>
+    <li>（需要第 8 章的环境）为这 6 部电影的简介生成向量嵌入，用“宇宙冒险”做语义搜索，再和 <code>to_tsquery('chinese','宇宙 &amp; 冒险')</code> 的结果对比。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

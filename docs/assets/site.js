@@ -18,12 +18,24 @@
     { n: 10, label: '10', f: 'ch10.html', t: '地理空间数据',         d: 'PostGIS、点线面、空间查询与 GiST 索引' },
     { n: 11, label: '11', f: 'ch11.html', t: '用 Postgres 做消息队列', d: 'SKIP LOCKED、LISTEN/NOTIFY 与 pgmq' },
     { n: 12, label: 'A',  f: 'appendix-a.html', t: '五个优化技巧',     d: '写出更高效的查询，设计更好的方案', part: '附录' },
-    { n: 13, label: 'B',  f: 'appendix-b.html', t: '什么时候别用 Postgres', d: '知道边界，才能放心地“就用 Postgres”' }
+    { n: 13, label: 'B',  f: 'appendix-b.html', t: '什么时候别用 Postgres', d: '知道边界，才能放心地“就用 Postgres”' },
+    { n: 14, label: 'S1', f: 'topic-chinese-fts.html', t: '中文全文搜索',   d: 'zhparser 分词、自定义词典与 pg_trgm 的取舍', part: '补充专题（原书之外）' },
+    { n: 15, label: 'S2', f: 'topic-sql.html',         t: '常用 SQL 补全',  d: 'UPSERT、数组/范围/枚举、锁与隔离级别' },
+    { n: 16, label: 'S3', f: 'topic-rls.html',         t: '行级安全 RLS',   d: '在同一张表里隔离多个租户的数据' },
+    { n: 17, label: 'S4', f: 'topic-vacuum.html',      t: 'VACUUM 与表膨胀', d: '死元组从哪来、怎么回收、怎么监控' },
+    { n: 18, label: 'S5', f: 'topic-app.html',         t: '从应用连接 Postgres', d: '驱动、参数化查询、事务与 ORM' },
+    { n: 19, label: 'S6', f: 'topic-backup.html',      t: '备份、恢复与升级', d: 'pg_dump、pg_restore 与大版本升级' },
+    { n: 20, label: '练', f: 'playground.html', tag: '工具', t: 'SQL 练习场', d: '在浏览器里直接写 SQL，自带示例数据', part: '工具与速查' }
   ];
 
   var cur = parseInt(document.body.dataset.chapter || '0', 10);
 
-  function name(c) { return /^\d+$/.test(c.label) ? '第 ' + c.label + ' 章' : '附录 ' + c.label; }
+  function name(c) {
+    if (c.tag) return c.tag;
+    if (/^\d+$/.test(c.label)) return '第 ' + c.label + ' 章';
+    if (/^S\d+$/.test(c.label)) return '专题 ' + c.label.slice(1);
+    return '附录 ' + c.label;
+  }
 
   /* ---------- 侧边栏 ---------- */
   var side = document.getElementById('sidebar');
@@ -39,8 +51,10 @@
       '<a class="ch" href="https://github.com/dmagda/just-use-postgres-book"><span class="n">&#8599;</span><span>原书代码仓库</span></a>';
     side.innerHTML = html;
     var active = side.querySelector('a.ch.active');
+    // 只滚动侧边栏自身，不能用 scrollIntoView（它会连带滚动整个页面）
     if (active) setTimeout(function () {
-      active.scrollIntoView({ block: 'center' });
+      var top = active.offsetTop - side.clientHeight / 2 + active.offsetHeight / 2;
+      if (top > 0) side.scrollTop = top;
     }, 0);
   }
 
@@ -203,6 +217,13 @@
       pre.innerHTML = paint(code, RE_SQL, ['tk-cm', 'tk-st', 'tk-op', 'tk-tp', 'tk-kw', 'tk-nm', 'tk-fn']);
     }
   });
+
+  /* ---------- 可在浏览器里运行的代码块（data-run），按需加载 runner.js ---------- */
+  if (document.querySelector('.code[data-run]')) {
+    var rs = document.createElement('script');
+    rs.type = 'module'; rs.src = 'assets/runner.js';
+    document.body.appendChild(rs);
+  }
 
   /* ---------- 上一章 / 下一章 ---------- */
   var pager = document.getElementById('pager');

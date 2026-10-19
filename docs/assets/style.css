@@ -461,3 +461,58 @@ figcaption {
   background: var(--accent-bg); color: var(--accent-2); border: 1px solid var(--accent);
   display: grid; place-items: center; font-size: 13px; font-weight: 700;
 }
+
+/* ---------------- 浏览器内运行 SQL（runner.js） ---------------- */
+.code .run-tools { display: inline-flex; gap: 6px; align-items: center; }
+.code .copy.run { color: #f3c58f; border-color: rgba(243,197,143,.45); font-weight: 600; }
+.code .copy.run:hover { color: #fff; border-color: #f3c58f; }
+.code .copy:disabled { opacity: .5; cursor: progress; }
+.code pre[contenteditable] { outline: 2px solid var(--accent); outline-offset: -2px; }
+.code.run-out { margin-top: -10px; border-top-left-radius: 0; border-top-right-radius: 0; }
+.code.run-out pre { max-height: 420px; overflow: auto; white-space: pre; }
+.code.run-out .run-err { color: var(--red); font-weight: 600; }
+
+/* ---------------- SQL 练习场 ---------------- */
+kbd {
+  font-family: var(--mono); font-size: .82em;
+  border: 1px solid var(--line-2); border-bottom-width: 2px; border-radius: 4px;
+  padding: 0 5px; background: var(--panel); color: var(--fg);
+}
+.pg-seed { margin: 14px 0 6px; }
+.pg-seed > summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 14.5px; }
+.pg-examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 16px; }
+.pg-chip {
+  border: 1px solid var(--line-2); background: var(--panel); color: var(--fg-soft);
+  border-radius: 20px; padding: 5px 13px; font-size: 13.5px; cursor: pointer; font-family: var(--sans);
+}
+.pg-chip:hover { border-color: var(--accent); color: var(--accent); }
+.pg-editor-wrap {
+  border: 1px solid var(--line-2); border-radius: var(--radius);
+  overflow: hidden; background: var(--code-bg);
+}
+.pg-bar {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;
+  padding: 7px 12px; background: rgba(255,255,255,.05);
+  border-bottom: 1px solid rgba(255,255,255,.08);
+  font-family: var(--mono); font-size: 11.5px; color: #b9b0a3;
+}
+.pg-bar .tag { color: #d8b48a; font-weight: 600; }
+.pg-actions { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.pg-btn {
+  border: 1px solid rgba(255,255,255,.18); background: transparent; color: #cfc6b8;
+  border-radius: 6px; font-size: 12.5px; padding: 4px 11px; cursor: pointer; font-family: var(--sans);
+}
+.pg-btn:hover { color: #fff; border-color: rgba(255,255,255,.45); }
+.pg-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.pg-btn.primary:hover { filter: brightness(1.08); }
+.pg-btn:disabled { opacity: .55; cursor: progress; }
+.pg-btn .kbd { font-family: var(--mono); font-size: 10.5px; opacity: .8; margin-left: 4px; }
+#pg-sql {
+  display: block; width: 100%; min-height: 260px; resize: vertical;
+  border: 0; outline: none; margin: 0; padding: 14px 16px;
+  background: var(--code-bg); color: var(--code-fg);
+  font-family: var(--mono); font-size: 13.5px; line-height: 1.7; tab-size: 2;
+  box-sizing: border-box; white-space: pre; overflow: auto;
+}
+.pg-out pre { min-height: 80px; max-height: 520px; overflow: auto; white-space: pre; }
+@media (max-width: 640px) { .pg-btn .kbd { display: none; } }

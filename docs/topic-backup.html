@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>专题 6 · 备份、恢复与升级 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="19">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">专题 6 · 补充内容（原书之外）</span>
+<h1>备份、恢复与升级</h1>
+<p class="lede">
+  “Just use Postgres”意味着越来越多的数据都放在这一个数据库里：业务表、JSON 文档、向量、时序、消息队列……
+  这时<strong>备份</strong>就不再是可选项。这一页讲 Postgres 的几种备份方式、怎样把备份恢复回来，以及升级到新的大版本时要注意什么。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 本页的命令都实际运行过</div>
+  <p>环境：Docker 里的 Postgres 17.2 和 18.1。例子用的是<a href="topic-rls.html">专题 3</a> 的 <code>rlstopic</code> 数据库（50 万行、带角色和 RLS 策略），以及<a href="topic-app.html">专题 5</a> 的 <code>apptopic</code> 数据库。</p>
+</div>
+
+<div class="goals">
+  <h4>本页目标</h4>
+  <ul>
+    <li>分清逻辑备份、物理备份和持续归档（PITR）各自适合什么场景</li>
+    <li>用 pg_dump 的几种格式备份，用 pg_restore 完整或部分恢复</li>
+    <li>记得用 pg_dumpall --globals-only 备份角色</li>
+    <li>在 Docker 环境下备份，避开数据卷的坑</li>
+    <li>把 Postgres 从 17 升级到 18</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="types">三种备份方式</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="三种备份方式：逻辑备份导出 SQL，物理备份复制数据文件，持续归档额外保存 WAL 可以恢复到任意时间点">
+  <rect class="bx-b" x="20" y="20" width="230" height="230" rx="12"/>
+  <text class="ttl on-b" x="135" y="46" text-anchor="middle">逻辑备份</text>
+  <text class="mono" x="135" y="70" text-anchor="middle">pg_dump</text>
+  <text class="sm" x="36" y="100">把数据导出成 SQL 或</text>
+  <text class="sm" x="36" y="118">一种可恢复的格式</text>
+  <text class="sm on-g" x="36" y="148">✓ 可以只备份 / 恢复一张表</text>
+  <text class="sm on-g" x="36" y="168">✓ 可跨大版本、跨平台</text>
+  <text class="sm on-r" x="36" y="188">✗ 数据量大时慢</text>
+  <text class="sm on-r" x="36" y="208">✗ 只能恢复到备份那一刻</text>
+  <text class="sm b" x="135" y="238" text-anchor="middle">适合：几十 GB 以内、升级</text>
+
+  <rect class="bx-p" x="265" y="20" width="230" height="230" rx="12"/>
+  <text class="ttl on-p" x="380" y="46" text-anchor="middle">物理备份</text>
+  <text class="mono" x="380" y="70" text-anchor="middle">pg_basebackup</text>
+  <text class="sm" x="281" y="100">原样复制整个实例的</text>
+  <text class="sm" x="281" y="118">数据文件</text>
+  <text class="sm on-g" x="281" y="148">✓ 大库也快，恢复也快</text>
+  <text class="sm on-r" x="281" y="168">✗ 只能整个实例一起恢复</text>
+  <text class="sm on-r" x="281" y="188">✗ 必须同一个大版本</text>
+  <text class="sm" x="281" y="208">  　同样的 CPU 架构</text>
+  <text class="sm b" x="380" y="238" text-anchor="middle">适合：大库、搭建副本</text>
+
+  <rect class="bx-g" x="510" y="20" width="230" height="230" rx="12"/>
+  <text class="ttl on-g" x="625" y="46" text-anchor="middle">持续归档 + PITR</text>
+  <text class="mono" x="625" y="70" text-anchor="middle">基础备份 + WAL</text>
+  <text class="sm" x="526" y="100">在物理备份之上，</text>
+  <text class="sm" x="526" y="118">持续保存每一段 WAL</text>
+  <text class="sm on-g" x="526" y="148">✓ 恢复到任意时间点</text>
+  <text class="sm" x="526" y="166">  　（如误删表之前 1 秒）</text>
+  <text class="sm on-r" x="526" y="188">✗ 要配置归档和存储，</text>
+  <text class="sm" x="526" y="206">  　通常借助专门的工具</text>
+  <text class="sm b" x="625" y="238" text-anchor="middle">适合：生产环境</text>
+</svg>
+<figcaption>图 S6-1　三种备份方式，从简单到完备</figcaption>
+</figure>
+
+<p>
+  如果你用的是云厂商的托管 Postgres（RDS、Cloud SQL、Azure、Supabase、Neon 等），第三种通常已经内置了，在控制台里设置保留天数即可。
+  但 pg_dump 仍然值得掌握：迁移数据、复制一份到本地调试、升级大版本，都会用到它。
+</p>
+
+<h2 id="dump">pg_dump：逻辑备份</h2>
+
+<h3>三种输出格式</h3>
+
+<div class="code" data-lang="bash"><pre>
+# 1. 纯 SQL 文本（默认）：一个能直接用 psql 执行的 .sql 文件
+pg_dump -U postgres -f rls.sql rlstopic
+
+# 2. 自定义格式 -Fc：压缩过的二进制文件，用 pg_restore 恢复（最常用）
+pg_dump -U postgres -Fc -f rls.dump rlstopic
+
+# 3. 目录格式 -Fd：每张表一个文件，可以用 -j 并行导出
+pg_dump -U postgres -Fd -j 4 -f rls_dir rlstopic
+
+du -sh rls.sql rls.dump rls_dir
+</pre></div>
+<div class="code out"><pre>
+12M	rls.sql
+2.5M	rls.dump
+2.5M	rls_dir
+</pre></div>
+
+<div class="tw"><table>
+<tr><th>格式</th><th>恢复用</th><th>压缩</th><th>选择性恢复</th><th>并行</th><th>什么时候用</th></tr>
+<tr><td>纯 SQL（默认）</td><td><code>psql -f</code></td><td>✗（可自己 gzip）</td><td>✗</td><td>✗</td><td>想看懂、想手改内容；很小的库</td></tr>
+<tr><td><strong>自定义 <code>-Fc</code></strong></td><td><code>pg_restore</code></td><td>✓</td><td>✓</td><td>恢复时 ✓</td><td><strong>默认选它</strong></td></tr>
+<tr><td>目录 <code>-Fd</code></td><td><code>pg_restore</code></td><td>✓</td><td>✓</td><td>导出、恢复都 ✓</td><td>大库，想用多核加速</td></tr>
+</table></div>
+
+<p>看一眼纯 SQL 备份的开头，能看到 pg_dump 为了得到一份完整、一致的备份做了什么：</p>
+
+<div class="code out"><pre>
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET client_min_messages = warning;
+SET row_security = off;            ← 要么备份所有行，要么报错（专题 3）
+…
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; pg_dump 不会挡住业务</div>
+  <p>
+    pg_dump 在一个<strong>可重复读事务</strong>里读取所有表（<a href="topic-sql.html#isolation">专题 2</a>），所以得到的是“某一时刻”完全一致的快照，备份期间应用照常读写。
+    它只拿很弱的共享锁，唯一会被它挡住的是 <code>ALTER TABLE</code>、<code>DROP TABLE</code> 这类改结构的操作。
+    不过它是一个长事务，备份大库期间会让 VACUUM 清理不了新产生的死元组（<a href="topic-vacuum.html#long-tx">专题 4</a>），尽量放在低峰期。
+  </p>
+</div>
+
+<h3>常用选项</h3>
+
+<div class="code" data-lang="bash"><pre>
+pg_dump -h db.example.com -p 5432 -U postgres -Fc -f shop.dump shop   # 连远程库
+pg_dump -U postgres -Fc -n sales -f sales.dump postgres                # 只备份 sales 模式
+pg_dump -U postgres -Fc -t 'sales.orders*' -f orders.dump postgres     # 只备份某些表（支持通配符）
+pg_dump -U postgres -Fc -T 'logs.*' -f nologs.dump postgres            # 排除某些表
+pg_dump -U postgres --schema-only -f schema.sql postgres               # 只要表结构
+pg_dump -U postgres --data-only -Fc -f data.dump postgres              # 只要数据
+</pre></div>
+
+<h2 id="restore">pg_restore：恢复</h2>
+
+<h3>先看看备份里有什么</h3>
+
+<div class="code" data-lang="bash"><pre>
+pg_restore -l apptopic.dump
+</pre></div>
+<div class="code out"><pre>
+221; 1259 17387 TABLE public accounts postgres
+220; 1259 17377 TABLE public products postgres
+219; 1259 17376 SEQUENCE public products_id_seq postgres
+3378; 0 0 SEQUENCE OWNED BY public products_id_seq postgres
+3216; 2604 17380 DEFAULT public products id postgres
+3371; 0 17387 TABLE DATA public accounts postgres
+3370; 0 17377 TABLE DATA public products postgres
+3379; 0 0 SEQUENCE SET public products_id_seq postgres
+3223; 2606 17394 CONSTRAINT public accounts accounts_pkey postgres
+3221; 2606 17386 CONSTRAINT public products products_pkey postgres
+</pre></div>
+
+<p>备份是一个“目录”：表结构、数据、序列、约束、索引分别是独立的条目。pg_restore 会按正确的顺序执行它们：先建表，再导数据，最后建索引和约束（这样导数据更快）。</p>
+
+<h3>完整恢复</h3>
+
+<div class="code" data-lang="bash"><pre>
+createdb -U postgres app_restored               # pg_restore 不会自己建库
+pg_restore -U postgres -d app_restored apptopic.dump
+psql -U postgres -d app_restored -c "SELECT count(*) FROM products"   # 4
+</pre></div>
+
+<p>想恢复到一个同名的库里、并且先删掉已有对象，可以加 <code>--clean --if-exists</code>；想让 pg_restore 自己建库，用 <code>-C -d postgres</code>（先连上 postgres 库，再按备份里的名字建库）。</p>
+
+<h3>坑：只恢复一张表会丢掉主键</h3>
+
+<div class="code" data-lang="bash"><pre>
+createdb -U postgres only_products
+pg_restore -U postgres -d only_products -t products apptopic.dump
+psql -U postgres -d only_products -c "\d products"
+</pre></div>
+<div class="code out"><pre>
+                   Table "public.products"
+ Column |     Type      | Collation | Nullable |   Default
+--------+---------------+-----------+----------+--------------
+ id     | integer       |           | not null |              ← 没有 nextval 默认值了
+ name   | text          |           | not null |
+ price  | numeric(10,2) |           | not null |
+ stock  | integer       |           | not null | 0
+ tags   | text[]        |           |          | '{}'::text[]
+                                                               ← 也没有 Indexes: products_pkey
+</pre></div>
+
+<p>
+  <code>-t</code> 只恢复表本身和它的数据，<strong>不包括主键、索引、序列</strong>这些单独的条目。需要精确控制时，用“目录清单”：
+</p>
+
+<div class="code" data-lang="bash"><pre>
+pg_restore -l apptopic.dump | grep -E 'products' > list.txt   # 挑出和 products 相关的所有条目
+#   TABLE、SEQUENCE、DEFAULT、TABLE DATA、SEQUENCE SET、CONSTRAINT products_pkey
+pg_restore -U postgres -d only_products -L list.txt apptopic.dump   # 这次主键和序列都在了
+</pre></div>
+
+<h3>要不要“遇错即停”</h3>
+
+<p>pg_restore 默认<strong>遇到错误继续执行</strong>，最后只给一个警告：</p>
+
+<div class="code out"><pre>
+pg_restore: warning: errors ignored on restore: 7
+</pre></div>
+
+<p>这很容易被忽略，结果得到一个“少了点东西”的库。更安全的做法是加上：</p>
+
+<div class="code" data-lang="bash"><pre>
+pg_restore -U postgres -d rlstopic --single-transaction --exit-on-error rls.dump
+# 任何一步出错，整个恢复回滚，库保持为空，退出码非 0
+</pre></div>
+
+<h2 id="roles">别忘了角色</h2>
+
+<p>
+  pg_dump 只备份<strong>一个数据库</strong>里的东西。角色（用户）和它们的密码属于整个实例，不在任何一个数据库里，所以不在 pg_dump 的备份里。
+  把 rlstopic 恢复到一个全新的实例上：
+</p>
+
+<div class="code" data-lang="bash"><pre>
+# 在全新的 Postgres 实例上
+createdb -U postgres rlstopic
+pg_restore -U postgres -d rlstopic --single-transaction --exit-on-error rls.dump
+echo "exit=$?"
+</pre></div>
+<div class="code out"><pre>
+pg_restore: error: could not execute query: ERROR:  role "app_user" does not exist
+Command was: CREATE POLICY hide_archived ON public.notes AS RESTRICTIVE FOR SELECT TO app_user USING ((NOT archived));
+exit=1
+</pre></div>
+
+<p>策略、GRANT、表的所有者都引用了角色。解决办法是用 <strong>pg_dumpall --globals-only</strong> 把所有角色（以及表空间）单独导出：</p>
+
+<div class="code" data-lang="bash"><pre>
+# 在旧实例上
+pg_dumpall -U postgres --globals-only -f globals.sql
+
+# 在新实例上：先建角色，再恢复数据库
+psql -U postgres -f globals.sql      # 会提示 role "postgres" already exists，可以忽略
+createdb -U postgres rlstopic
+pg_restore -U postgres -d rlstopic rls.dump        # exit=0
+</pre></div>
+
+<p>globals.sql 的内容大致是这样（密码是加密后的哈希）：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE ROLE app_user;
+ALTER ROLE app_user WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS
+  PASSWORD 'SCRAM-SHA-256$4096:…';
+CREATE ROLE reporter;
+ALTER ROLE reporter WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION BYPASSRLS;
+…
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; 只想要数据，不要权限</div>
+  <p>把生产库复制到本地调试时，往往不需要原来的角色。<code>pg_restore --no-owner --no-privileges</code> 会跳过所有 OWNER 和 GRANT，对象都归执行恢复的用户所有。但 RLS 策略里写的 <code>TO app_user</code> 仍然需要角色存在。</p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="一个完整的逻辑备份包含两部分：pg_dumpall --globals-only 导出的角色，和每个数据库各自的 pg_dump">
+  <rect class="bx" x="20" y="20" width="330" height="160" rx="12"/>
+  <text class="ttl" x="185" y="44" text-anchor="middle">一个 Postgres 实例</text>
+  <rect class="bx-a" x="36" y="58" width="298" height="34" rx="6"/><text class="sm" x="185" y="80" text-anchor="middle">角色、表空间（实例级，“全局对象”）</text>
+  <rect class="bx-b" x="36" y="104" width="90" height="60" rx="6"/><text class="sm" x="81" y="138" text-anchor="middle">数据库 A</text>
+  <rect class="bx-b" x="140" y="104" width="90" height="60" rx="6"/><text class="sm" x="185" y="138" text-anchor="middle">数据库 B</text>
+  <rect class="bx-b" x="244" y="104" width="90" height="60" rx="6"/><text class="sm" x="289" y="138" text-anchor="middle">数据库 C</text>
+  <path class="ln-a" d="M336 75 H436" marker-end="url(#ar-a)"/>
+  <path class="ln-b" d="M336 134 H436" marker-end="url(#ar-b)"/>
+  <rect class="bx-a" x="440" y="52" width="300" height="46" rx="8"/><text class="mono" x="590" y="72" text-anchor="middle">pg_dumpall --globals-only</text><text class="sm" x="590" y="90" text-anchor="middle">→ globals.sql</text>
+  <rect class="bx-b" x="440" y="110" width="300" height="46" rx="8"/><text class="mono" x="590" y="130" text-anchor="middle">pg_dump -Fc（每个库一次）</text><text class="sm" x="590" y="148" text-anchor="middle">→ A.dump、B.dump、C.dump</text>
+  <text class="sm" x="590" y="182" text-anchor="middle">恢复顺序：先 globals.sql，再各个库</text>
+</svg>
+<figcaption>图 S6-2　完整的逻辑备份 = 全局对象 + 每个数据库</figcaption>
+</figure>
+
+<h2 id="docker">在 Docker 里备份</h2>
+
+<p>第 1 章的数据库跑在名为 <code>postgres</code> 的容器里。宿主机上不需要装任何 Postgres 工具，直接借用容器里的：</p>
+
+<div class="code" data-lang="bash"><pre>
+# 备份：容器里的 pg_dump 输出到标准输出，宿主机重定向到文件（不要加 -t，会破坏二进制输出）
+docker exec postgres pg_dump -U postgres -Fc postgres > postgres-$(date +%F).dump
+docker exec postgres pg_dumpall -U postgres --globals-only > globals.sql
+
+# 恢复：-i 把宿主机文件喂给容器里的 pg_restore 的标准输入
+docker exec postgres createdb -U postgres restored
+docker exec -i postgres pg_restore -U postgres -d restored < postgres-2026-10-20.dump
+</pre></div>
+
+<h3>直接打包数据卷</h3>
+
+<p>数据都在第 1 章创建的 <code>postgres-volume</code> 卷里，也可以把整个卷打包，这就是一种最简单的物理备份。但<strong>必须先停掉数据库</strong>：</p>
+
+<div class="code" data-lang="bash"><pre>
+docker stop postgres
+docker run --rm -v postgres-volume:/data:ro -v "$PWD":/backup alpine:3.20 \
+    tar czf /backup/pgdata.tgz -C /data .
+docker start postgres
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 不要在数据库运行时复制数据文件</div>
+  <p>
+    数据库运行时，数据文件随时在变化，一部分修改还只在内存和 WAL 里。这时 tar / cp / 云盘快照得到的很可能是一份<strong>无法启动或者数据损坏</strong>的副本。
+    要在线做物理备份，用下面的 pg_basebackup。
+  </p>
+</div>
+
+<h2 id="pitr">物理备份与时间点恢复</h2>
+
+<p>pg_basebackup 通过复制协议，在数据库<strong>运行时</strong>得到一份一致的物理备份：</p>
+
+<div class="code" data-lang="bash"><pre>
+pg_basebackup -U postgres -D /backups/base -Ft -z -c fast
+#   -Ft  打包成 tar     -z  gzip 压缩     -c fast  立即做检查点，不必等待
+ls /backups/base
+</pre></div>
+<div class="code out"><pre>
+backup_manifest      ← 每个文件的校验和，可用 pg_verifybackup 校验
+base.tar.gz          ← 数据文件
+pg_wal.tar.gz        ← 备份期间产生的 WAL，恢复时需要
+</pre></div>
+
+<p>
+  它解决了“大库备份太慢”的问题，但恢复出来的仍然是“备份那一刻”。Postgres 的每一个修改都会先写进 <strong>WAL</strong>（Write-Ahead Log，预写日志），再落到数据文件里，崩溃后就靠它恢复。
+  如果把 WAL 也<strong>持续地</strong>保存下来，就能从一份基础备份开始“重放”WAL，停在任何想要的时刻：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="时间点恢复：从周日的基础备份开始重放 WAL，停在周三 14:29 误删表之前">
+  <path class="ln" d="M40 120 H720" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="40" y="60" width="120" height="44" rx="8"/><text class="sm" x="100" y="80" text-anchor="middle">基础备份</text><text class="sm" x="100" y="97" text-anchor="middle">周日 02:00</text>
+  <g>
+    <rect class="cell-b" x="170" y="104" width="60" height="32"/><rect class="cell-b" x="230" y="104" width="60" height="32"/><rect class="cell-b" x="290" y="104" width="60" height="32"/>
+    <rect class="cell-b" x="350" y="104" width="60" height="32"/><rect class="cell-b" x="410" y="104" width="60" height="32"/><rect class="cell-b" x="470" y="104" width="60" height="32"/>
+    <rect class="cell-r" x="530" y="104" width="60" height="32"/><rect class="cell" x="590" y="104" width="60" height="32"/>
+  </g>
+  <text class="sm on-b" x="380" y="158" text-anchor="middle">持续归档的 WAL 段</text>
+  <path class="ln-r" d="M560 60 V100" marker-end="url(#ar-r)"/>
+  <text class="sm on-r b" x="560" y="40" text-anchor="middle">周三 14:30</text>
+  <text class="sm on-r" x="560" y="56" text-anchor="middle">DROP TABLE orders 😱</text>
+  <path class="ln-g" d="M100 186 H544" marker-end="url(#ar-g)"/>
+  <text class="sm on-g b" x="310" y="206" text-anchor="middle">恢复：解开基础备份 → 重放 WAL → recovery_target_time = '周三 14:29:59'</text>
+  <circle class="dot-g" cx="554" cy="186" r="6"/><path class="ln-d" d="M554 140 V180"/>
+</svg>
+<figcaption>图 S6-3　时间点恢复（PITR）：把数据库“倒带”到出事前一秒</figcaption>
+</figure>
+
+<p>
+  原理不复杂，但手工配置归档（<code>archive_mode</code>、<code>archive_command</code>）、管理保留策略、做恢复演练都很繁琐。
+  生产环境一般使用专门的工具：<strong>pgBackRest</strong>、<strong>Barman</strong>、<strong>WAL-G</strong>，它们负责基础备份、WAL 归档、压缩、加密、上传到对象存储和一键恢复。
+  用托管服务的话，这一切通常已经替你做好。
+</p>
+
+<h2 id="upgrade">升级 Postgres</h2>
+
+<h3>小版本 vs 大版本</h3>
+
+<div class="tw"><table>
+<tr><th></th><th>小版本（17.2 → 17.6）</th><th>大版本（17 → 18）</th></tr>
+<tr><td>内容</td><td>只修 bug 和安全漏洞</td><td>新功能，内部存储格式可能变化</td></tr>
+<tr><td>数据文件</td><td>兼容，直接用</td><td><strong>不兼容</strong>，必须迁移</td></tr>
+<tr><td>怎么升</td><td>换新的二进制 / 镜像，重启即可</td><td>dump + restore、pg_upgrade 或逻辑复制</td></tr>
+<tr><td>多久一次</td><td>大约每季度，<strong>应该及时跟上</strong></td><td>每年一个；每个大版本支持 5 年</td></tr>
+</table></div>
+
+<p>用新的大版本镜像去打开旧版本的数据目录，Postgres 会直接拒绝启动：</p>
+
+<div class="code out"><pre>
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 17,
+         which is not compatible with this version 18.1 (Debian 18.1-1.pgdg13+2).
+</pre></div>
+
+<h3>Docker 用户注意：18 的镜像改了数据目录</h3>
+
+<p>
+  官方 <code>postgres</code> 镜像从 18 开始，把数据目录从 <code>/var/lib/postgresql/data</code> 改成了按版本区分的 <code>/var/lib/postgresql/18/docker</code>，
+  并建议把卷挂载到上一级 <code>/var/lib/postgresql</code>（这样新旧版本的目录可以放在同一个卷里，方便 <code>pg_upgrade --link</code>）。
+  如果沿用第 1 章 <code>-v postgres-volume:/var/lib/postgresql/data</code> 的写法去跑 <code>postgres:18</code>，容器会报错退出：
+</p>
+
+<div class="code out"><pre>
+Error: in 18+, these Docker images are configured to store database data in a
+       format which is compatible with "pg_ctlcluster" (specifically, using
+       major-version-specific directory names).  …
+       Counter to that, there appears to be PostgreSQL data in:
+         /var/lib/postgresql/data
+       …
+       The suggested container configuration for 18+ is to place a single mount
+       at /var/lib/postgresql which will then place PostgreSQL data in a
+       subdirectory, …
+</pre></div>
+
+<p>实测即使挂载的是一个空卷，也会这样报错。所以 18 及以后的版本，启动命令要写成：</p>
+
+<div class="code" data-lang="bash"><pre>
+docker run --name postgres18 -e POSTGRES_PASSWORD=password -p 5433:5432 \
+    -v postgres18-volume:/var/lib/postgresql \
+    -d postgres:18.1
+</pre></div>
+
+<h3>方法一：dump + restore（最简单）</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 180" role="img" aria-label="用 dump 和 restore 从 17 升级到 18：新旧两个实例并存，用 18 的 pg_dump 导出再导入">
+  <rect class="bx-b" x="20" y="40" width="170" height="90" rx="12"/><text class="ttl on-b" x="105" y="70" text-anchor="middle">旧实例</text><text class="sm" x="105" y="92" text-anchor="middle">postgres:17.2</text><text class="sm" x="105" y="112" text-anchor="middle">端口 5432</text>
+  <path class="ln" d="M192 70 H286" marker-end="url(#ar)"/><text class="sm" x="240" y="60" text-anchor="middle">① globals</text>
+  <path class="ln" d="M192 104 H286" marker-end="url(#ar)"/><text class="sm" x="240" y="124" text-anchor="middle">② 每个库</text>
+  <rect class="bx-a" x="290" y="40" width="180" height="90" rx="12"/><text class="ttl on-a" x="380" y="70" text-anchor="middle">18 的 pg_dump</text><text class="sm" x="380" y="92" text-anchor="middle">pg_dumpall --globals-only</text><text class="sm" x="380" y="112" text-anchor="middle">pg_dump -Fc</text>
+  <path class="ln" d="M472 85 H566" marker-end="url(#ar)"/><text class="sm" x="520" y="76" text-anchor="middle">③ 导入</text>
+  <rect class="bx-g" x="570" y="40" width="170" height="90" rx="12"/><text class="ttl on-g" x="655" y="70" text-anchor="middle">新实例</text><text class="sm" x="655" y="92" text-anchor="middle">postgres:18.1</text><text class="sm" x="655" y="112" text-anchor="middle">端口 5433</text>
+  <text class="sm" x="380" y="160" text-anchor="middle">验证无误后，把应用的连接串指向新实例，旧实例保留一段时间作为退路</text>
+</svg>
+<figcaption>图 S6-4　dump + restore 升级：新旧并存，切换前可以充分验证</figcaption>
+</figure>
+
+<div class="code" data-lang="bash"><pre>
+# 在 18 的容器里，用 18 版本的工具连接旧的 17 实例导出
+docker exec -e PGPASSWORD=password postgres18 \
+    pg_dumpall -h 旧实例地址 -U postgres --globals-only -f /tmp/globals.sql
+docker exec -e PGPASSWORD=password postgres18 \
+    pg_dump -h 旧实例地址 -U postgres -Fc -f /tmp/rls17.dump rlstopic
+
+# 导入新实例
+docker exec postgres18 psql -U postgres -q -f /tmp/globals.sql
+docker exec postgres18 createdb -U postgres rlstopic
+docker exec postgres18 pg_restore -U postgres -d rlstopic /tmp/rls17.dump
+docker exec postgres18 psql -U postgres -d rlstopic -c "SELECT count(*) FROM notes"
+</pre></div>
+<div class="code out"><pre>
+ count
+--------
+ 500006
+(1 row)
+</pre></div>
+
+<p>
+  两个容器怎么互相访问：可以把它们放进同一个 Docker 网络（<code>docker network create</code>，然后用容器名当主机名），
+  或者在旧容器映射了 5432 端口时用 <code>host.docker.internal</code>（Docker Desktop）。
+</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 用新版本的 pg_dump</div>
+  <p>pg_dump 能导出比它自己<strong>旧</strong>的服务器，反过来不行。跨版本迁移时，总是用<strong>目标版本</strong>（新版本）的 pg_dump 去连接旧服务器，就像上面在 18 的容器里执行那样。</p>
+</div>
+
+<h3>方法二和三：数据量大的时候</h3>
+
+<ul>
+  <li><strong>pg_upgrade</strong>：直接把旧的数据目录转换成新版本的格式。<code>--link</code> 模式用硬链接而不是复制，几百 GB 的库也只需要几分钟停机。但它需要新旧两个版本的二进制同时存在，在 Docker 里操作比较繁琐（社区有 <code>pgautoupgrade</code> 之类的镜像帮你做）。</li>
+  <li><strong>逻辑复制</strong>：先建好新版本实例，用发布 / 订阅（<code>CREATE PUBLICATION</code> / <code>CREATE SUBSCRIPTION</code>）把数据持续同步过去，同步追上后再切换应用，停机时间可以缩短到秒级。步骤最多，适合不能停机的系统。</li>
+</ul>
+
+<div class="tw"><table>
+<tr><th>方法</th><th>停机时间</th><th>复杂度</th><th>适合</th></tr>
+<tr><td>dump + restore</td><td>和数据量成正比</td><td>低</td><td>几十 GB 以内，可以安排维护窗口</td></tr>
+<tr><td>pg_upgrade --link</td><td>几分钟</td><td>中</td><td>大库，可以接受短暂停机</td></tr>
+<tr><td>逻辑复制</td><td>秒级</td><td>高</td><td>不能停机的系统</td></tr>
+</table></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 升级前的检查清单</div>
+  <ul>
+    <li>先做一份完整备份，并<strong>确认能恢复</strong>。</li>
+    <li>用到的扩展（pgvector、PostGIS、TimescaleDB、zhparser……）在新版本上都有可用的版本吗？</li>
+    <li>读一遍新版本发行说明里的“Migration”部分，留意不兼容的改动。</li>
+    <li>在新版本上跑一遍应用的测试。</li>
+    <li>升级后执行 <code>ANALYZE</code>（或 <code>vacuumdb --all --analyze-in-stages</code>）。dump + restore 不会带上统计信息；pg_upgrade 在 18 之前也不会（18 起保留了大部分，但扩展统计信息仍需重建）。没有统计信息，规划器会选出很差的计划（第 4 章）。</li>
+  </ul>
+</div>
+
+<h2 id="practice">备份的纪律</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 150" role="img" aria-label="3-2-1 备份原则和定期恢复演练">
+  <rect class="bx-b" x="20" y="20" width="170" height="100" rx="12"/><text class="ttl on-b" x="105" y="54" text-anchor="middle">3 份</text><text class="sm" x="105" y="80" text-anchor="middle">生产数据 + 两份备份</text>
+  <rect class="bx-p" x="205" y="20" width="170" height="100" rx="12"/><text class="ttl on-p" x="290" y="54" text-anchor="middle">2 种介质</text><text class="sm" x="290" y="80" text-anchor="middle">如本地磁盘 + 对象存储</text>
+  <rect class="bx-a" x="390" y="20" width="170" height="100" rx="12"/><text class="ttl on-a" x="475" y="54" text-anchor="middle">1 份异地</text><text class="sm" x="475" y="80" text-anchor="middle">另一个机房 / 区域 / 账号</text>
+  <rect class="bx-g" x="575" y="20" width="165" height="100" rx="12"/><text class="ttl on-g" x="657" y="54" text-anchor="middle">定期演练</text><text class="sm" x="657" y="80" text-anchor="middle">真的恢复一次，</text><text class="sm" x="657" y="98" text-anchor="middle">并且计时</text>
+  <text class="sm" x="380" y="142" text-anchor="middle">没有恢复过的备份，不算备份</text>
+</svg>
+<figcaption>图 S6-5　3-2-1 原则，加上最重要的一条：演练</figcaption>
+</figure>
+
+<ul>
+  <li><strong>自动化</strong>：用 cron 或调度系统每天执行备份脚本，失败要告警。</li>
+  <li><strong>演练恢复</strong>：定期把备份恢复到一台临时机器上，跑几个检查查询（行数、最新一条记录的时间），记录花了多久，这就是你真实的恢复时间。</li>
+  <li><strong>备份也是数据</strong>：备份文件里有全部数据和密码哈希，要和生产库同等对待：加密、限制访问。</li>
+  <li><strong>备份不是副本</strong>：主从复制会把 <code>DROP TABLE</code> 也忠实地同步过去，它防的是机器故障，防不了误操作。</li>
+</ul>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>逻辑备份（pg_dump）灵活、可跨版本；物理备份（pg_basebackup）适合大库；持续归档 + PITR 能恢复到任意时间点，生产环境用 pgBackRest 等工具或托管服务。</li>
+  <li>pg_dump 默认用 <code>-Fc</code>，它在一致的快照里导出，不阻塞读写。</li>
+  <li>pg_restore 不建库、默认遇错继续；用 <code>--single-transaction --exit-on-error</code> 更安全；<code>-t</code> 不会恢复主键和索引。</li>
+  <li>角色不在 pg_dump 里，用 <code>pg_dumpall --globals-only</code> 单独备份，并且先恢复它。</li>
+  <li>Docker 里用 <code>docker exec … pg_dump &gt; 文件</code>；打包数据卷前必须停库。</li>
+  <li>大版本数据文件不兼容：用新版本的 pg_dump 导出再导入，或者 pg_upgrade、逻辑复制。18 的官方镜像要把卷挂在 <code>/var/lib/postgresql</code>。</li>
+  <li>没有恢复过的备份不算备份。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用 <code>docker exec</code> 把第 2 章的数据库备份到宿主机，然后恢复到一个叫 <code>shop_copy</code> 的新库里，比较两边 <code>sales.orders</code> 的行数。</li>
+    <li>只恢复 <code>sales.products</code> 一张表，分别用 <code>-t</code> 和 <code>-L 清单</code> 两种方式，用 <code>\d</code> 比较结果。</li>
+    <li>写一个 shell 脚本：备份所有数据库和 globals，文件名带日期，并删除 7 天前的备份。</li>
+    <li>启动一个 <code>postgres:18.1</code> 容器（注意卷的挂载路径），把第 1 章的数据库迁移过去，并验证数据。</li>
+    <li>做一次恢复演练：从备份恢复，给每张表数一次行数，记下从开始到完成一共花了多久。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

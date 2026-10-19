@@ -295,6 +295,8 @@ COMMIT;      -- 成功提交或失败回滚时，锁才释放
 <figcaption>图 11-4　SKIP LOCKED：被别人锁住的消息直接跳过，而不是排队等待</figcaption>
 </figure>
 
+<p>SKIP LOCKED 和 <code>FOR UPDATE</code>、<code>NOWAIT</code>、<code>lock_timeout</code> 的对比，以及死锁和咨询锁，见<a href="topic-sql.html#locks">专题 2</a>。</p>
+
 <h3>标记完成函数</h3>
 
 <div class="code" data-lang="sql" data-file="清单 11.4 · 修改消息状态的函数">
@@ -629,7 +631,7 @@ WHERE status = 'new';
 
 <p>
   第 9 章用分区优化了时序负载。高吞吐的消息队列同样受益：写入速度很高时表会迅速膨胀，影响取消息和改状态的性能。
-  而且<strong>删掉的消息并不会立刻消失</strong>：被删除的行（<strong>死元组</strong>，dead tuple）仍留在表的物理结构里，直到被 Postgres 的 <strong>autovacuum</strong> 进程回收。为了跟上负载，可能得调整 vacuum 设置，让它更积极地清理。
+  而且<strong>删掉的消息并不会立刻消失</strong>：被删除的行（<strong>死元组</strong>，dead tuple）仍留在表的物理结构里，直到被 Postgres 的 <strong>autovacuum</strong> 进程回收。为了跟上负载，可能得调整 vacuum 设置，让它更积极地清理（怎么调见<a href="topic-vacuum.html#autovacuum">专题 4</a>）。
 </p>
 
 <div class="box deep">

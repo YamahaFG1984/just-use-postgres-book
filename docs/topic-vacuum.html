@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>专题 4 · VACUUM 与表膨胀 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="17">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">专题 4 · 补充内容（原书之外）</span>
+<h1>VACUUM 与表膨胀</h1>
+<p class="lede">
+  第 2 章讲过 MVCC：Postgres 更新一行时<strong>不覆盖旧数据</strong>，而是写一个新版本（图 2-7）。这让读写互不阻塞，代价是旧版本会留在表里，变成“死元组”。
+  负责清理它们的就是 <strong>VACUUM</strong>。理解它，才能看懂“为什么我的表越来越大”“为什么删了数据磁盘没变小”这类问题。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 本页的例子都实际运行过</div>
+  <p>输出均在 Postgres 17.2 上实测。为了让现象可控，演示用的表都关掉了自动清理：<code>WITH (autovacuum_enabled = false)</code>。<strong>生产环境千万不要这样做。</strong></p>
+</div>
+
+<div class="goals">
+  <h4>本页目标</h4>
+  <ul>
+    <li>亲眼看到 UPDATE 产生的死元组，以及表为什么会膨胀</li>
+    <li>分清 VACUUM 和 VACUUM FULL：一个回收空间供复用，一个把文件缩小</li>
+    <li>理解 autovacuum 何时触发，以及如何按表调整</li>
+    <li>知道“长事务”为什么会让 VACUUM 失效</li>
+    <li>用 HOT 更新和 fillfactor 减少膨胀，了解事务 ID 回卷</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="dead">死元组从哪来</h2>
+
+<h3>每一行都有隐藏的版本信息</h3>
+
+<p>每一行除了你定义的列，还有几个系统列。<code>ctid</code> 是行在文件里的物理位置（第几页，第几个槽），<code>xmin</code> 是创建这个版本的事务 ID，<code>xmax</code> 是删除（或更新掉）它的事务 ID：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE DATABASE vactopic;
+\c vactopic
+
+CREATE TABLE items (id int PRIMARY KEY, qty int, note text)
+  WITH (autovacuum_enabled = false);
+INSERT INTO items VALUES (1, 10, 'a');
+
+SELECT ctid, xmin, xmax, * FROM items;
+</pre></div>
+<div class="code out"><pre>
+ ctid  | xmin | xmax | id | qty | note
+-------+------+------+----+-----+------
+ (0,1) |  865 |    0 |  1 |  10 | a
+(1 row)
+</pre></div>
+
+<div class="code" data-lang="sql"><pre>
+UPDATE items SET qty = 11 WHERE id = 1;
+SELECT ctid, xmin, xmax, * FROM items;
+</pre></div>
+<div class="code out"><pre>
+ ctid  | xmin | xmax | id | qty | note
+-------+------+------+----+-----+------
+ (0,2) |  866 |    0 |  1 |  11 | a
+(1 row)
+</pre></div>
+
+<p>ctid 从 (0,1) 变成了 (0,2)：更新后的行住进了新的位置。那旧版本呢？用自带的 <code>pageinspect</code> 扩展直接看数据页的内容：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION pageinspect;
+SELECT lp, t_xmin, t_xmax, t_ctid FROM heap_page_items(get_raw_page('items', 0));
+</pre></div>
+<div class="code out"><pre>
+ lp | t_xmin | t_xmax | t_ctid
+----+--------+--------+--------
+  1 |    865 |    866 | (0,2)      ← 旧版本还在！被事务 866 “删除”，指向新版本
+  2 |    866 |      0 | (0,2)      ← 新版本
+(2 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="UPDATE 之后数据页里同时存在旧版本和新版本，VACUUM 把旧版本标记为可复用">
+  <text class="ttl" x="190" y="22" text-anchor="middle">UPDATE 之后：第 0 页</text>
+  <rect class="bx" x="20" y="34" width="340" height="150" rx="10"/>
+  <rect class="cell-r" x="36" y="50" width="308" height="52"/>
+  <text class="mono" x="48" y="72">槽 1  qty=10  xmin=865 xmax=866</text>
+  <text class="sm on-r" x="48" y="92">死元组：已经没有事务需要它了</text>
+  <rect class="cell-g" x="36" y="112" width="308" height="52"/>
+  <text class="mono" x="48" y="134">槽 2  qty=11  xmin=866 xmax=0</text>
+  <text class="sm on-g" x="48" y="154">当前版本（活元组）</text>
+  <path class="ln" d="M362 110 H418" marker-end="url(#ar)"/>
+  <text class="sm b" x="390" y="100" text-anchor="middle">VACUUM</text>
+  <text class="ttl" x="575" y="22" text-anchor="middle">VACUUM 之后：第 0 页</text>
+  <rect class="bx" x="420" y="34" width="320" height="150" rx="10"/>
+  <rect class="cell" x="436" y="50" width="288" height="52" style="stroke-dasharray:5 4"/>
+  <text class="mono" x="448" y="72">槽 1  （空，可复用）</text>
+  <text class="sm" x="448" y="92">lp_flags = 2：只留一个指针</text>
+  <rect class="cell-g" x="436" y="112" width="288" height="52"/>
+  <text class="mono" x="448" y="134">槽 2  qty=11  xmin=866</text>
+  <text class="sm on-g" x="448" y="154">不受影响</text>
+  <text class="sm" x="380" y="214" text-anchor="middle">VACUUM 不移动活元组，只把死元组占的空间登记为“可以再用”</text>
+  <text class="sm" x="380" y="234" text-anchor="middle">DELETE 同理：被删的行要等 VACUUM 才真正腾出空间</text>
+</svg>
+<figcaption>图 S4-1　UPDATE = 插入新版本 + 把旧版本标记为过期</figcaption>
+</figure>
+
+<div class="code" data-lang="sql"><pre>
+VACUUM items;
+SELECT lp, lp_flags, t_xmin, t_xmax, t_ctid FROM heap_page_items(get_raw_page('items', 0));
+</pre></div>
+<div class="code out"><pre>
+ lp | lp_flags | t_xmin | t_xmax | t_ctid
+----+----------+--------+--------+--------
+  1 |        2 |        |        |            ← 内容被清掉了
+  2 |        1 |    866 |      0 | (0,2)
+(2 rows)
+</pre></div>
+
+<p>为什么不在 UPDATE 时直接删掉旧版本？因为此时可能还有别的事务正在读它（比如一个可重复读事务，见<a href="topic-sql.html#isolation">专题 2</a>）。只有当<strong>所有可能看到它的事务都结束了</strong>，旧版本才成为真正的“死元组”，才可以被清理。</p>
+
+<h3>表膨胀</h3>
+
+<p>放大到 10 万行，看看把每一行都更新一遍会发生什么：</p>
+
+<div class="code" data-lang="sql"><pre>
+TRUNCATE items;
+INSERT INTO items SELECT g, 0, repeat('x', 100) FROM generate_series(1, 100000) g;
+
+SELECT pg_size_pretty(pg_relation_size('items')) AS size, n_dead_tup
+FROM pg_stat_user_tables WHERE relname = 'items';
+--  size  | n_dead_tup
+--  13 MB |          0
+
+UPDATE items SET qty = qty + 1;     -- 每行都改一下
+
+SELECT pg_size_pretty(pg_relation_size('items')) AS size, n_dead_tup
+FROM pg_stat_user_tables WHERE relname = 'items';
+--  size  | n_dead_tup
+--  27 MB |     100000         表翻倍了，里面一半是死元组
+</pre></div>
+
+<p>
+  数据量没变，表却从 13 MB 涨到 27 MB。这就是<strong>表膨胀（bloat）</strong>。死元组不仅占磁盘，还拖慢查询：
+  顺序扫描要多读一倍的页，索引里也留着指向死元组的条目。
+</p>
+
+<h2 id="vacuum">VACUUM 与 VACUUM FULL</h2>
+
+<div class="code" data-lang="sql"><pre>
+VACUUM (VERBOSE) items;
+</pre></div>
+<div class="code out"><pre>
+INFO:  finished vacuuming "vactopic.public.items": index scans: 1
+pages: 0 removed, 3449 remain, 3449 scanned (100.00% of total)
+tuples: 100000 removed, 100000 remain, 0 are dead but not yet removable
+…
+index "items_pkey": pages: 551 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+</pre></div>
+
+<div class="code" data-lang="sql"><pre>
+SELECT pg_size_pretty(pg_relation_size('items')) AS size, n_dead_tup
+FROM pg_stat_user_tables WHERE relname = 'items';
+--  size  | n_dead_tup
+--  27 MB |          0         死元组没了，但文件还是 27 MB
+</pre></div>
+
+<p>普通 VACUUM <strong>不会把文件变小</strong>。它把死元组的空间记进“空闲空间映射”（Free Space Map），之后的写入优先用这些空位。再更新一遍全表试试：</p>
+
+<div class="code" data-lang="sql"><pre>
+UPDATE items SET qty = qty + 1;
+SELECT pg_size_pretty(pg_relation_size('items'));   -- 27 MB   没再长：新版本填进了上次回收的空间
+</pre></div>
+
+<p>用 <code>pgstattuple</code> 扩展（同样随 Postgres 自带）可以精确看到表里有多少死元组和空闲空间：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION pgstattuple;
+
+-- 刚 UPDATE 完全表
+SELECT tuple_count, dead_tuple_count, round(dead_tuple_percent) AS dead_pct,
+       round(free_percent) AS free_pct
+FROM pgstattuple('items');
+--  tuple_count | dead_tuple_count | dead_pct | free_pct
+--       100000 |           100000 |       47 |        1
+
+VACUUM items;
+-- 再查一次
+--       100000 |                0 |        0 |       50     死元组变成了空闲空间
+</pre></div>
+
+<p>真要把文件缩小，就要 <code>VACUUM FULL</code>，它把活元组复制到一个全新的文件里：</p>
+
+<div class="code" data-lang="sql"><pre>
+VACUUM FULL items;
+SELECT pg_size_pretty(pg_relation_size('items'));   -- 13 MB
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="表大小的变化：插入 13MB，全表更新 27MB，VACUUM 后仍 27MB 但一半空闲，VACUUM FULL 后回到 13MB">
+  <text class="sm b" x="85" y="22" text-anchor="middle">插入 10 万行</text>
+  <text class="sm b" x="275" y="22" text-anchor="middle">UPDATE 全表</text>
+  <text class="sm b" x="465" y="22" text-anchor="middle">VACUUM</text>
+  <text class="sm b" x="655" y="22" text-anchor="middle">VACUUM FULL</text>
+  <rect class="cell-g" x="40" y="128" width="90" height="72"/>
+  <rect class="cell-g" x="230" y="128" width="90" height="72"/><rect class="cell-r" x="230" y="56" width="90" height="72"/>
+  <rect class="cell-g" x="420" y="128" width="90" height="72"/><rect class="cell" x="420" y="56" width="90" height="72" style="stroke-dasharray:5 4"/>
+  <rect class="cell-g" x="610" y="128" width="90" height="72"/>
+  <text class="sm" x="85" y="168" text-anchor="middle">活元组</text>
+  <text class="sm" x="275" y="168" text-anchor="middle">活元组</text><text class="sm on-r" x="275" y="96" text-anchor="middle">死元组</text>
+  <text class="sm" x="465" y="168" text-anchor="middle">活元组</text><text class="sm" x="465" y="96" text-anchor="middle">空闲，可复用</text>
+  <text class="sm" x="655" y="168" text-anchor="middle">活元组</text>
+  <text class="ttl" x="85" y="222" text-anchor="middle">13 MB</text>
+  <text class="ttl on-r" x="275" y="222" text-anchor="middle">27 MB</text>
+  <text class="ttl" x="465" y="222" text-anchor="middle">27 MB</text>
+  <text class="ttl on-g" x="655" y="222" text-anchor="middle">13 MB</text>
+  <path class="ln" d="M134 164 H222" marker-end="url(#ar)"/><path class="ln" d="M324 164 H412" marker-end="url(#ar)"/><path class="ln" d="M514 164 H602" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="250" text-anchor="middle">VACUUM 让空间“可复用”；只有 VACUUM FULL（或 pg_repack 之类的工具）才把空间还给操作系统</text>
+</svg>
+<figcaption>图 S4-2　同样 10 万行数据，表大小的四个阶段</figcaption>
+</figure>
+
+<div class="tw"><table>
+<tr><th></th><th>VACUUM</th><th>VACUUM FULL</th></tr>
+<tr><td>做什么</td><td>标记死元组空间为可复用，更新统计信息和可见性映射</td><td>把整张表重写到一个新文件，旧文件删除</td></tr>
+<tr><td>文件变小吗</td><td>基本不会（只能截掉表末尾完全空的页）</td><td>会</td></tr>
+<tr><td>锁</td><td>不阻塞读写，可以随时跑</td><td><strong>ACCESS EXCLUSIVE 锁：期间表完全不能读写</strong></td></tr>
+<tr><td>额外磁盘</td><td>不需要</td><td>需要再放得下一份表和索引</td></tr>
+<tr><td>什么时候用</td><td>日常，通常交给 autovacuum</td><td>一次性删除了大量数据、确实需要还空间，且能接受停机</td></tr>
+</table></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 不要把 VACUUM FULL 当日常维护</div>
+  <p>
+    一张稳定在 27 MB、内部一半空闲的表，其实是健康的：空闲空间会被持续复用。把它 VACUUM FULL 到 13 MB，下一次全表更新它还会长回 27 MB，白白锁表一次。
+    需要在线缩小大表时，社区常用第三方扩展 <strong>pg_repack</strong>，它只在最后切换时短暂加锁，但不随 Postgres 自带，需要另外安装。
+  </p>
+</div>
+
+<h2 id="autovacuum">autovacuum：自动清理</h2>
+
+<p>没人会手动给每张表跑 VACUUM。Postgres 有一个后台进程 <strong>autovacuum launcher</strong>，定期检查每张表，死元组多到一定程度就派一个 worker 去清理：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT name, setting FROM pg_settings WHERE name LIKE 'autovacuum%' ORDER BY name;
+</pre></div>
+<div class="code out"><pre>
+                name                |  setting
+------------------------------------+-----------
+ autovacuum                         | on          总开关
+ autovacuum_analyze_scale_factor    | 0.1
+ autovacuum_analyze_threshold       | 50
+ autovacuum_freeze_max_age          | 200000000
+ autovacuum_max_workers             | 3           最多同时 3 个 worker
+ autovacuum_naptime                 | 60          每个数据库每 60 秒检查一轮
+ autovacuum_vacuum_insert_threshold | 1000
+ autovacuum_vacuum_scale_factor     | 0.2
+ autovacuum_vacuum_threshold        | 50
+…
+</pre></div>
+
+<p>触发条件是：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="autovacuum 触发公式以及不同大小的表需要多少死元组才触发">
+  <rect class="bx-a" x="20" y="16" width="720" height="56" rx="10"/>
+  <text class="mono b" x="380" y="40" text-anchor="middle">死元组数 &gt; autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × 表的行数</text>
+  <text class="sm" x="380" y="62" text-anchor="middle">默认 threshold = 50，scale_factor = 0.2，即“50 + 20% × 行数”</text>
+  <rect class="cell-h" x="20" y="88" width="720" height="30"/>
+  <text class="sm b" x="40" y="108">表的行数</text><text class="sm b" x="300" y="108">触发清理需要的死元组</text><text class="sm b" x="540" y="108">占比</text>
+  <rect class="cell" x="20" y="118" width="720" height="28"/><text class="sm" x="40" y="137">1 万</text><text class="mono" x="300" y="137">2,050</text><text class="sm" x="540" y="137">20%，很快就会被清理</text>
+  <rect class="cell" x="20" y="146" width="720" height="28"/><text class="sm" x="40" y="165">10 万</text><text class="mono" x="300" y="165">20,050</text><text class="sm" x="540" y="165">20%</text>
+  <rect class="cell-r" x="20" y="174" width="720" height="28"/><text class="sm" x="40" y="193">1 亿</text><text class="mono" x="300" y="193">20,000,050</text><text class="sm on-r" x="540" y="193">攒到 2000 万死元组才开始！</text>
+</svg>
+<figcaption>图 S4-3　按比例触发：表越大，等得越久</figcaption>
+</figure>
+
+<p>
+  对小表这个规则很好，对大表就太迟钝了。可以<strong>按表</strong>单独调小比例（这些设置叫存储参数，写在表上，不影响别的表）：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE items SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_enabled = true);
+-- 现在 10 万行的表，只要 50 + 1000 = 1050 个死元组就会触发
+
+UPDATE items SET qty = qty + 1 WHERE id <= 5000;
+-- 等一两分钟……
+SELECT relname, n_dead_tup, last_autovacuum, autovacuum_count
+FROM pg_stat_user_tables WHERE relname = 'items';
+</pre></div>
+<div class="code out"><pre>
+ relname | n_dead_tup |        last_autovacuum        | autovacuum_count
+---------+------------+-------------------------------+------------------
+ items   |          0 | 2026-10-19 15:58:35.804374+00 |                1
+(1 row)
+</pre></div>
+
+<p>autovacuum 在后台自己完成了清理。同一个 worker 还会顺带做 <strong>ANALYZE</strong>（更新第 4 章讲的统计信息，<code>last_autoanalyze</code> 列），触发规则类似：50 + 10% 的行数发生变化。</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 只插入不更新的表也需要 VACUUM</div>
+  <p>日志、时序这类只追加的表没有死元组，但 VACUUM 还负责更新<strong>可见性映射</strong>（让第 4 章的 Index Only Scan 不用回表）和冻结旧行（见下文）。所以 Postgres 13 起增加了 <code>autovacuum_vacuum_insert_threshold</code>：插入了足够多的行也会触发清理。</p>
+</div>
+
+<h2 id="long-tx">长事务：VACUUM 的头号敌人</h2>
+
+<p>前面说过，只要还有事务<strong>可能</strong>看到旧版本，它就不能被清理。一个忘了提交的事务，会让整个数据库的 VACUUM 都无法清理它开始之后产生的死元组。用两个会话实测：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 会话 A：开了个事务，读了点东西，然后……一直没提交
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM items;
+
+-- 会话 B：更新全表，然后 VACUUM
+UPDATE items SET qty = qty + 1;
+VACUUM (VERBOSE) items;
+</pre></div>
+<div class="code out"><pre>
+tuples: 0 removed, 200000 remain, 100000 are dead but not yet removable
+removable cutoff: 874, which was 1 XIDs old when operation ended
+</pre></div>
+
+<p>
+  <strong>“100000 are dead but not yet removable”</strong>：10 万个死元组，一个也删不掉，因为会话 A 的快照还可能需要它们。
+  会话 A 提交之后再 VACUUM，就 <code>100000 removed</code> 了。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="长事务时间线：事务开始后产生的死元组都无法被清理，直到事务结束">
+  <path class="ln" d="M40 150 H720" marker-end="url(#ar)"/>
+  <text class="sm" x="720" y="138" text-anchor="end">时间</text>
+  <rect class="bx-a" x="100" y="30" width="420" height="34" rx="8"/>
+  <text class="sm" x="310" y="52" text-anchor="middle">会话 A：BEGIN …（快照一直有效）… 没提交</text>
+  <circle class="dot-a" cx="520" cy="150" r="6"/><text class="sm on-a" x="520" y="134" text-anchor="middle">A 提交</text>
+  <rect class="area-a" x="100" y="78" width="420" height="40" rx="4"/>
+  <text class="sm on-r" x="310" y="103" text-anchor="middle">这段时间产生的死元组：VACUUM 跑多少次都清不掉，表持续膨胀</text>
+  <circle class="dot-b" cx="250" cy="150" r="6"/><text class="sm" x="250" y="176" text-anchor="middle">VACUUM：0 removed</text>
+  <circle class="dot-g" cx="620" cy="150" r="6"/><text class="sm on-g" x="620" y="176" text-anchor="middle">VACUUM：100000 removed</text>
+</svg>
+<figcaption>图 S4-4　一个不提交的事务，能挡住整个数据库的清理</figcaption>
+</figure>
+
+<p>谁在“拖后腿”？查看 <code>pg_stat_activity</code> 里持有旧快照（<code>backend_xmin</code> 不为空）、事务开始时间最早的连接：</p>
+
+<div class="code" data-lang="sql"><pre>
+SELECT pid, usename, state, now() - xact_start AS xact_age, backend_xmin, left(query, 40) AS query
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL AND pid <> pg_backend_pid()
+ORDER BY xact_start;
+</pre></div>
+<div class="code out"><pre>
+ pid | usename | state  |    xact_age     | backend_xmin | query
+-----+---------+--------+-----------------+--------------+------------------------------
+ 420 | postgres| active | 00:00:01.352946 |          874 | …
+</pre></div>
+
+<p>常见的罪魁祸首和对策：</p>
+
+<ul>
+  <li><strong>应用开了事务却没提交</strong>（异常分支漏了 rollback），连接显示为 <code>idle in transaction</code>。设置 <code>idle_in_transaction_session_timeout</code>（默认 0，即不限制），比如 <code>'10min'</code>，超时自动断开。</li>
+  <li><strong>跑了几个小时的分析查询</strong>：放到只读副本上执行，或者拆小。</li>
+  <li><strong>被遗忘的复制槽</strong>（逻辑复制、Debezium 这类变更数据捕获工具会创建它们）：查 <code>pg_replication_slots</code>，删掉不用的。</li>
+  <li>必要时用 <code>SELECT pg_terminate_backend(pid);</code> 结束那个连接。</li>
+</ul>
+
+<h2 id="hot">HOT 更新与 fillfactor</h2>
+
+<p>
+  一次普通的 UPDATE，除了写新版本，还要在<strong>每一个索引</strong>里插入一条指向新版本的条目。表上索引越多，代价越大，索引膨胀也越快。
+  如果满足两个条件，Postgres 会走一条捷径，叫 <strong>HOT（Heap-Only Tuple）更新</strong>：
+</p>
+
+<ol>
+  <li>更新的列<strong>都没有被任何索引用到</strong>；</li>
+  <li>新版本能放进<strong>同一个数据页</strong>（页里还有空位）。</li>
+</ol>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="普通更新要改所有索引，HOT 更新只在同一页里串一个链，索引不动">
+  <text class="ttl" x="190" y="22" text-anchor="middle">普通 UPDATE</text>
+  <rect class="bx-b" x="20" y="36" width="140" height="34" rx="6"/><text class="sm" x="90" y="58" text-anchor="middle">索引 1</text>
+  <rect class="bx-b" x="20" y="80" width="140" height="34" rx="6"/><text class="sm" x="90" y="102" text-anchor="middle">索引 2</text>
+  <rect class="cell-r" x="230" y="40" width="120" height="30"/><text class="sm" x="290" y="60" text-anchor="middle">旧版本 页 3</text>
+  <rect class="cell-g" x="230" y="140" width="120" height="30"/><text class="sm" x="290" y="160" text-anchor="middle">新版本 页 9</text>
+  <path class="ln-d" d="M162 53 H226"/><path class="ln-d" d="M162 97 L226 60"/>
+  <path class="ln-r" d="M162 60 L226 150" marker-end="url(#ar-r)"/><path class="ln-r" d="M162 104 L226 156" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="190" y="200" text-anchor="middle">每个索引都要新增一条条目</text>
+
+  <text class="ttl" x="575" y="22" text-anchor="middle">HOT 更新</text>
+  <rect class="bx-b" x="410" y="36" width="140" height="34" rx="6"/><text class="sm" x="480" y="58" text-anchor="middle">索引 1</text>
+  <rect class="bx-b" x="410" y="80" width="140" height="34" rx="6"/><text class="sm" x="480" y="102" text-anchor="middle">索引 2</text>
+  <rect class="bx" x="600" y="34" width="140" height="140" rx="8"/>
+  <text class="sm b" x="670" y="52" text-anchor="middle">同一个页 3</text>
+  <rect class="cell-r" x="612" y="62" width="116" height="30"/><text class="sm" x="670" y="82" text-anchor="middle">旧版本</text>
+  <rect class="cell-g" x="612" y="132" width="116" height="30"/><text class="sm" x="670" y="152" text-anchor="middle">新版本</text>
+  <path class="ln-g" d="M670 94 V128" marker-end="url(#ar-g)"/><text class="sm on-g" x="676" y="116">链</text>
+  <path class="ln" d="M552 53 L608 74" marker-end="url(#ar)"/><path class="ln" d="M552 97 L608 80" marker-end="url(#ar)"/>
+  <text class="sm on-g" x="575" y="200" text-anchor="middle">索引不动，顺着页内的链找到新版本</text>
+  <text class="sm" x="575" y="218" text-anchor="middle">旧版本连页内清理都更容易</text>
+</svg>
+<figcaption>图 S4-5　HOT 更新：不碰索引的更新</figcaption>
+</figure>
+
+<p>
+  第二个条件就是 <strong>fillfactor</strong> 的用武之地。表默认 fillfactor = 100，插入时把每页填满，更新时页里没有空位，新版本只能去别的页。
+  设成 90，插入时每页留 10% 的空位给将来的更新。对比两张一模一样的表，各更新 10% 的行（只改没有索引的 note 列）：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE ff100 (id int PRIMARY KEY, qty int, note text) WITH (autovacuum_enabled = false);
+CREATE TABLE ff90  (id int PRIMARY KEY, qty int, note text) WITH (autovacuum_enabled = false, fillfactor = 90);
+INSERT INTO ff100 SELECT g, 0, repeat('x', 100) FROM generate_series(1, 100000) g;
+INSERT INTO ff90  SELECT g, 0, repeat('x', 100) FROM generate_series(1, 100000) g;
+
+UPDATE ff100 SET note = 'y' || note WHERE id % 10 = 0;
+UPDATE ff90  SET note = 'y' || note WHERE id % 10 = 0;
+
+SELECT relname, n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables
+WHERE relname LIKE 'ff%' ORDER BY 1;
+</pre></div>
+<div class="code out"><pre>
+ relname | n_tup_upd | n_tup_hot_upd
+---------+-----------+---------------
+ ff100   |     10000 |             0     页都满了，一次 HOT 都没有
+ ff90    |     10000 |         10000     全部是 HOT 更新
+(2 rows)
+</pre></div>
+
+<p>再给 qty 加个索引，然后更新 qty。被更新的列有索引，第一个条件不满足，fillfactor 再低也没用：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX ON ff90 (qty);
+SELECT pg_stat_reset_single_table_counters('ff90'::regclass);   -- 计数清零
+UPDATE ff90 SET qty = 1 WHERE id % 10 = 5;
+-- n_tup_upd = 10000, n_tup_hot_upd = 0
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 经验法则</div>
+  <ul>
+    <li>频繁更新的表（计数器、状态、库存），考虑 <code>fillfactor = 80 ~ 90</code>。只插入不更新的表保持 100。</li>
+    <li><strong>别给经常被更新的列随手建索引</strong>：多一个索引，不只是多一份写入，还可能让所有更新都失去 HOT。</li>
+    <li>用 <code>n_tup_hot_upd * 100.0 / n_tup_upd</code> 观察每张表的 HOT 比例。</li>
+    <li>改了 fillfactor 只影响之后写入的页；要让已有数据也留出空位，需要 VACUUM FULL 或重建表。</li>
+  </ul>
+</div>
+
+<h2 id="wraparound">事务 ID 回卷</h2>
+
+<p>
+  xmin、xmax 里的事务 ID 是 32 位的，大约 42 亿个，用完会<strong>绕回去重新开始</strong>。Postgres 判断“这行是不是过去写的”靠比较事务 ID 的先后，
+  一个很老的 ID 绕一圈后，可能突然被当成“未来”的，那一行就凭空消失了。
+</p>
+
+<p>
+  解决办法是<strong>冻结（freeze）</strong>：VACUUM 会把足够老的行标记为“已冻结”，意思是“对所有事务永远可见”，之后它的事务 ID 就不再参与比较。
+  当一张表最老的未冻结 ID 的“年龄”超过 <code>autovacuum_freeze_max_age</code>（默认 2 亿），即使表上关了 autovacuum，Postgres 也会强制对它做一次防回卷的 VACUUM。
+</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 每个数据库、每张表距离回卷还有多远（年龄越大越危险）
+SELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC;
+SELECT relname, age(relfrozenxid) FROM pg_class
+WHERE relkind = 'r' ORDER BY 2 DESC LIMIT 10;
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 年龄接近 20 亿就要立即处理</div>
+  <p>
+    如果冻结一直跟不上（通常是因为长事务、被遗忘的复制槽，或者 autovacuum 被关掉），年龄会逼近约 21 亿的上限。
+    到那一步，Postgres 为了保护数据会<strong>拒绝分配新的事务 ID，也就是拒绝一切写入</strong>，直到完成 VACUUM。
+    在监控里给 <code>age(datfrozenxid)</code> 设一个告警（比如超过 5 亿），比事后补救容易得多。
+  </p>
+</div>
+
+<h2 id="monitor">日常监控清单</h2>
+
+<div class="code" data-lang="sql"><pre>
+-- 1. 死元组最多的表，以及它们上次被清理的时间
+SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_vacuum, last_autovacuum, autovacuum_count
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC LIMIT 10;
+
+-- 2. 正在运行的 VACUUM 进度
+SELECT pid, relid::regclass, phase, heap_blks_scanned, heap_blks_total
+FROM pg_stat_progress_vacuum;
+
+-- 3. 最老的事务（挡住清理的元凶）
+SELECT pid, state, now() - xact_start AS age, left(query, 50)
+FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start LIMIT 5;
+
+-- 4. HOT 比例低、更新又多的表：考虑 fillfactor 或删掉多余索引
+SELECT relname, n_tup_upd, round(100.0 * n_tup_hot_upd / nullif(n_tup_upd, 0), 1) AS hot_pct
+FROM pg_stat_user_tables WHERE n_tup_upd > 1000 ORDER BY hot_pct;
+</pre></div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>UPDATE 和 DELETE 都会留下旧版本；没有事务再需要它时就成了死元组，只有 VACUUM 能回收。</li>
+  <li>普通 VACUUM 不锁表，把空间留给后续写入复用，文件通常不变小；VACUUM FULL 重写整张表、缩小文件，但全程锁表。</li>
+  <li>autovacuum 在死元组超过 <code>50 + 20% × 行数</code> 时触发；大表应按表调低 <code>autovacuum_vacuum_scale_factor</code>。</li>
+  <li>长事务（尤其是 idle in transaction）会阻止清理，用 <code>pg_stat_activity</code> 找出来，用 <code>idle_in_transaction_session_timeout</code> 预防。</li>
+  <li>HOT 更新要求被改的列没有索引、且页内有空位；频繁更新的表可以设 fillfactor 80 ~ 90。</li>
+  <li>VACUUM 还负责冻结旧行、防止事务 ID 回卷，监控 <code>age(datfrozenxid)</code>。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>建一张表插入 10 万行，执行 <code>DELETE FROM … WHERE id % 2 = 0</code>，分别在 VACUUM 前后、VACUUM FULL 后查看 <code>pg_relation_size</code> 和 <code>pgstattuple</code>。</li>
+    <li>用 pageinspect 观察同一行连续更新 3 次后，数据页里有几个版本、t_ctid 是怎么串起来的。</li>
+    <li>复现“长事务挡住 VACUUM”：会话 A 开事务不提交，会话 B 更新并 VACUUM VERBOSE，然后在会话 B 里用 <code>pg_terminate_backend</code> 结束会话 A。</li>
+    <li>把 <code>idle_in_transaction_session_timeout</code> 设为 <code>'5s'</code>，开一个事务后等 6 秒再执行查询，观察报错。</li>
+    <li>对第 2 章的 <code>sales.products</code> 表，查一下 <code>n_tup_hot_upd</code>。哪些索引会让更新库存数量失去 HOT？</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

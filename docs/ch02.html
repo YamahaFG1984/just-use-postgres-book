@@ -994,13 +994,15 @@ SELECT name, stock_quantity FROM products.catalog WHERE id = 1;
 <figcaption>图 2-7　MVCC：更新写入新版本，读者各取所需，互不阻塞</figcaption>
 </figure>
 
+<p>旧版本不会立刻消失，它们由 VACUUM 负责回收，详见<a href="topic-vacuum.html">专题 4：VACUUM 与表膨胀</a>。</p>
+
 <div class="box note">
   <div class="t">&#9432; 更强的隔离级别</div>
   <p>
     读已提交在一致性和并发性能之间取得了很好的平衡，所以是默认值。
     但 SQL 标准还定义了<strong>不可重复读</strong>、<strong>幻读</strong>等现象，Postgres 提供了更强的
     <code>REPEATABLE READ</code>（可重复读）和 <code>SERIALIZABLE</code>（可串行化）隔离级别来应对。
-    什么时候需要它们，官方文档讲得很清楚：<a href="https://www.postgresql.org/docs/current/transaction-iso.html">Transaction Isolation</a>。
+    什么时候需要它们，官方文档讲得很清楚：<a href="https://www.postgresql.org/docs/current/transaction-iso.html">Transaction Isolation</a>。<a href="topic-sql.html#isolation">专题 2</a> 用并发实验演示了三种级别的区别，以及丢失更新、写偏斜和死锁。
   </p>
 </div>
 
@@ -1332,7 +1334,7 @@ $$ LANGUAGE plpgsql;
 
 <div class="box note">
   <div class="t">&#9432; MERGE 是什么</div>
-  <p><code>MERGE</code>（Postgres 15 起支持）把“存在就更新，不存在就插入”合成一条语句：<code>USING</code> 指定数据来源，<code>ON</code> 是匹配条件，<code>WHEN MATCHED</code> / <code>WHEN NOT MATCHED</code> 分别处理两种情况。</p>
+  <p><code>MERGE</code>（Postgres 15 起支持）把“存在就更新，不存在就插入”合成一条语句：<code>USING</code> 指定数据来源，<code>ON</code> 是匹配条件，<code>WHEN MATCHED</code> / <code>WHEN NOT MATCHED</code> 分别处理两种情况。更常用的 <code>INSERT … ON CONFLICT</code> 写法及两者的区别见<a href="topic-sql.html#upsert">专题 2</a>。</p>
 </div>
 
 <p>老顾客 Charlie Brown（id=3）登录后，往购物车里放了两袋 Morning Glory（id=3）：</p>
@@ -1791,6 +1793,8 @@ GRANT USAGE, SELECT ON ALL SEQUENCES
   IN SCHEMA sales TO coffee_chain_admin;
 </pre>
 </div>
+
+<p>（GRANT 控制的是“能访问哪些表”；想进一步控制“能看到表里哪些行”，见<a href="topic-rls.html">专题 3：行级安全 RLS</a>。）</p>
 
 <p>最后，确保默认谁都连不上 Susannah 的库和默认的 postgres 库：</p>
 

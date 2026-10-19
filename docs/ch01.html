@@ -277,7 +277,7 @@ docker run --name postgres `
 <tr><td><code>-p 5432:5432</code></td><td>把容器里的 5432 端口（Postgres 默认端口）映射到你电脑上，外部程序就能连进来</td></tr>
 <tr><td><code>-v postgres-volume:/var/lib/postgresql/data</code></td><td>把数据卷挂到容器里 Postgres 存放数据文件的目录。<strong>即使删掉容器重建，数据也还在</strong></td></tr>
 <tr><td><code>-d</code></td><td>后台运行，不占用当前终端窗口</td></tr>
-<tr><td><code>postgres:17.2</code></td><td>使用 Docker Hub 官方镜像的 17.2 版本。建议和书保持一致，这样输出结果能对得上</td></tr>
+<tr><td><code>postgres:17.2</code></td><td>使用 Docker Hub 官方镜像的 17.2 版本。建议和书保持一致，这样输出结果能对得上。注意：18 及以后的镜像要把卷挂到 <code>/var/lib/postgresql</code>，见<a href="topic-backup.html#upgrade">专题 6</a></td></tr>
 </table></div>
 
 <div class="box warn">

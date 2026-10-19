@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>专题 5 · 从应用连接 Postgres — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="18">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">专题 5 · 补充内容（原书之外）</span>
+<h1>从应用连接 Postgres</h1>
+<p class="lede">
+  全书几乎都在 psql 里操作，但真实的数据库是给应用用的。这一页用 <strong>Python（psycopg 3）</strong>和 <strong>Node.js（node-postgres）</strong>两种最常见的组合，
+  讲清楚从应用访问 Postgres 时最要紧的几件事：连接串、参数化查询、事务、连接池、错误处理和批量写入。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 本页的代码都实际运行过</div>
+  <p>环境：Postgres 17.2、Python 3.12 + psycopg 3.3 + psycopg_pool 3.3、Node.js 24 + pg 8.23。其他语言的写法大同小异，文末有一张驱动对照表。</p>
+</div>
+
+<div class="goals">
+  <h4>本页目标</h4>
+  <ul>
+    <li>写出正确的连接串，用环境变量管理它</li>
+    <li>永远用参数化查询，亲眼看到字符串拼接为什么会被注入</li>
+    <li>在 Python 和 Node 里正确地开启、提交、回滚事务</li>
+    <li>用连接池复用连接，知道 PgBouncer 事务模式的限制</li>
+    <li>按 SQLSTATE 处理错误、给查询设超时、用 COPY 批量导入</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="dsn">连接串</h2>
+
+<p>几乎所有驱动都认同一种 URI 格式的连接串：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="连接串各部分的含义">
+  <text class="mono b" x="380" y="50" text-anchor="middle">postgresql://app_user:s3cret@db.example.com:5432/shop?sslmode=require</text>
+  <path class="ln-b" d="M132 62 H224"/><text class="sm on-b" x="178" y="84" text-anchor="middle">协议</text><text class="sm" x="170" y="102" text-anchor="middle">也可写 postgres://</text>
+  <path class="ln-p" d="M226 62 H332"/><text class="sm on-p" x="279" y="84" text-anchor="middle">用户名 : 密码</text><text class="sm" x="296" y="102" text-anchor="middle">特殊字符要 URL 编码</text>
+  <path class="ln-g" d="M341 62 H476"/><text class="sm on-g" x="408" y="84" text-anchor="middle">主机 : 端口</text><text class="sm" x="414" y="102" text-anchor="middle">端口默认 5432</text>
+  <path class="ln-a" d="M485 62 H512"/><text class="sm on-a" x="498" y="84" text-anchor="middle">数据库</text>
+  <path class="ln-r" d="M521 62 H628"/><text class="sm on-r" x="575" y="84" text-anchor="middle">其他参数</text><text class="sm" x="575" y="102" text-anchor="middle">如 SSL、超时</text>
+  <text class="sm" x="380" y="140" text-anchor="middle">连接串里有密码：放在环境变量（如 DATABASE_URL）或密钥管理服务里，不要写进代码、不要提交到 git</text>
+</svg>
+<figcaption>图 S5-1　一个连接串包含的信息</figcaption>
+</figure>
+
+<p>本书用 Docker 启动的数据库（第 1 章），从宿主机上的应用连接时，连接串就是：</p>
+
+<div class="code" data-lang="bash"><pre>
+export DATABASE_URL="postgresql://postgres:password@localhost:5432/postgres"
+</pre></div>
+
+<div class="box tip">
+  <div class="t">&#128161; libpq 环境变量</div>
+  <p>psql 和许多驱动（psycopg 就是基于 libpq 的）也认识 <code>PGHOST</code>、<code>PGPORT</code>、<code>PGUSER</code>、<code>PGPASSWORD</code>、<code>PGDATABASE</code> 这些环境变量，设置之后连 <code>psql</code> 都不用带参数。密码还可以放在 <code>~/.pgpass</code> 文件里。</p>
+</div>
+
+<p>下面的例子用这样一个小数据库：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE products (
+  id serial PRIMARY KEY, name text NOT NULL,
+  price numeric(10,2) NOT NULL, stock int NOT NULL DEFAULT 0, tags text[] DEFAULT '{}'
+);
+INSERT INTO products (name, price, stock, tags) VALUES
+  ('Sunrise Blend', 12.50, 40, '{coffee}'), ('Mug', 8.00, 15, '{kitchen}'),
+  ('Grinder', 45.00, 3, '{coffee,kitchen}');
+
+CREATE TABLE accounts (id int PRIMARY KEY, owner text,
+                       balance numeric NOT NULL CHECK (balance >= 0));
+INSERT INTO accounts VALUES (1, 'alice', 100), (2, 'bob', 50);
+</pre></div>
+
+<h2 id="python">Python：psycopg 3</h2>
+
+<div class="code" data-lang="bash"><pre>
+python3 -m venv venv && source venv/bin/activate
+pip install "psycopg[binary]" psycopg_pool
+</pre></div>
+
+<div class="code" data-lang="python"><pre>
+# basic.py
+import os
+import psycopg
+from psycopg.rows import dict_row
+
+DSN = os.environ["DATABASE_URL"]
+
+with psycopg.connect(DSN) as conn:
+    # 参数化查询：用 %s 占位，值放在第二个参数（一个元组）里
+    rows = conn.execute(
+        "SELECT id, name, price FROM products WHERE price < %s ORDER BY id",
+        (20,),
+    ).fetchall()
+    for r in rows:
+        print(r)
+
+    # 结果按字典返回
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT name, tags FROM products WHERE %s = ANY(tags)", ("kitchen",))
+        print(cur.fetchall())
+
+    # 写入并取回自增 id
+    new_id = conn.execute(
+        "INSERT INTO products (name, price, stock) VALUES (%s, %s, %s) RETURNING id",
+        ("Filter Paper", 3.20, 200),
+    ).fetchone()[0]
+    print("new id:", new_id)
+# 离开 with 块：没有异常就 COMMIT，有异常就 ROLLBACK，然后关闭连接
+</pre></div>
+<div class="code out"><pre>
+(1, 'Sunrise Blend', Decimal('12.50'))
+(2, 'Mug', Decimal('8.00'))
+[{'name': 'Mug', 'tags': ['kitchen']}, {'name': 'Grinder', 'tags': ['coffee', 'kitchen']}]
+new id: 4
+</pre></div>
+
+<p>注意类型转换：<code>numeric</code> 变成 Python 的 <code>Decimal</code>（不丢精度，适合金额），<code>text[]</code> 变成 <code>list</code>，<code>jsonb</code> 会变成 dict / list，<code>timestamptz</code> 变成带时区的 <code>datetime</code>。</p>
+
+<div class="box warn">
+  <div class="t">&#9888; psycopg 默认自动开启事务</div>
+  <p>
+    psycopg 在你执行第一条语句时<strong>自动 BEGIN</strong>，直到你 commit 或离开 <code>with</code> 块才提交。
+    如果没用 <code>with</code>、也忘了 <code>conn.commit()</code>，写入就不会生效，连接还会一直处于 <code>idle in transaction</code> 状态，挡住 VACUUM（见<a href="topic-vacuum.html#long-tx">专题 4</a>）。
+    另外，不要把脚本命名为 <code>copy.py</code>、<code>json.py</code> 这类和标准库同名的文件，它会挡住标准库模块，psycopg 一导入就报错。
+  </p>
+</div>
+
+<h2 id="params">参数化查询：防 SQL 注入</h2>
+
+<p>假设搜索框里，用户输入了 <code>Mug' OR '1'='1</code>：</p>
+
+<div class="code" data-lang="python"><pre>
+user_input = "Mug' OR '1'='1"
+
+# ✗ 错误：把用户输入拼进 SQL 字符串
+sql = f"SELECT name FROM products WHERE name = '{user_input}'"
+print(sql)
+print("拼接:", conn.execute(sql).fetchall())
+
+# ✓ 正确：参数化
+print("参数化:", conn.execute("SELECT name FROM products WHERE name = %s", (user_input,)).fetchall())
+</pre></div>
+<div class="code out"><pre>
+SELECT name FROM products WHERE name = 'Mug' OR '1'='1'
+拼接: [('Sunrise Blend',), ('Mug',), ('Grinder',), ('Filter Paper',)]
+参数化: []
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="字符串拼接让用户输入变成 SQL 的一部分；参数化让它始终只是一个值">
+  <text class="ttl on-r" x="190" y="22" text-anchor="middle">拼接：输入变成了代码</text>
+  <rect class="bx-r" x="20" y="36" width="340" height="80" rx="10"/>
+  <text class="mono" x="34" y="62">WHERE name = 'Mug' OR '1'='1'</text>
+  <rect class="fill-r" x="157" y="70" width="87" height="4"/>
+  <text class="sm" x="34" y="98">用户输入的引号“闭合”了字符串，</text>
+  <text class="sm" x="34" y="112">后面的 OR '1'='1' 成了 SQL 条件</text>
+  <text class="sm on-r b" x="190" y="146" text-anchor="middle">→ 返回全部行，甚至可以 ; DROP TABLE</text>
+
+  <text class="ttl on-g" x="575" y="22" text-anchor="middle">参数化：输入永远只是值</text>
+  <rect class="bx-g" x="400" y="36" width="340" height="80" rx="10"/>
+  <text class="mono" x="414" y="62">SQL : WHERE name = $1</text>
+  <text class="mono" x="414" y="84">值  : "Mug' OR '1'='1"</text>
+  <text class="sm" x="414" y="106">SQL 和值分开发送给服务器</text>
+  <text class="sm on-g b" x="575" y="146" text-anchor="middle">→ 找名字叫这一整串的商品：0 行</text>
+  <text class="sm" x="380" y="190" text-anchor="middle">规则只有一条：用户给的任何值，都通过参数传，不要放进 SQL 字符串</text>
+  <text class="sm" x="380" y="208" text-anchor="middle">表名、列名不能参数化，需要动态拼接时用白名单，或 psycopg.sql.Identifier</text>
+</svg>
+<figcaption>图 S5-2　SQL 注入：问题出在“把数据当成了代码”</figcaption>
+</figure>
+
+<p>不同驱动的占位符写法不同，但原理一样：</p>
+
+<div class="tw"><table>
+<tr><th>驱动</th><th>占位符</th></tr>
+<tr><td>Postgres 本身、node-postgres、Go pgx、Rust sqlx</td><td><code>$1, $2, …</code></td></tr>
+<tr><td>Python psycopg</td><td><code>%s</code> 或命名的 <code>%(name)s</code>（不是 Python 的 % 格式化，不要自己用 % 拼）</td></tr>
+<tr><td>Java JDBC</td><td><code>?</code></td></tr>
+</table></div>
+
+<h2 id="tx">事务</h2>
+
+<p>第 2 章的转账例子：两条 UPDATE 必须一起成功或一起失败。psycopg 用 <code>conn.transaction()</code> 包住一段代码：</p>
+
+<div class="code" data-lang="python"><pre>
+def transfer(conn, src, dst, amount):
+    with conn.transaction():          # BEGIN … COMMIT；块内抛异常则 ROLLBACK
+        conn.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amount, src))
+        conn.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amount, dst))
+
+with psycopg.connect(DSN, autocommit=True) as conn:
+    transfer(conn, 1, 2, 30)
+    print(conn.execute("SELECT id, balance FROM accounts ORDER BY id").fetchall())
+    try:
+        transfer(conn, 1, 2, 500)     # 余额不足，违反 CHECK 约束
+    except psycopg.errors.CheckViolation as e:
+        print("失败:", e.diag.message_primary, "| sqlstate", e.sqlstate)
+    print(conn.execute("SELECT id, balance FROM accounts ORDER BY id").fetchall())
+</pre></div>
+<div class="code out"><pre>
+[(1, Decimal('70')), (2, Decimal('80'))]
+失败: new row for relation "accounts" violates check constraint "accounts_balance_check" | sqlstate 23514
+[(1, Decimal('70')), (2, Decimal('80'))]          ← 失败的转账没有留下任何痕迹
+</pre></div>
+
+<p><code>autocommit=True</code> 让连接不再自动 BEGIN，每条语句单独提交，事务的边界完全由 <code>conn.transaction()</code> 决定。这种“显式事务”的写法更不容易出错。</p>
+
+<h2 id="node">Node.js：node-postgres</h2>
+
+<div class="code" data-lang="bash"><pre>
+npm install pg
+</pre></div>
+
+<div class="code" data-lang="js"><pre>
+// app.mjs
+import pg from 'pg';
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,                       // 最多 10 个连接
+  idleTimeoutMillis: 30000,      // 空闲 30 秒的连接关掉
+});
+
+// 单条查询：直接用 pool.query，它会自动借、还连接
+const { rows } = await pool.query(
+  'SELECT id, name, price, stock FROM products WHERE price < $1 ORDER BY id',
+  [20],
+);
+console.log(rows);
+
+// 事务：必须从池里借出【同一个】连接，BEGIN / COMMIT 都在它上面执行
+async function transfer(src, dst, amount) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [amount, src]);
+    await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [amount, dst]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();            // 一定要归还，否则池很快被耗尽
+  }
+}
+
+try {
+  await transfer(1, 2, 1000);
+} catch (e) {
+  console.log('失败:', e.code, e.constraint);   // 失败: 23514 accounts_balance_check
+}
+await pool.end();
+</pre></div>
+<div class="code out"><pre>
+[
+  { id: 1, name: 'Sunrise Blend', price: '12.50', stock: 40 },
+  { id: 2, name: 'Mug', price: '8.00', stock: 15 },
+  { id: 4, name: 'Filter Paper', price: '3.20', stock: 200 }
+]
+失败: 23514 accounts_balance_check
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 事务里不要用 pool.query</div>
+  <p>
+    <code>pool.query('BEGIN')</code> 和下一句 <code>pool.query('UPDATE …')</code> 可能被分到<strong>两个不同的连接</strong>上，BEGIN 就白开了。
+    事务必须 <code>pool.connect()</code> 借出一个 client，所有语句都在它上面执行，最后 <code>release()</code>。
+  </p>
+</div>
+
+<h3>类型的坑：数字变成了字符串</h3>
+
+<p>上面输出里 <code>price: '12.50'</code> 是<strong>字符串</strong>。node-postgres 默认把 <code>numeric</code> 和 <code>bigint</code>（包括 <code>count(*)</code> 的结果）转成字符串，因为 JavaScript 的 number 放不下它们的全部精度：</p>
+
+<div class="code" data-lang="js"><pre>
+const r = await pool.query('SELECT count(*) AS n, sum(price) AS total FROM products');
+console.log(r.rows[0], typeof r.rows[0].n);
+// { n: '4', total: '68.70' } string
+</pre></div>
+
+<p>处理办法：在 SQL 里转换（<code>count(*)::int</code>），或者在应用里用 <code>Number()</code> / 十进制库处理。金额最好保持字符串或使用 decimal.js 之类的库，不要转成浮点数。</p>
+
+<h2 id="pool">连接池</h2>
+
+<p>
+  <a href="appendix-a.html#pooling">附录 A.3</a> 讲过：Postgres 为每个连接起一个操作系统进程，开关连接很贵，所以要用连接池复用。node-postgres 的 <code>Pool</code> 自带池；Python 用 <code>psycopg_pool</code>：
+</p>
+
+<div class="code" data-lang="python"><pre>
+from psycopg_pool import ConnectionPool
+
+pool = ConnectionPool(DSN, min_size=2, max_size=10, open=True)
+
+with pool.connection() as conn:          # 借一个连接，块结束时提交并归还
+    conn.execute("SELECT 1")
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="多个应用实例各自的连接池加起来不能超过 max_connections；中间可以加 PgBouncer">
+  <rect class="bx-b" x="20" y="20" width="160" height="56" rx="8"/><text class="sm" x="100" y="44" text-anchor="middle">应用实例 1</text><text class="sm on-b" x="100" y="64" text-anchor="middle">池 max = 10</text>
+  <rect class="bx-b" x="20" y="90" width="160" height="56" rx="8"/><text class="sm" x="100" y="114" text-anchor="middle">应用实例 2</text><text class="sm on-b" x="100" y="134" text-anchor="middle">池 max = 10</text>
+  <rect class="bx-b" x="20" y="160" width="160" height="56" rx="8"/><text class="sm" x="100" y="184" text-anchor="middle">… 实例 N</text><text class="sm on-b" x="100" y="204" text-anchor="middle">池 max = 10</text>
+  <path class="ln" d="M182 48 L300 108" marker-end="url(#ar)"/><path class="ln" d="M182 118 L300 118" marker-end="url(#ar)"/><path class="ln" d="M182 188 L300 128" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="304" y="78" width="170" height="80" rx="10"/><text class="ttl on-a" x="389" y="104" text-anchor="middle">PgBouncer（可选）</text><text class="sm" x="389" y="124" text-anchor="middle">成百上千个客户端连接</text><text class="sm" x="389" y="142" text-anchor="middle">→ 几十个服务器连接</text>
+  <path class="ln" d="M476 118 H546" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="550" y="70" width="190" height="96" rx="10"/><text class="ttl on-g" x="645" y="96" text-anchor="middle">Postgres</text><text class="sm" x="645" y="118" text-anchor="middle">max_connections = 100</text><text class="sm" x="645" y="138" text-anchor="middle">（默认值）</text><text class="sm" x="645" y="156" text-anchor="middle">每个连接一个进程</text>
+  <text class="sm on-r" x="380" y="232" text-anchor="middle">N × 池大小 超过 max_connections → FATAL: sorry, too many clients already</text>
+</svg>
+<figcaption>图 S5-3　池大小要从全局算：所有实例加起来</figcaption>
+</figure>
+
+<h3>池应该开多大</h3>
+
+<p>
+  直觉上越大越好，其实不是。真正同时干活的连接数受 CPU 核数和磁盘限制，连接太多只会互相争抢。一个常用的起点是
+  <strong>每个数据库服务器 “CPU 核数 × 2 ~ 4” 个活跃连接</strong>，再除以应用实例数，得到每个实例的池大小，然后压测调整。
+  请求多于连接时，让请求在池里<strong>排队</strong>，比让它们都挤进数据库更快。
+</p>
+
+<h3>PgBouncer 事务模式的限制</h3>
+
+<p>PgBouncer 最常用的是<strong>事务模式（transaction pooling）</strong>：一个客户端只在事务期间占用一个服务器连接，事务一结束连接就给别人。这意味着<strong>跨事务的会话状态不可靠</strong>：</p>
+
+<div class="tw"><table>
+<tr><th>功能</th><th>事务模式下</th><th>替代做法</th></tr>
+<tr><td><code>SET</code>（会话级）</td><td>✗ 可能被别的客户端继承</td><td>事务里用 <code>SET LOCAL</code> / <code>set_config(…, true)</code></td></tr>
+<tr><td>会话级咨询锁 <code>pg_advisory_lock</code></td><td>✗ 锁留在了服务器连接上</td><td>用 <code>pg_advisory_xact_lock</code></td></tr>
+<tr><td><code>LISTEN</code>（第 11 章）</td><td>✗ 收不到通知</td><td>监听的那个连接直连 Postgres</td></tr>
+<tr><td>临时表</td><td>✗ 跨事务不可用</td><td>在一个事务内建、用、删</td></tr>
+<tr><td>预备语句（prepared statements）</td><td>老版本 ✗；PgBouncer 1.21 起可通过 <code>max_prepared_statements</code> 支持</td><td>升级 PgBouncer 或关闭驱动的预备语句</td></tr>
+</table></div>
+
+<p>这正是<a href="topic-rls.html#app">专题 3</a> 坚持用 <code>SET LOCAL</code> 的原因。配合 RLS 的请求处理函数长这样（连接的是专题 3 的 rlstopic 数据库，输出对应专题 3 前半部分的数据）：</p>
+
+<div class="code" data-lang="python"><pre>
+def list_notes(conn, tenant_id):
+    with conn.transaction():
+        # 租户 ID 来自服务器端验证过的登录信息，而不是请求参数
+        conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        return conn.execute("SELECT id, title FROM notes ORDER BY id").fetchall()
+
+with psycopg.connect("postgresql://app_user:app@localhost:5432/rlstopic", autocommit=True) as conn:
+    print(list_notes(conn, 1))                                    # [(1, '采购咖啡豆'), (2, '招聘咖啡师')]
+    print(conn.execute("SELECT count(*) FROM notes").fetchone())  # (0,)  事务外：什么都看不到
+</pre></div>
+
+<h2 id="errors">错误处理与超时</h2>
+
+<h3>按 SQLSTATE 处理错误</h3>
+
+<p>Postgres 的每个错误都带一个 5 位的 <strong>SQLSTATE</strong> 代码。按代码判断，比匹配错误消息文字可靠得多（消息可能随版本、语言设置变化）：</p>
+
+<div class="tw"><table>
+<tr><th>SQLSTATE</th><th>名称</th><th>常见原因</th><th>应用该怎么做</th></tr>
+<tr><td><code>23505</code></td><td>unique_violation</td><td>重复的邮箱、订单号</td><td>提示用户“已存在”，或改用 ON CONFLICT（<a href="topic-sql.html#upsert">专题 2</a>）</td></tr>
+<tr><td><code>23503</code></td><td>foreign_key_violation</td><td>引用了不存在的记录</td><td>返回 400 / 404</td></tr>
+<tr><td><code>23514</code></td><td>check_violation</td><td>余额为负等</td><td>返回业务错误</td></tr>
+<tr><td><code>40001</code></td><td>serialization_failure</td><td>可重复读 / 串行化下的并发冲突</td><td><strong>整个事务重试</strong></td></tr>
+<tr><td><code>40P01</code></td><td>deadlock_detected</td><td>死锁</td><td><strong>整个事务重试</strong></td></tr>
+<tr><td><code>57014</code></td><td>query_canceled</td><td>statement_timeout 超时</td><td>记录慢查询，返回 503</td></tr>
+<tr><td><code>53300</code></td><td>too_many_connections</td><td>连接数超过 max_connections</td><td>调小池、加 PgBouncer</td></tr>
+</table></div>
+
+<p>psycopg 为每个 SQLSTATE 都定义了异常类（<code>psycopg.errors.UniqueViolation</code> 等），node-postgres 则放在 <code>e.code</code> 里。</p>
+
+<h3>带重试的串行化事务</h3>
+
+<p><a href="topic-sql.html#isolation">专题 2</a> 说过，SERIALIZABLE 事务失败时要重试。下面两个线程同时从同一个账户扣钱（故意“先读、在应用里算、再写回”）：</p>
+
+<div class="code" data-lang="python"><pre>
+import time, threading
+import psycopg
+from psycopg import errors
+from psycopg_pool import ConnectionPool
+
+pool = ConnectionPool(DSN, min_size=2, max_size=10, open=True)
+
+def run_serializable(fn, retries=5):
+    """在 SERIALIZABLE 下执行 fn(conn)，遇到串行化失败或死锁就整体重试"""
+    for attempt in range(1, retries + 1):
+        try:
+            with pool.connection() as conn:
+                conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE
+                with conn.transaction():
+                    return fn(conn)
+        except (errors.SerializationFailure, errors.DeadlockDetected) as e:
+            print(f"  第 {attempt} 次失败（{e.sqlstate}），重试")
+            time.sleep(0.05 * attempt)            # 稍等再试，避免再次撞车
+    raise RuntimeError("重试次数用完")
+
+def withdraw(conn, amount):
+    bal = conn.execute("SELECT balance FROM accounts WHERE id = 1").fetchone()[0]
+    time.sleep(0.2)                               # 模拟耗时的业务逻辑
+    conn.execute("UPDATE accounts SET balance = %s WHERE id = 1", (bal - amount,))
+    return bal - amount
+
+# 余额 100，两个线程分别扣 10 和 20
+threads = [threading.Thread(target=lambda a=a: print("结果", run_serializable(lambda c: withdraw(c, a))))
+           for a in (10, 20)]
+for t in threads: t.start()
+for t in threads: t.join()
+</pre></div>
+<div class="code out"><pre>
+结果 80
+  第 1 次失败（40001），重试
+结果 70
+最终余额: 70          ✓ 没有丢失更新
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 重试的是整个事务</div>
+  <p>重试时必须<strong>从头重新读数据</strong>再计算，所以重试的单位是包含读取在内的整个函数，而不是失败的那一条语句。也因此，事务里不要做“发邮件、调第三方支付”这类无法撤销的事。</p>
+</div>
+
+<h3>超时</h3>
+
+<p>一条失控的慢查询会一直占着连接。在连接参数里给所有语句设上限，并用 <code>application_name</code> 标明身份，方便在 <code>pg_stat_activity</code> 里认出它：</p>
+
+<div class="code" data-lang="python"><pre>
+with psycopg.connect(DSN, application_name="shop-api",
+                     options="-c statement_timeout=1000") as conn:   # 1 秒
+    try:
+        conn.execute("SELECT pg_sleep(3)")
+    except psycopg.errors.QueryCanceled as e:
+        print("超时:", e.diag.message_primary, e.sqlstate)
+</pre></div>
+<div class="code out"><pre>
+超时: canceling statement due to statement timeout 57014
+</pre></div>
+
+<p>node-postgres 的对应写法是在 Pool 配置里加 <code>statement_timeout: 1000</code> 和 <code>application_name: 'shop-api'</code>。也可以对整个角色设置：<code>ALTER ROLE app_user SET statement_timeout = '5s';</code>。</p>
+
+<h3>连不上时看错误消息</h3>
+
+<div class="code out"><pre>
+connection to server at "127.0.0.1", port 55999 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+        → 地址或端口不对，或者容器没启动 / 没映射端口（docker ps 看看）
+
+connection to server at "…", port 5432 failed: FATAL:  password authentication failed for user "postgres"
+        → 用户名或密码错误
+
+connection to server at "…", port 5432 failed: FATAL:  database "nosuchdb" does not exist
+        → 数据库名写错了，或者还没 CREATE DATABASE
+</pre></div>
+
+<h2 id="copy">批量写入：用 COPY</h2>
+
+<p>一次导入成千上万行时，逐条 INSERT 很慢。Postgres 的 <strong>COPY</strong> 协议专门用于批量传输，驱动都支持。插入 10 万行对比：</p>
+
+<div class="code" data-lang="python"><pre>
+rows = [(f"item {i}", i % 100 + 0.99, i % 50) for i in range(100_000)]
+
+with conn.cursor() as cur:
+    cur.executemany("INSERT INTO t1 VALUES (%s, %s, %s)", rows)
+
+with conn.cursor() as cur:
+    with cur.copy("COPY t2 (name, price, stock) FROM STDIN") as copy:
+        for r in rows:
+            copy.write_row(r)
+</pre></div>
+<div class="code out"><pre>
+executemany: 1.82s
+COPY:        0.09s       约快 20 倍
+</pre></div>
+
+<p>Node 里可以用 <code>pg-copy-streams</code> 包实现同样的事。几百行以内的小批量，用一条多行 <code>INSERT … VALUES (…), (…), …</code> 或 <code>INSERT … SELECT * FROM unnest($1::text[], $2::numeric[])</code> 也足够快。</p>
+
+<h2 id="orm">ORM 与其他语言</h2>
+
+<p>
+  ORM（对象关系映射）把表映射成类，帮你生成 SQL、管理迁移，能省很多样板代码。它们底层用的仍是上面这些驱动。用 ORM 时有两点要注意：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 190" role="img" aria-label="N+1 查询问题：先查 1 次订单列表，再为每个订单各查 1 次商品">
+  <text class="ttl on-r" x="190" y="22" text-anchor="middle">N + 1 次查询</text>
+  <rect class="bx-r" x="20" y="34" width="340" height="120" rx="10"/>
+  <text class="mono" x="34" y="58">SELECT * FROM orders LIMIT 50</text>
+  <text class="mono" x="34" y="82">SELECT * FROM items WHERE order_id=1</text>
+  <text class="mono" x="34" y="102">SELECT * FROM items WHERE order_id=2</text>
+  <text class="mono" x="34" y="122">…</text>
+  <text class="mono" x="34" y="142">SELECT * FROM items WHERE order_id=50</text>
+  <text class="sm on-r" x="190" y="176" text-anchor="middle">51 次往返：循环里访问 order.items 触发</text>
+  <text class="ttl on-g" x="575" y="22" text-anchor="middle">1 ~ 2 次查询</text>
+  <rect class="bx-g" x="400" y="34" width="340" height="120" rx="10"/>
+  <text class="mono" x="414" y="62">SELECT … FROM orders o</text>
+  <text class="mono" x="414" y="84">JOIN items i ON i.order_id = o.id</text>
+  <text class="sm" x="414" y="114">或者 ORM 的预加载：</text>
+  <text class="mono" x="414" y="136">selectinload / include / prefetch</text>
+  <text class="sm on-g" x="575" y="176" text-anchor="middle">打开 SQL 日志，数一数一个请求发了几条</text>
+</svg>
+<figcaption>图 S5-4　ORM 最常见的性能问题：N+1 查询</figcaption>
+</figure>
+
+<ul>
+  <li><strong>看得见它生成的 SQL</strong>：开发时打开 ORM 的 SQL 日志。一个页面发了几十条查询，多半是 N+1 问题。</li>
+  <li><strong>Postgres 特色功能可以直接写 SQL</strong>：JSONB 运算符、全文搜索、pgvector、窗口函数、<code>ON CONFLICT</code>，ORM 支持不全时就用它提供的“原生 SQL”接口，同样记得参数化。</li>
+</ul>
+
+<div class="tw"><table>
+<tr><th>语言</th><th>常用驱动</th><th>常见 ORM / 查询构建器</th></tr>
+<tr><td>Python</td><td>psycopg 3、asyncpg</td><td>SQLAlchemy、Django ORM</td></tr>
+<tr><td>Node.js / TypeScript</td><td>pg（node-postgres）、postgres.js</td><td>Prisma、Drizzle、Knex</td></tr>
+<tr><td>Java / Kotlin</td><td>PostgreSQL JDBC + HikariCP 连接池</td><td>Hibernate / JPA、jOOQ</td></tr>
+<tr><td>Go</td><td>pgx</td><td>sqlc、GORM</td></tr>
+<tr><td>Rust</td><td>tokio-postgres、sqlx</td><td>Diesel、SeaORM</td></tr>
+<tr><td>C# / .NET</td><td>Npgsql</td><td>Entity Framework Core、Dapper</td></tr>
+</table></div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>连接串 <code>postgresql://用户:密码@主机:端口/数据库</code> 放在环境变量里，不进代码仓库。</li>
+  <li>任何来自用户的值都用参数传（<code>%s</code>、<code>$1</code>），绝不拼进 SQL。</li>
+  <li>事务要么用 psycopg 的 <code>conn.transaction()</code>，要么在 node-postgres 里借出同一个 client 执行 BEGIN / COMMIT / ROLLBACK 并 release。</li>
+  <li>用连接池；所有实例的池加起来要小于 <code>max_connections</code>。PgBouncer 事务模式下不要依赖会话级状态。</li>
+  <li>按 SQLSTATE 处理错误；40001 和 40P01 要重试整个事务；给语句设 statement_timeout。</li>
+  <li>批量导入用 COPY，比逐条 INSERT 快一个数量级。</li>
+  <li>注意类型映射：numeric 在 Python 里是 Decimal，在 node-postgres 里是字符串。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用你熟悉的语言连接第 1 章的数据库，查询第 2 章的 <code>sales.products</code> 中库存最少的 5 个商品。</li>
+    <li>写一个“注册用户”函数，邮箱重复时捕获 23505，返回友好的提示，而不是抛出 500 错误。</li>
+    <li>把本页的 <code>run_serializable</code> 改成 node-postgres 版本，用两个并发的 Promise 测试它。</li>
+    <li>把 Python 连接池的 max_size 设为 2，同时启动 5 个线程各执行 <code>SELECT pg_sleep(1)</code>，观察总耗时，理解“请求在池里排队”。</li>
+    <li>用 COPY 把一个 CSV 文件导入 Postgres，并和逐行 INSERT 比较耗时。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

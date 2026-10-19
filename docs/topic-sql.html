@@ -1,0 +1,676 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>专题 2 · 常用 SQL 补全 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="15" data-pglite-ext="btree_gist">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">专题 2 · 补充内容（原书之外）</span>
+<h1>常用 SQL 补全</h1>
+<p class="lede">
+  原书第 2、3 章覆盖了关系型数据库的主干，但还有几样东西是写真实应用时<strong>几乎天天会用到</strong>的：
+  “存在就更新、不存在就插入”的 UPSERT；Postgres 特色的数组、范围、枚举类型；以及并发场景下最容易出事故的锁与隔离级别。
+  这一页把它们补齐。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 本页的例子都实际运行过</div>
+  <p>
+    所有输出均在 Postgres 17.2 上实测。并发部分的输出来自两个真实会话交替执行。
+    任何 Postgres 容器都可以跟着做，建议新建一个数据库：<code>CREATE DATABASE sqltopic;</code> 然后 <code>\c sqltopic</code>。
+  </p>
+</div>
+
+<div class="goals">
+  <h4>本页目标</h4>
+  <ul>
+    <li>用 <code>INSERT … ON CONFLICT</code> 实现 UPSERT，知道它和 <code>MERGE</code> 的区别</li>
+    <li>用数组存标签、用范围类型 + 排他约束防止预订冲突、用枚举表示状态</li>
+    <li>识别“丢失更新”，用原子更新或 <code>SELECT … FOR UPDATE</code> 解决</li>
+    <li>理解 NOWAIT、lock_timeout、死锁和咨询锁</li>
+    <li>看懂三种隔离级别各自防住了什么，知道串行化失败要重试</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="upsert">UPSERT：INSERT … ON CONFLICT</h2>
+
+<p>一张库存表，sku 是主键：</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+CREATE TABLE inventory (
+  sku text PRIMARY KEY,
+  name text,
+  qty int NOT NULL DEFAULT 0,
+  updated_at timestamptz DEFAULT now()
+);
+
+INSERT INTO inventory (sku, name, qty) VALUES ('COF-01', 'Sunrise Blend', 10);
+</pre></div>
+
+<p>同一个 sku 再插一次，主键冲突，整条语句失败：</p>
+
+<div class="code out"><pre>
+ERROR:  duplicate key value violates unique constraint "inventory_pkey"
+DETAIL:  Key (sku)=(COF-01) already exists.
+</pre></div>
+
+<p>
+  很多应用的第一反应是“先 SELECT 看看有没有，没有再 INSERT，有就 UPDATE”。但这在并发下是错的：两个请求可能同时发现“没有”，然后都去 INSERT。
+  Postgres 的答案是 <strong><code>ON CONFLICT</code></strong>，把“检查 + 插入 / 更新”做成<strong>一个原子操作</strong>。
+</p>
+
+<h3>冲突时什么都不做</h3>
+
+<div class="code" data-lang="sql" data-run><pre>
+INSERT INTO inventory (sku, name, qty) VALUES ('COF-01', 'Sunrise Blend', 5)
+ON CONFLICT (sku) DO NOTHING;
+-- INSERT 0 0     没插入，也没报错
+</pre></div>
+
+<p>适合“幂等写入”：比如消息被重复投递，同一个事件 ID 写第二次时直接忽略。</p>
+
+<h3>冲突时更新</h3>
+
+<div class="code" data-lang="sql" data-run><pre>
+INSERT INTO inventory (sku, name, qty) VALUES
+  ('COF-01', 'Sunrise Blend', 5),
+  ('MUG-01', 'Mug', 3)
+ON CONFLICT (sku) DO UPDATE
+  SET qty = inventory.qty + EXCLUDED.qty,
+      updated_at = now()
+RETURNING sku, qty, (xmax = 0) AS inserted;
+</pre></div>
+<div class="code out"><pre>
+  sku   | qty | inserted
+--------+-----+----------
+ COF-01 |  15 | f
+ MUG-01 |   3 | t
+(2 rows)
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="ON CONFLICT 的执行逻辑：没有冲突就插入，有冲突就执行 DO UPDATE 或 DO NOTHING">
+  <rect class="bx-p" x="20" y="80" width="160" height="60" rx="10"/>
+  <text class="ttl on-p" x="100" y="106" text-anchor="middle">要插入的一行</text>
+  <text class="mono" x="100" y="126" text-anchor="middle">('COF-01', …, 5)</text>
+  <path class="ln" d="M182 110 H236" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="240" y="70" width="200" height="80" rx="10"/>
+  <text class="ttl on-a" x="340" y="96" text-anchor="middle">主键 / 唯一索引里</text>
+  <text class="ttl on-a" x="340" y="116" text-anchor="middle">已经有 COF-01 吗？</text>
+  <text class="sm" x="340" y="138" text-anchor="middle">由唯一索引原子地判断</text>
+  <path class="ln-g" d="M442 90 L520 50" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="470" y="58">没有</text>
+  <rect class="bx-g" x="524" y="20" width="216" height="56" rx="10"/>
+  <text class="ttl on-g" x="632" y="44" text-anchor="middle">正常 INSERT</text>
+  <text class="sm" x="632" y="64" text-anchor="middle">MUG-01 → inserted = t</text>
+  <path class="ln-b" d="M442 130 L520 170" marker-end="url(#ar-b)"/>
+  <text class="sm on-b" x="470" y="172">有</text>
+  <rect class="bx-b" x="524" y="140" width="216" height="76" rx="10"/>
+  <text class="ttl on-b" x="632" y="162" text-anchor="middle">DO UPDATE SET …</text>
+  <text class="sm" x="632" y="182" text-anchor="middle">inventory.qty = 已有的行（10）</text>
+  <text class="sm" x="632" y="200" text-anchor="middle">EXCLUDED.qty = 想插入的行（5）</text>
+  <text class="sm" x="100" y="184" text-anchor="middle">或者 DO NOTHING：</text>
+  <text class="sm" x="100" y="202" text-anchor="middle">有冲突就跳过</text>
+</svg>
+<figcaption>图 S2-1　ON CONFLICT：插入还是更新，由唯一索引原子地决定</figcaption>
+</figure>
+
+<ul>
+  <li><code>ON CONFLICT (sku)</code>：指定按哪一列（或哪个唯一约束）判断冲突。这一列上<strong>必须有唯一索引或唯一约束</strong>。</li>
+  <li><code>EXCLUDED</code>：一个特殊的表名，代表“本来想插入、因冲突而被排除的那一行”；<code>inventory.qty</code> 则是表里已有的值。</li>
+  <li><code>RETURNING</code>：返回最终的行。<code>(xmax = 0) AS inserted</code> 是社区常用的小技巧：新插入的行 xmax 为 0，被更新的行不为 0，借此区分这一行是插入还是更新。注意它依赖 MVCC 的实现细节（见<a href="topic-vacuum.html">专题 4</a>），不是官方文档承诺的接口。</li>
+</ul>
+
+<h3>带条件的更新</h3>
+
+<p><code>DO UPDATE</code> 后面可以跟 <code>WHERE</code>，只有满足条件才更新。比如“只接受更大的库存数”：</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+INSERT INTO inventory (sku, name, qty) VALUES ('COF-01', 'Sunrise Blend', 100)
+ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty
+  WHERE inventory.qty < EXCLUDED.qty
+RETURNING sku, qty;
+-- COF-01 | 100     15 < 100，更新了
+
+INSERT INTO inventory (sku, name, qty) VALUES ('COF-01', 'Sunrise Blend', 1)
+ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty
+  WHERE inventory.qty < EXCLUDED.qty
+RETURNING sku, qty;
+-- (0 rows)        100 < 1 不成立，什么也没做
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; ON CONFLICT 还是 MERGE？</div>
+  <p>
+    第 2 章用了 <code>MERGE</code>（清单 2.22）。两者都能“有则改、无则插”，区别在于：
+    <strong>ON CONFLICT 借助唯一索引，在并发下也保证“要么插入、要么更新”</strong>；
+    MERGE 更灵活（可以按任意条件匹配、可以 DELETE、能处理多种分支），但官方文档指出，并发插入时 MERGE 仍可能遇到唯一约束冲突报错。
+    <strong>简单的“按主键 / 唯一键 UPSERT”优先用 ON CONFLICT</strong>；需要复杂的同步逻辑（比如拿一张临时表去同步一张目标表）再用 MERGE。
+  </p>
+</div>
+
+<h2 id="types">Postgres 特色类型</h2>
+
+<h3>数组</h3>
+
+<p>任何类型都可以加上 <code>[]</code> 变成数组。适合标签、多个电话号码这类“一行有几个、通常整体读写”的数据：</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+CREATE TABLE posts (id serial PRIMARY KEY, title text, tags text[]);
+
+INSERT INTO posts (title, tags) VALUES
+  ('Postgres 索引入门', ARRAY['postgres', 'index']),   -- ARRAY[...] 写法
+  ('JSONB 实战',        '{postgres,json}'),             -- 字面量写法
+  ('Redis 缓存',        '{redis,cache}');
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="数组运算符：ANY、包含、重叠">
+  <text class="ttl" x="20" y="22">tags 列</text>
+  <rect class="cell-b" x="20" y="34" width="200" height="30"/><text class="mono" x="30" y="54">{postgres,index}</text>
+  <rect class="cell-g" x="20" y="64" width="200" height="30"/><text class="mono" x="30" y="84">{postgres,json}</text>
+  <rect class="cell-p" x="20" y="94" width="200" height="30"/><text class="mono" x="30" y="114">{redis,cache}</text>
+
+  <rect class="bx" x="250" y="20" width="490" height="216" rx="10"/>
+  <text class="mono b" x="266" y="46">'json' = ANY(tags)</text>
+  <text class="sm" x="266" y="64">数组里有任意一个元素等于 'json' → JSONB 实战</text>
+  <text class="mono b" x="266" y="92">tags @&gt; ARRAY['postgres','index']</text>
+  <text class="sm" x="266" y="110">左边包含右边所有元素（顺序无关） → Postgres 索引入门</text>
+  <text class="mono b" x="266" y="138">tags &amp;&amp; ARRAY['redis','json']</text>
+  <text class="sm" x="266" y="156">有任意重叠的元素 → JSONB 实战、Redis 缓存</text>
+  <text class="mono b" x="266" y="184">tags[1]　cardinality(tags)</text>
+  <text class="sm" x="266" y="202">取第一个元素（下标从 1 开始！）、元素个数</text>
+  <text class="sm on-a" x="266" y="226">GIN 索引能加速 @&gt; 和 &amp;&amp;，但加速不了 = ANY(…)</text>
+</svg>
+<figcaption>图 S2-2　最常用的三个数组运算符</figcaption>
+</figure>
+
+<div class="code" data-lang="sql" data-run><pre>
+SELECT title FROM posts WHERE 'json' = ANY(tags);                 -- JSONB 实战
+SELECT title FROM posts WHERE tags @> ARRAY['postgres','index'];  -- Postgres 索引入门
+SELECT title FROM posts WHERE tags && ARRAY['redis','json'];      -- JSONB 实战、Redis 缓存
+
+-- 展开成行再统计：最热门的标签
+SELECT unnest(tags) AS tag, count(*) FROM posts GROUP BY tag ORDER BY 2 DESC, 1;
+</pre></div>
+<div class="code out"><pre>
+   tag    | count
+----------+-------
+ postgres |     2
+ cache    |     1
+ index    |     1
+ json     |     1
+ redis    |     1
+(5 rows)
+</pre></div>
+
+<div class="code" data-lang="sql" data-run><pre>
+-- 多行聚合成一个数组
+SELECT array_agg(title ORDER BY id) FROM posts;
+-- {"Postgres 索引入门","JSONB 实战","Redis 缓存"}
+
+-- 增删元素
+UPDATE posts SET tags = array_append(tags, 'beginner') WHERE id = 1 RETURNING tags;
+-- {postgres,index,beginner}
+UPDATE posts SET tags = array_remove(tags, 'beginner') WHERE id = 1 RETURNING tags;
+-- {postgres,index}
+</pre></div>
+
+<p>给数组建 GIN 索引（和第 5 章 JSONB 一样是倒排索引）：</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+CREATE INDEX posts_tags_gin ON posts USING GIN (tags);
+SET enable_seqscan = off;   -- 表里只有 3 行，规划器本会直接全表扫描；先禁止它，看索引能不能用上
+
+EXPLAIN (costs off) SELECT title FROM posts WHERE tags @> ARRAY['postgres'];
+--  Bitmap Heap Scan on posts
+--    Recheck Cond: (tags @> '{postgres}'::text[])
+--    ->  Bitmap Index Scan on posts_tags_gin           ✓ 用上了
+
+EXPLAIN (costs off) SELECT title FROM posts WHERE 'postgres' = ANY(tags);
+--  Seq Scan on posts
+--    Filter: ('postgres'::text = ANY (tags))          ✗ 禁止了全表扫描也用不上
+
+RESET enable_seqscan;
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 想用索引，就写 @&gt;</div>
+  <p><code>'x' = ANY(tags)</code> 最直观，但 GIN 索引只支持 <code>@&gt;</code>、<code>&amp;&amp;</code>、<code>&lt;@</code>、<code>=</code> 这些数组运算符。查“包含某个标签”时写成 <code>tags @&gt; ARRAY['x']</code>，意思一样，还能走索引。</p>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 数组、JSONB 还是关联表？</div>
+  <p>
+    标签这种“简单值的列表”，数组最轻量。元素本身有结构（标签还要带颜色、创建人），用 JSONB（第 5 章）。
+    元素需要被单独引用、要有外键约束、或者经常被单独修改，就老老实实建一张关联表（第 2 章的 order_items 就是）。
+  </p>
+</div>
+
+<h3>范围类型与排他约束</h3>
+
+<p>
+  <strong>范围类型</strong>用一个值表示“从哪到哪”。内置的有 <code>int4range</code>、<code>int8range</code>、<code>numrange</code>、<code>daterange</code>、<code>tsrange</code>、<code>tstzrange</code>。
+  方括号 <code>[</code> 表示包含边界，圆括号 <code>)</code> 表示不包含：
+</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+SELECT int4range(1, 10) @> 5,      -- t   包含 5
+       int4range(1, 10) @> 10,     -- f   默认左闭右开 [1,10)
+       '[1,10]'::int4range;        -- [1,11)   整数范围会被规范化成左闭右开
+
+SELECT daterange('2025-06-01', '2025-06-05') && daterange('2025-06-04', '2025-06-08');
+-- t   两个范围重叠
+
+SELECT tstzrange('2025-06-01 09:00', '2025-06-01 10:00')
+     * tstzrange('2025-06-01 09:30', '2025-06-01 11:00');
+-- ["2025-06-01 09:30:00+00","2025-06-01 10:00:00+00")   * 是取交集
+</pre></div>
+
+<p>
+  范围类型真正的杀手锏是配合<strong>排他约束</strong>（第 2 章清单 2.21 见过 <code>EXCLUDE</code>）：<strong>同一个会议室的预订时间不能重叠</strong>。这条规则交给数据库保证，应用层再怎么并发也不会出错：
+</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+CREATE EXTENSION btree_gist;   -- 让 GiST 也能处理 text 的 = 比较
+
+CREATE TABLE bookings (
+  id serial PRIMARY KEY,
+  room text NOT NULL,
+  during tstzrange NOT NULL,
+  EXCLUDE USING gist (room WITH =, during WITH &&)
+);
+
+INSERT INTO bookings (room, during) VALUES ('A101', '[2025-06-01 09:00, 2025-06-01 10:00)');
+INSERT INTO bookings (room, during) VALUES ('A101', '[2025-06-01 10:00, 2025-06-01 11:00)');  -- ✓ 首尾相接不算重叠
+INSERT INTO bookings (room, during) VALUES ('B202', '[2025-06-01 09:30, 2025-06-01 10:30)');  -- ✓ 不同房间
+INSERT INTO bookings (room, during) VALUES ('A101', '[2025-06-01 09:30, 2025-06-01 10:30)');  -- ✗
+</pre></div>
+<div class="code out"><pre>
+ERROR:  conflicting key value violates exclusion constraint "bookings_room_during_excl"
+DETAIL:  Key (room, during)=(A101, ["2025-06-01 09:30:00+00","2025-06-01 10:30:00+00"))
+conflicts with existing key (room, during)=(A101, ["2025-06-01 09:00:00+00","2025-06-01 10:00:00+00")).
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="会议室预订时间线：A101 两个首尾相接的预订可以共存，第三个重叠的被排他约束拒绝">
+  <path class="ln" d="M120 170 H720"/>
+  <text class="sm" x="120" y="190" text-anchor="middle">9:00</text><text class="sm" x="270" y="190" text-anchor="middle">9:30</text><text class="sm" x="420" y="190" text-anchor="middle">10:00</text><text class="sm" x="570" y="190" text-anchor="middle">10:30</text><text class="sm" x="720" y="190" text-anchor="middle">11:00</text>
+  <path class="ln-d" d="M120 20 V170 M270 20 V170 M420 20 V170 M570 20 V170 M720 20 V170"/>
+  <text class="sm b" x="20" y="54">A101</text>
+  <rect class="bx-g" x="120" y="36" width="298" height="30" rx="6"/><text class="sm" x="269" y="56" text-anchor="middle">[9:00, 10:00)</text>
+  <rect class="bx-g" x="422" y="36" width="298" height="30" rx="6"/><text class="sm" x="571" y="56" text-anchor="middle">[10:00, 11:00) ✓ 首尾相接</text>
+  <rect class="bx-r" x="270" y="72" width="300" height="30" rx="6" style="stroke-dasharray:5 4"/><text class="sm on-r" x="420" y="92" text-anchor="middle">[9:30, 10:30) ✗ 和两个都重叠</text>
+  <text class="sm b" x="20" y="134">B202</text>
+  <rect class="bx-b" x="270" y="116" width="300" height="30" rx="6"/><text class="sm" x="420" y="136" text-anchor="middle">[9:30, 10:30) ✓ 房间不同</text>
+  <text class="mono" x="380" y="212" text-anchor="middle">EXCLUDE USING gist (room WITH =, during WITH &amp;&amp;)　→　“同房间”且“时间重叠”的两行不能共存</text>
+</svg>
+<figcaption>图 S2-3　范围类型 + 排他约束：把“不许撞车”交给数据库</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 为什么要 btree_gist</div>
+  <p>排他约束要用 GiST 索引来检查 <code>&amp;&amp;</code>（重叠），但 GiST 默认不支持 text 的 <code>=</code>。随发行版自带的 <code>btree_gist</code> 扩展补上了这个能力（第 7 章列出的 45 个自带扩展之一）。左闭右开 <code>[)</code> 是表示时间段的最佳习惯：10:00 结束和 10:00 开始不算冲突。</p>
+</div>
+
+<h3>枚举</h3>
+
+<p>第 11 章已经用过枚举（<code>mq.status</code>）。它把列限制在一组固定的值里，排序按<strong>声明顺序</strong>而不是字母序：</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped', 'delivered');
+CREATE TABLE orders (id serial PRIMARY KEY, status order_status NOT NULL DEFAULT 'pending');
+INSERT INTO orders (status) VALUES ('paid'), ('pending'), ('delivered'), ('shipped');
+
+INSERT INTO orders (status) VALUES ('refunded');
+-- ERROR:  invalid input value for enum order_status: "refunded"
+
+SELECT id, status FROM orders ORDER BY status;           -- pending, paid, shipped, delivered
+SELECT id, status FROM orders WHERE status >= 'shipped';  -- shipped、delivered：可以比较“先后”
+</pre></div>
+
+<div class="code" data-lang="sql" data-run><pre>
+ALTER TYPE order_status ADD VALUE 'refunded' AFTER 'delivered';   -- 可以加
+ALTER TYPE order_status RENAME VALUE 'paid' TO 'payed';           -- 可以改名
+SELECT enum_range(NULL::order_status);
+-- {pending,payed,shipped,delivered,refunded}
+</pre></div>
+
+<div class="tw"><table>
+<tr><th>方案</th><th>优点</th><th>缺点</th><th>适合</th></tr>
+<tr><td>ENUM 类型</td><td>紧凑（4 字节）、自带顺序、可读</td><td><strong>不能删除值</strong>，要删只能重建类型；改动需要 DDL</td><td>几乎不变的状态机</td></tr>
+<tr><td><code>text</code> + <code>CHECK (… IN (…))</code></td><td>改约束即可增删值（第 2 章的写法）</td><td>没有内置顺序</td><td>偶尔会变的取值</td></tr>
+<tr><td>字典表 + 外键</td><td>值可以带属性（显示名、排序号），运营可在线维护</td><td>多一次 JOIN</td><td>经常变、要多语言显示</td></tr>
+</table></div>
+
+<h2 id="locks">锁：并发写入的正确姿势</h2>
+
+<p>第 2 章演示过：两个事务同时改同一行，后来的会等先来的提交（图 2-6）。但如果“读 → 在应用里计算 → 写回”，即便有这种行锁，也会出事。</p>
+
+<h3>丢失更新</h3>
+
+<p>Alice 账户里有 100 元。两个请求几乎同时到达：一个扣 10 元，一个扣 30 元。应用的写法是先读余额、在代码里算好、再写回：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 会话 A                                   -- 会话 B（晚 0.2 秒开始）
+BEGIN;                                      BEGIN;
+SELECT balance FROM accounts WHERE id=1;    SELECT balance FROM accounts WHERE id=1;
+-- 100，应用算出 100-10=90                  -- 100，应用算出 100-30=70
+UPDATE accounts SET balance = 90 WHERE id=1;
+COMMIT;                                     UPDATE accounts SET balance = 70 WHERE id=1;
+                                            COMMIT;
+</pre></div>
+<div class="code out"><pre>
+ balance
+---------
+      70        ← 应该是 60，A 扣的 10 元凭空消失了
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="丢失更新的时间线以及两种修复方式">
+  <text class="ttl on-b" x="140" y="22" text-anchor="middle">会话 A（扣 10）</text>
+  <text class="ttl on-p" x="400" y="22" text-anchor="middle">会话 B（扣 30）</text>
+  <rect class="bx-b" x="40" y="34" width="200" height="30" rx="6"/><text class="sm" x="140" y="54" text-anchor="middle">读到 100</text>
+  <rect class="bx-p" x="300" y="70" width="200" height="30" rx="6"/><text class="sm" x="400" y="90" text-anchor="middle">也读到 100（A 还没写）</text>
+  <rect class="bx-b" x="40" y="106" width="200" height="30" rx="6"/><text class="sm" x="140" y="126" text-anchor="middle">写 90，COMMIT</text>
+  <rect class="bx-r" x="300" y="142" width="200" height="30" rx="6"/><text class="sm on-r" x="400" y="162" text-anchor="middle">写 70，COMMIT（覆盖了 90）</text>
+  <text class="sm on-r b" x="270" y="200" text-anchor="middle">结果 70，正确应为 60</text>
+
+  <rect class="bx-g" x="540" y="30" width="200" height="96" rx="10"/>
+  <text class="ttl on-g" x="640" y="52" text-anchor="middle">修复 ①：原子更新</text>
+  <text class="mono" x="640" y="76" text-anchor="middle">SET balance =</text>
+  <text class="mono" x="640" y="94" text-anchor="middle">  balance - 10</text>
+  <text class="sm" x="640" y="116" text-anchor="middle">让数据库在行锁下计算</text>
+  <rect class="bx-g" x="540" y="136" width="200" height="104" rx="10"/>
+  <text class="ttl on-g" x="640" y="158" text-anchor="middle">修复 ②：先锁再读</text>
+  <text class="mono" x="640" y="182" text-anchor="middle">SELECT … FOR UPDATE</text>
+  <text class="sm" x="640" y="204" text-anchor="middle">B 要等 A 提交后才能读，</text>
+  <text class="sm" x="640" y="222" text-anchor="middle">读到的是 90 → 写 60 ✓</text>
+</svg>
+<figcaption>图 S2-4　丢失更新：每个事务各自都“没错”，合在一起就错了</figcaption>
+</figure>
+
+<p>
+  问题在于计算发生在<strong>应用里</strong>，数据库只看到“把余额设成 90”“把余额设成 70”两条互不相干的指令。两种修复：
+</p>
+
+<ol>
+  <li><strong>让数据库来算</strong>：<code>UPDATE accounts SET balance = balance - 10 WHERE id = 1</code>（第 2 章清单 2.12 就是这么写的）。UPDATE 在行锁下读取最新值再计算，不会丢。能这么写就这么写。</li>
+  <li><strong>先锁住再读</strong>：业务逻辑复杂、必须在应用里计算时，用 <code>SELECT … FOR UPDATE</code> 在读的时候就加上行锁：</li>
+</ol>
+
+<div class="code" data-lang="sql"><pre>
+-- 会话 A                                          -- 会话 B
+BEGIN;                                             BEGIN;
+SELECT balance FROM accounts                       SELECT balance FROM accounts
+  WHERE id=1 FOR UPDATE;   -- 100，行被锁住          WHERE id=1 FOR UPDATE;   -- ⏸ 等 A
+UPDATE accounts SET balance = 90 WHERE id=1;
+COMMIT;                                            -- 解除阻塞，读到 90
+                                                   UPDATE accounts SET balance = 60 WHERE id=1;
+                                                   COMMIT;
+</pre></div>
+<div class="code out"><pre>
+ balance
+---------
+      60        ✓
+</pre></div>
+
+<h3>不想等：NOWAIT 和 lock_timeout</h3>
+
+<p>默认情况下拿不到锁就一直等。有时候宁可立刻失败、给用户提示“稍后再试”：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 会话 A 正持有 id=1 的行锁时，会话 B：
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;
+-- ERROR:  could not obtain lock on row in relation "accounts"
+
+SET lock_timeout = '500ms';
+UPDATE accounts SET balance = 0 WHERE id = 1;
+-- （等了 0.5 秒）ERROR:  canceling statement due to lock timeout
+</pre></div>
+
+<p>第 11 章用到的 <code>SKIP LOCKED</code> 是第三种选择：拿不到锁的行直接跳过。三者对比：</p>
+
+<div class="tw"><table>
+<tr><th>写法</th><th>遇到被锁的行</th><th>典型场景</th></tr>
+<tr><td><code>FOR UPDATE</code></td><td>一直等</td><td>扣库存、转账：必须处理这一行</td></tr>
+<tr><td><code>FOR UPDATE NOWAIT</code></td><td>立刻报错</td><td>交互式操作，宁可提示用户也不卡住</td></tr>
+<tr><td><code>SET lock_timeout</code></td><td>等一会儿再报错</td><td>给所有语句一个等待上限，防止雪崩</td></tr>
+<tr><td><code>FOR UPDATE SKIP LOCKED</code></td><td>跳过</td><td>任务队列：随便处理哪一行都行（第 11 章）</td></tr>
+</table></div>
+
+<h3>死锁</h3>
+
+<p>A 给 B 转账、同时 B 给 A 转账，两个事务各自先锁住了一行，然后都去等对方手里的那一行：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 会话 A                                            -- 会话 B
+BEGIN;                                               BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id=1;
+                                                     UPDATE accounts SET balance = balance - 10 WHERE id=2;
+UPDATE accounts SET balance = balance + 10 WHERE id=2;  -- ⏸ 等 B
+                                                     UPDATE accounts SET balance = balance + 10 WHERE id=1;  -- ⏸ 等 A
+</pre></div>
+<div class="code out"><pre>
+ERROR:  deadlock detected
+DETAIL:  Process 258 waits for ShareLock on transaction 809; blocked by process 265.
+Process 265 waits for ShareLock on transaction 808; blocked by process 258.
+HINT:  See server log for query details.
+CONTEXT:  while updating tuple (0,2) in relation "accounts"
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="死锁：两个事务互相等待对方持有的锁">
+  <rect class="bx-b" x="60" y="70" width="170" height="70" rx="12"/>
+  <text class="ttl on-b" x="145" y="98" text-anchor="middle">事务 A</text>
+  <text class="sm" x="145" y="120" text-anchor="middle">已锁 id=1，想要 id=2</text>
+  <rect class="bx-p" x="530" y="70" width="170" height="70" rx="12"/>
+  <text class="ttl on-p" x="615" y="98" text-anchor="middle">事务 B</text>
+  <text class="sm" x="615" y="120" text-anchor="middle">已锁 id=2，想要 id=1</text>
+  <rect class="bx" x="320" y="20" width="120" height="40" rx="8"/><text class="mono" x="380" y="45" text-anchor="middle">行 id=2</text>
+  <rect class="bx" x="320" y="150" width="120" height="40" rx="8"/><text class="mono" x="380" y="175" text-anchor="middle">行 id=1</text>
+  <path class="ln-b" d="M232 90 Q280 40 316 40" marker-end="url(#ar-b)"/><text class="sm on-b" x="250" y="44">等待</text>
+  <path class="ln-p" d="M444 40 Q500 40 526 86" marker-end="url(#ar-p)" style="stroke-dasharray:5 4"/><text class="sm on-p" x="490" y="40">持有</text>
+  <path class="ln-p" d="M528 124 Q480 170 444 170" marker-end="url(#ar-p)"/><text class="sm on-p" x="490" y="186">等待</text>
+  <path class="ln-b" d="M316 170 Q260 170 234 124" marker-end="url(#ar-b)" style="stroke-dasharray:5 4"/><text class="sm on-b" x="250" y="186">持有</text>
+  <text class="sm" x="380" y="104" text-anchor="middle">环形等待 → 谁也走不了</text>
+  <text class="sm on-r" x="380" y="122" text-anchor="middle">Postgres 检测到后，取消其中一个</text>
+</svg>
+<figcaption>图 S2-5　死锁就是一个等待的环</figcaption>
+</figure>
+
+<p>
+  Postgres 会定期（默认等待超过 <code>deadlock_timeout</code> = 1 秒后）检查有没有等待的环，发现后<strong>取消其中一个事务</strong>，另一个就能继续完成。
+  被取消的那个要由应用重试。预防的办法是<strong>所有事务按同样的顺序加锁</strong>，比如转账时总是先锁 id 小的那一行：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 不管谁转给谁，先按 id 顺序把两行都锁住
+SELECT * FROM accounts WHERE id IN (1, 2) ORDER BY id FOR UPDATE;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+UPDATE accounts SET balance = balance + 10 WHERE id = 2;
+COMMIT;
+</pre></div>
+
+<h3>咨询锁</h3>
+
+<p>有时要锁的不是某一行，而是一件“事”：比如“同一时间只能有一个进程在生成月度报表”。<strong>咨询锁（advisory lock）</strong>就是一个以数字命名、由应用自己约定含义的锁：</p>
+
+<div class="code" data-lang="sql" data-run><pre>
+SELECT pg_try_advisory_lock(42);     -- t：拿到了；另一个会话再调用会返回 f
+-- ……生成报表……
+SELECT pg_advisory_unlock(42);
+
+-- 事务级版本：事务结束自动释放，不怕忘记解锁
+BEGIN;
+SELECT pg_advisory_xact_lock(42);
+-- ……
+COMMIT;
+</pre></div>
+
+<p>会话级的咨询锁在会话断开时也会自动释放。它很适合多个应用实例之间的“选主”或防止定时任务重复执行。</p>
+
+<h2 id="isolation">隔离级别</h2>
+
+<p>
+  第 2 章说过，Postgres 默认是<strong>读已提交（READ COMMITTED）</strong>，此外还有 <strong>REPEATABLE READ</strong> 和 <strong>SERIALIZABLE</strong>。
+  它们的区别在于：并发事务之间，能“看到”对方多少东西。用一个事务里读两次同一行的实验来看：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 会话 A                                           -- 会话 B（0.5 秒后）
+BEGIN;  -- 或 BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM accounts WHERE id=1;   -- 100
+                                                    UPDATE accounts SET balance = 50 WHERE id=1;
+SELECT pg_sleep(1.5);
+SELECT balance FROM accounts WHERE id=1;   -- ?
+COMMIT;
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 64 760 144" role="img" aria-label="同一事务里读两次：读已提交看到新值，可重复读看到快照里的旧值">
+  <path class="ln" d="M40 100 H720" marker-end="url(#ar)"/>
+  <circle class="dot-b" cx="120" cy="100" r="6"/><text class="sm" x="120" y="84" text-anchor="middle">A 第一次读：100</text>
+  <circle class="dot-p" cx="300" cy="100" r="6"/><text class="sm on-p" x="300" y="84" text-anchor="middle">B 改成 50 并提交</text>
+  <circle class="dot-b" cx="520" cy="100" r="6"/><text class="sm" x="520" y="84" text-anchor="middle">A 第二次读</text>
+  <rect class="bx-a" x="420" y="120" width="300" height="34" rx="8"/><text class="sm" x="570" y="142" text-anchor="middle">READ COMMITTED：<tspan class="b">50</tspan>（每条语句一个新快照）</text>
+  <rect class="bx-g" x="420" y="162" width="300" height="34" rx="8"/><text class="sm" x="570" y="184" text-anchor="middle">REPEATABLE READ：<tspan class="b">100</tspan>（整个事务一个快照）</text>
+  <text class="sm" x="40" y="146">读已提交下，同一个事务</text>
+  <text class="sm" x="40" y="164">两次读结果不同 =</text>
+  <text class="sm b" x="40" y="182">不可重复读</text>
+</svg>
+<figcaption>图 S2-6　快照什么时候拍，决定了你能看到什么</figcaption>
+</figure>
+
+<div class="code out"><pre>
+READ COMMITTED                     REPEATABLE READ
+ first_read  | 100                  first_read   | 100
+ second_read |  50  ← 变了          second_read  | 100  ← 没变
+                                    after_commit |  50  ← 事务结束后才看到
+</pre></div>
+
+<h3>可重复读：并发修改会报错</h3>
+
+<p>可重复读下，如果你要修改的行在你的快照之后被别人改过，Postgres 不会让你基于旧数据去覆盖它：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 会话 A                                           -- 会话 B
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM accounts WHERE id=1;   -- 100
+                                                    UPDATE accounts SET balance = balance - 30 WHERE id=1;
+UPDATE accounts SET balance = balance - 10 WHERE id=1;
+-- ERROR:  could not serialize access due to concurrent update
+</pre></div>
+
+<p>A 必须回滚并<strong>重试整个事务</strong>。结果余额是 70（只有 B 生效），不会出现基于过期数据的错误写入。</p>
+
+<h3>串行化：连写偏斜也能防住</h3>
+
+<p>
+  医院规定：任何时候至少要有一位医生值班。Alice 和 Bob 都在值班，两人几乎同时申请下班，各自的事务都先检查“值班人数 ≥ 2”，然后把自己设为下班：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE doctors (name text PRIMARY KEY, on_call boolean NOT NULL);
+INSERT INTO doctors VALUES ('Alice', true), ('Bob', true);
+
+-- 会话 A（Alice）                                  -- 会话 B（Bob）
+BEGIN ISOLATION LEVEL REPEATABLE READ;              BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM doctors WHERE on_call;  -- 2   SELECT count(*) FROM doctors WHERE on_call;  -- 2
+UPDATE doctors SET on_call=false WHERE name='Alice'; UPDATE doctors SET on_call=false WHERE name='Bob';
+COMMIT;                                             COMMIT;
+</pre></div>
+<div class="code out"><pre>
+ name  | on_call
+-------+---------
+ Alice | f
+ Bob   | f          ← 没有人值班了！
+</pre></div>
+
+<p>
+  两个事务改的是<strong>不同的行</strong>，所以既没有行锁冲突，可重复读也不报错。但合起来违反了业务规则 —— 这叫<strong>写偏斜（write skew）</strong>。换成 <code>SERIALIZABLE</code>：
+</p>
+
+<div class="code out"><pre>
+ERROR:  could not serialize access due to read/write dependencies among transactions
+DETAIL:  Reason code: Canceled on identification as a pivot, during write.
+HINT:  The transaction might succeed if retried.
+
+ name  | on_call
+-------+---------
+ Bob   | t          ← 还有人值班 ✓
+ Alice | f
+</pre></div>
+
+<p>
+  串行化级别会追踪事务之间的读写依赖，发现“不可能按某种先后顺序依次执行得到这个结果”时，就取消其中一个。
+  Bob 的事务重试时会读到“值班人数 = 1”，从而拒绝下班。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 294" role="img" aria-label="Postgres 三种隔离级别各自防止的现象">
+  <rect class="cell-h" x="20" y="20" width="720" height="34"/>
+  <text class="sm b" x="30" y="42">现象</text><text class="sm b" x="300" y="42">READ COMMITTED（默认）</text><text class="sm b" x="470" y="42">REPEATABLE READ</text><text class="sm b" x="620" y="42">SERIALIZABLE</text>
+  <rect class="cell" x="20" y="54" width="720" height="34"/><text class="sm" x="30" y="76">脏读：读到别人未提交的数据</text>
+  <text class="sm on-g" x="300" y="76">✓ 防止</text><text class="sm on-g" x="470" y="76">✓ 防止</text><text class="sm on-g" x="620" y="76">✓ 防止</text>
+  <rect class="cell" x="20" y="88" width="720" height="34"/><text class="sm" x="30" y="110">不可重复读：同一行读两次不一样</text>
+  <text class="sm on-r" x="300" y="110">✗ 可能</text><text class="sm on-g" x="470" y="110">✓ 防止</text><text class="sm on-g" x="620" y="110">✓ 防止</text>
+  <rect class="cell" x="20" y="122" width="720" height="34"/><text class="sm" x="30" y="144">幻读：同一条件查两次多出新行</text>
+  <text class="sm on-r" x="300" y="144">✗ 可能</text><text class="sm on-g" x="470" y="144">✓ 防止 *</text><text class="sm on-g" x="620" y="144">✓ 防止</text>
+  <rect class="cell" x="20" y="156" width="720" height="34"/><text class="sm" x="30" y="178">丢失更新（基于旧值覆盖）</text>
+  <text class="sm on-r" x="300" y="178">✗ 可能（要靠 FOR UPDATE）</text><text class="sm on-g" x="470" y="178">✓ 报错重试</text><text class="sm on-g" x="620" y="178">✓ 报错重试</text>
+  <rect class="cell" x="20" y="190" width="720" height="34"/><text class="sm" x="30" y="212">写偏斜</text>
+  <text class="sm on-r" x="300" y="212">✗ 可能</text><text class="sm on-r" x="470" y="212">✗ 可能</text><text class="sm on-g" x="620" y="212">✓ 报错重试</text>
+  <text class="sm" x="20" y="246">* SQL 标准允许可重复读出现幻读，但 Postgres 基于整个事务的快照实现它，实际上不会出现。</text>
+  <text class="sm" x="20" y="264">READ UNCOMMITTED 在 Postgres 里等同于 READ COMMITTED。</text>
+  <text class="sm" x="20" y="282">级别越高越安全，但应用要捕获串行化错误（SQLSTATE 40001）并重试，冲突越多重试越多。</text>
+</svg>
+<figcaption>图 S2-7　三种隔离级别的能力对照</figcaption>
+</figure>
+
+<div class="box key">
+  <div class="t">&#9733; 怎么选</div>
+  <ul>
+    <li>大多数场景保持默认的 <strong>READ COMMITTED</strong>，配合原子更新和 <code>FOR UPDATE</code>。</li>
+    <li>报表、对账这类需要“同一时刻一致视图”的只读事务，用 <strong>REPEATABLE READ</strong>。</li>
+    <li>业务规则跨越多行、很难靠锁表达（排班、额度、库存总量），用 <strong>SERIALIZABLE</strong>，并且<strong>一定要写重试逻辑</strong>：捕获 SQLSTATE <code>40001</code>（serialization_failure）和 <code>40P01</code>（deadlock_detected），回滚后整个事务重来。</li>
+  </ul>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li><code>INSERT … ON CONFLICT</code> 是并发安全的 UPSERT；<code>EXCLUDED</code> 代表被排除的新行，<code>DO UPDATE … WHERE</code> 可以有条件地更新。简单 UPSERT 优先用它，复杂同步用 MERGE。</li>
+  <li>数组适合简单值的列表，查询用 <code>@&gt;</code> / <code>&amp;&amp;</code> 才能走 GIN 索引。</li>
+  <li>范围类型 + <code>EXCLUDE USING gist</code> 能在数据库层面杜绝时间冲突。</li>
+  <li>枚举紧凑有序，但不能删除值；经常变的取值用 CHECK 或字典表。</li>
+  <li>“读 → 应用计算 → 写”会丢失更新：用原子 UPDATE 或 <code>SELECT … FOR UPDATE</code>。NOWAIT / lock_timeout / SKIP LOCKED 应对等不起的场景。</li>
+  <li>死锁由 Postgres 自动检测并取消一方；按固定顺序加锁可以预防。咨询锁用来锁“一件事”。</li>
+  <li>隔离级别越高能防住的现象越多（不可重复读、丢失更新、写偏斜），代价是要处理串行化失败并重试。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用 ON CONFLICT 实现一个“页面访问计数器”：<code>page_views(path PRIMARY KEY, views int)</code>，每次访问 +1。开两个会话各执行 1000 次，确认总数正好是 2000。</li>
+    <li>给 bookings 表再加一条规则：每个预订不能超过 4 小时（提示：<code>CHECK (upper(during) - lower(during) &lt;= interval '4 hours')</code>）。</li>
+    <li>用 <code>daterange</code> 和排他约束实现“同一间酒店客房不能被重复预订”，并查询 6 月 3 日哪些房间是空的。</li>
+    <li>复现本页的死锁，然后按“先锁 id 小的”改写，确认不再死锁。</li>
+    <li>用你熟悉的语言写一个带重试的转账函数：在 SERIALIZABLE 下运行，捕获 40001 后最多重试 3 次。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

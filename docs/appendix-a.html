@@ -315,6 +315,7 @@ docker exec -it postgres psql -U postgres -p 5432
   <li><strong>客户端连接池</strong>：由某种语言的库或框架为应用管理连接。应用要执行查询时不直接连数据库，而是从池里<strong>借</strong>一个连接，执行完再<strong>还</strong>回去。池不会关闭归还的连接，而是留着给下一个请求复用。池的最大连接数可以配置，从而控制能同时向数据库发多少查询。</li>
   <li><strong>服务端（数据库端）连接池</strong>：适合数据库被多个应用或微服务访问的情况。即使每个应用都有自己的客户端池，加起来也会给数据库很大压力 —— 它要维护的连接数（OS 进程数）等于所有客户端池的总和。Postgres 没有内置连接池，也不需要：生态里有很多久经考验的选择，比如 <strong>Pgpool</strong>、<strong>PgBouncer</strong>、<strong>Odyssey</strong>。托管的 Postgres 服务通常已经自带服务端连接池。</li>
 </ul>
+<p>在 Python、Node.js 代码里怎样配置连接池、PgBouncer 事务模式有哪些限制，见<a href="topic-app.html#pool">专题 5：从应用连接 Postgres</a>。</p>
 
 <div class="box tip">
   <div class="t">&#128161; 看看底层发生了什么</div>

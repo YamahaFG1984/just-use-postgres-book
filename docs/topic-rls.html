@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>专题 3 · 行级安全 RLS — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="16">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">专题 3 · 补充内容（原书之外）</span>
+<h1>行级安全 RLS</h1>
+<p class="lede">
+  做 SaaS 时，经常是几百个客户（租户）的数据放在<strong>同一张表</strong>里，靠一列 <code>tenant_id</code> 区分。
+  只要某个查询忘了写 <code>WHERE tenant_id = …</code>，A 公司就能看到 B 公司的数据。
+  <strong>行级安全（Row-Level Security，RLS）</strong>把这条过滤规则交给数据库：哪怕应用忘了写，数据库也会替你加上。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 本页的例子都实际运行过</div>
+  <p>输出均在 Postgres 17.2 上实测。RLS 要用<strong>普通角色</strong>来演示，因为超级用户永远不受 RLS 约束（后面会讲）。例子用 <code>SET ROLE</code> 在同一个 psql 里切换身份。</p>
+</div>
+
+<div class="goals">
+  <h4>本页目标</h4>
+  <ul>
+    <li>理解 RLS 解决什么问题：把“只能看自己的数据”从应用代码挪进数据库</li>
+    <li>开启 RLS、编写策略，分清 <code>USING</code> 和 <code>WITH CHECK</code></li>
+    <li>在连接池环境里用 <code>SET LOCAL</code> 安全地传递“当前租户”</li>
+    <li>知道哪些角色会绕过 RLS：超级用户、表的所有者、BYPASSRLS、视图</li>
+    <li>组合多条策略，并给策略涉及的列建索引</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="why">为什么需要 RLS</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="对比：在应用里过滤租户，和让数据库通过 RLS 自动过滤">
+  <text class="ttl" x="190" y="24" text-anchor="middle">没有 RLS：每个查询都要自己记得过滤</text>
+  <rect class="bx-b" x="20" y="40" width="340" height="140" rx="10"/>
+  <text class="sm on-b b" x="36" y="62">应用代码</text>
+  <text class="mono" x="36" y="88">… WHERE tenant_id = 1  ✓</text>
+  <text class="mono" x="36" y="110">… WHERE tenant_id = 1  ✓</text>
+  <text class="mono on-r" x="36" y="132">SELECT * FROM notes    ✗ 忘了</text>
+  <text class="mono" x="36" y="154">… WHERE tenant_id = 1  ✓</text>
+  <path class="ln-r" d="M190 182 V214" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="60" y="218" width="260" height="40" rx="8"/>
+  <text class="sm on-r" x="190" y="243" text-anchor="middle">返回了所有租户的数据 → 数据泄露</text>
+
+  <text class="ttl" x="575" y="24" text-anchor="middle">有 RLS：数据库替每个查询加上过滤</text>
+  <rect class="bx-b" x="400" y="40" width="340" height="62" rx="10"/>
+  <text class="sm on-b b" x="416" y="62">应用代码</text>
+  <text class="mono" x="416" y="88">SELECT * FROM notes    （忘了也没事）</text>
+  <path class="ln" d="M570 104 V122" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="400" y="126" width="340" height="56" rx="10"/>
+  <text class="sm on-a b" x="416" y="148">Postgres：表上开启了 RLS</text>
+  <text class="mono" x="416" y="170">自动追加 tenant_id = 当前租户</text>
+  <path class="ln-g" d="M570 184 V214" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="440" y="218" width="260" height="40" rx="8"/>
+  <text class="sm on-g" x="570" y="243" text-anchor="middle">只返回租户 1 的行 ✓</text>
+</svg>
+<figcaption>图 S3-1　RLS 把“只能看自己的数据”从约定变成强制</figcaption>
+</figure>
+
+<p>
+  第 2 章讲过<strong>权限</strong>（GRANT）：它控制一个角色能不能访问<strong>某张表</strong>。RLS 则更细一层，控制能访问表里的<strong>哪些行</strong>。
+  两者是叠加关系：先要有表的权限，RLS 再决定其中哪些行可见、可改。
+</p>
+
+<h2 id="setup">准备数据和应用角色</h2>
+
+<div class="code" data-lang="sql"><pre>
+CREATE DATABASE rlstopic;
+\c rlstopic
+
+CREATE TABLE tenants (id int PRIMARY KEY, name text);
+INSERT INTO tenants VALUES (1, '咖啡店'), (2, '书店');
+
+CREATE TABLE notes (
+  id serial PRIMARY KEY,
+  tenant_id int NOT NULL REFERENCES tenants,
+  title text NOT NULL
+);
+INSERT INTO notes (tenant_id, title) VALUES
+  (1, '采购咖啡豆'), (1, '招聘咖啡师'), (2, '盘点库存'), (2, '新书上架');
+
+-- 应用连接数据库用的角色：不是超级用户，也不是表的所有者
+CREATE ROLE app_user LOGIN PASSWORD 'app';
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+GRANT USAGE ON SEQUENCE notes_id_seq TO app_user;
+</pre></div>
+
+<p>现在切换成 app_user，它能看到所有行，因为还没开启 RLS：</p>
+
+<div class="code" data-lang="sql"><pre>
+SET ROLE app_user;
+SELECT * FROM notes;
+</pre></div>
+<div class="code out"><pre>
+ id | tenant_id |   title
+----+-----------+------------
+  1 |         1 | 采购咖啡豆
+  2 |         1 | 招聘咖啡师
+  3 |         2 | 盘点库存
+  4 |         2 | 新书上架
+(4 rows)
+</pre></div>
+
+<h2 id="enable">开启 RLS：默认拒绝</h2>
+
+<div class="code" data-lang="sql"><pre>
+RESET ROLE;                                    -- 切回 postgres
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+SET ROLE app_user;
+SELECT * FROM notes;
+</pre></div>
+<div class="code out"><pre>
+ id | tenant_id | title
+----+-----------+-------
+(0 rows)
+</pre></div>
+
+<p>
+  一行都看不到了。这是 RLS 的重要设计：<strong>开启之后、还没有任何策略时，默认拒绝一切</strong>。
+  它不会报错，只是“什么都没有”。安全上这是对的：忘了写策略的后果是看不到数据，而不是看到所有数据。
+</p>
+
+<h2 id="policy">第一条策略：按租户隔离</h2>
+
+<p>
+  策略需要知道“当前是哪个租户”。最常见的做法是用一个<strong>自定义配置参数</strong>：名字里带一个点（如 <code>app.tenant_id</code>）就可以随意 SET，
+  再在策略里用 <code>current_setting()</code> 读出来：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+RESET ROLE;
+CREATE POLICY tenant_isolation ON notes
+  USING (tenant_id = current_setting('app.tenant_id', true)::int);
+</pre></div>
+
+<ul>
+  <li><code>CREATE POLICY 名字 ON 表</code>：不写 <code>FOR …</code> 时对 SELECT、INSERT、UPDATE、DELETE 全部生效。</li>
+  <li><code>USING (…)</code>：一个布尔表达式，<strong>只有结果为 true 的行</strong>才对当前用户可见。</li>
+  <li><code>current_setting('app.tenant_id', true)</code>：第二个参数 true 表示“没设置过就返回 NULL，不要报错”。<code>tenant_id = NULL</code> 不是 true，于是一行也看不到。</li>
+</ul>
+
+<div class="code" data-lang="sql"><pre>
+SET ROLE app_user;
+SELECT * FROM notes;              -- (0 rows)  还没告诉数据库“我是谁”
+
+SET app.tenant_id = '1';
+SELECT * FROM notes;
+</pre></div>
+<div class="code out"><pre>
+ id | tenant_id |   title
+----+-----------+------------
+  1 |         1 | 采购咖啡豆
+  2 |         1 | 招聘咖啡师
+(2 rows)
+</pre></div>
+
+<div class="code" data-lang="sql"><pre>
+SET app.tenant_id = '2';
+SELECT * FROM notes;
+</pre></div>
+<div class="code out"><pre>
+ id | tenant_id |  title
+----+-----------+----------
+  3 |         2 | 盘点库存
+  4 |         2 | 新书上架
+(2 rows)
+</pre></div>
+
+<p>同一条 SQL，不同的租户看到不同的行。用 EXPLAIN 可以看到数据库到底做了什么：</p>
+
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (costs off) SELECT * FROM notes WHERE title LIKE '%书%';
+</pre></div>
+<div class="code out"><pre>
+ Seq Scan on notes
+   Filter: ((tenant_id = (current_setting('app.tenant_id'::text, true))::integer)
+            AND (title ~~ '%书%'::text))
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="RLS 的原理：把策略表达式和查询自己的 WHERE 用 AND 合并">
+  <rect class="bx-b" x="20" y="30" width="250" height="60" rx="10"/>
+  <text class="sm on-b b" x="36" y="52">你写的查询</text>
+  <text class="mono" x="36" y="76">WHERE title LIKE '%书%'</text>
+  <rect class="bx-a" x="20" y="120" width="250" height="60" rx="10"/>
+  <text class="sm on-a b" x="36" y="142">表上的策略 USING</text>
+  <text class="mono" x="36" y="166">tenant_id = 当前租户</text>
+  <path class="ln" d="M272 60 L360 100" marker-end="url(#ar)"/>
+  <path class="ln" d="M272 150 L360 112" marker-end="url(#ar)"/>
+  <circle class="dot-a" cx="380" cy="105" r="16"/><text class="sm wh b" x="380" y="110" text-anchor="middle">AND</text>
+  <path class="ln" d="M398 105 H446" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="450" y="60" width="290" height="90" rx="10"/>
+  <text class="sm on-g b" x="466" y="84">实际执行的过滤条件</text>
+  <text class="mono" x="466" y="110">tenant_id = 当前租户</text>
+  <text class="mono" x="466" y="132">AND title LIKE '%书%'</text>
+</svg>
+<figcaption>图 S3-2　RLS 的本质：给查询悄悄加上一个 AND 条件</figcaption>
+</figure>
+
+<h2 id="write">写入：USING 和 WITH CHECK</h2>
+
+<p>策略同样管写入。当前租户是 2，试着动租户 1 的数据：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 当前 app.tenant_id = '2'
+INSERT INTO notes (tenant_id, title) VALUES (1, '偷偷写到咖啡店');
+-- ERROR:  new row violates row-level security policy for table "notes"
+
+UPDATE notes SET title = 'x' WHERE tenant_id = 1;   -- UPDATE 0   看不到的行改不了
+DELETE FROM notes WHERE id = 1;                     -- DELETE 0   也删不了
+
+UPDATE notes SET tenant_id = 1 WHERE id = 3;        -- 把自己的行“送”给别人
+-- ERROR:  new row violates row-level security policy for table "notes"
+
+INSERT INTO notes (tenant_id, title) VALUES (2, '书店的新笔记') RETURNING *;
+--  6 |  2 | 书店的新笔记     ✓ 写自己的租户没问题
+</pre></div>
+
+<p>
+  注意 UPDATE / DELETE 别人的数据<strong>不报错，只是影响 0 行</strong>，因为那些行对你来说“不存在”。
+  而 INSERT 和“把行改成别的租户”会直接报错。这是两种不同的检查（新行的 id 是 6 而不是 5，是因为失败的那次 INSERT 已经消耗了序列值 5，序列不会回滚）：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="USING 检查已有的行，WITH CHECK 检查新写入的行">
+  <rect class="bx-b" x="20" y="20" width="340" height="190" rx="12"/>
+  <text class="ttl on-b" x="190" y="46" text-anchor="middle">USING：过滤“已有的行”</text>
+  <text class="sm" x="40" y="74">决定哪些行能被</text>
+  <text class="sm b" x="40" y="94">SELECT 读到、被 UPDATE / DELETE 选中</text>
+  <text class="sm" x="40" y="124">不满足的行：被悄悄跳过</text>
+  <text class="mono" x="40" y="148">UPDATE 0 / DELETE 0</text>
+  <text class="sm" x="40" y="180">适用：SELECT、UPDATE、DELETE</text>
+  <rect class="bx-p" x="400" y="20" width="340" height="190" rx="12"/>
+  <text class="ttl on-p" x="570" y="46" text-anchor="middle">WITH CHECK：检查“新写入的行”</text>
+  <text class="sm" x="420" y="74">INSERT 进来的行、UPDATE 之后的行</text>
+  <text class="sm b" x="420" y="94">必须满足这个条件</text>
+  <text class="sm" x="420" y="124">不满足：整条语句报错</text>
+  <text class="mono" x="420" y="148">new row violates row-level …</text>
+  <text class="sm" x="420" y="180">适用：INSERT、UPDATE</text>
+</svg>
+<figcaption>图 S3-3　两种检查：一个管“能看到什么”，一个管“能写进什么”</figcaption>
+</figure>
+
+<p>
+  我们的策略只写了 <code>USING</code>，没写 <code>WITH CHECK</code>。这时 Postgres 会<strong>把 USING 的表达式同时当作 WITH CHECK 使用</strong>，所以写入也被约束住了。
+  需要两者不同时可以分开写，例如“可以读到全公司的公告，但只能写自己部门的”：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE POLICY p ON announcements
+  USING (true)                                         -- 读：都能看
+  WITH CHECK (dept_id = current_setting('app.dept_id', true)::int);  -- 写：只能写自己部门
+</pre></div>
+
+<h2 id="app">在应用里设置“当前租户”</h2>
+
+<h3>一定要用 SET LOCAL</h3>
+
+<p>
+  普通的 <code>SET</code> 在整个<strong>连接</strong>里一直有效。而应用几乎都在用连接池（见<a href="topic-app.html">专题 5</a>）：一个请求用完的连接会被交给下一个请求。
+  如果上一个请求 SET 了租户 1，下一个请求又恰好忘了 SET，它就会以租户 1 的身份运行。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="连接池里 SET 会残留到下一个请求，SET LOCAL 在事务结束时自动清除">
+  <text class="ttl on-r" x="190" y="22" text-anchor="middle">SET：跟着连接走</text>
+  <rect class="bx-b" x="20" y="36" width="160" height="50" rx="8"/><text class="sm" x="100" y="58" text-anchor="middle">请求 1（租户 1）</text><text class="mono" x="100" y="77" text-anchor="middle">SET … = '1'</text>
+  <path class="ln" d="M182 61 H206" marker-end="url(#ar)"/>
+  <rect class="bx" x="210" y="36" width="150" height="50" rx="8"/><text class="sm" x="285" y="58" text-anchor="middle">连接 #7 归还</text><text class="sm on-r" x="285" y="77" text-anchor="middle">tenant_id 仍是 1</text>
+  <path class="ln" d="M285 88 V112" marker-end="url(#ar)"/>
+  <rect class="bx-r" x="120" y="116" width="240" height="50" rx="8"/><text class="sm" x="240" y="138" text-anchor="middle">请求 2（租户 2）拿到连接 #7</text><text class="sm on-r" x="240" y="157" text-anchor="middle">忘了 SET → 看到租户 1 的数据 ✗</text>
+
+  <text class="ttl on-g" x="570" y="22" text-anchor="middle">SET LOCAL：跟着事务走</text>
+  <rect class="bx-b" x="400" y="36" width="340" height="80" rx="8"/>
+  <text class="mono" x="416" y="58">BEGIN;</text>
+  <text class="mono" x="416" y="78">SET LOCAL app.tenant_id = '1';</text>
+  <text class="mono" x="416" y="98">…查询…; COMMIT;</text>
+  <path class="ln-g" d="M570 118 V140" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="400" y="144" width="340" height="50" rx="8"/><text class="sm" x="570" y="166" text-anchor="middle">COMMIT / ROLLBACK 后自动恢复</text><text class="sm on-g" x="570" y="185" text-anchor="middle">下一个请求忘了设置 → 0 行，安全 ✓</text>
+  <text class="sm" x="380" y="220" text-anchor="middle">规则：每个请求开一个事务，事务开头 SET LOCAL 当前租户</text>
+</svg>
+<figcaption>图 S3-4　连接池里，SET 会“串”到别人的请求里</figcaption>
+</figure>
+
+<div class="code" data-lang="sql"><pre>
+BEGIN;
+SET LOCAL app.tenant_id = '1';
+SELECT count(*) FROM notes;     -- 2
+COMMIT;
+SELECT count(*) FROM notes;     -- 0   事务一结束，设置就没了
+</pre></div>
+
+<p>
+  应用驱动里通常用参数化查询来传值，而 <code>SET</code> 语句不支持 <code>$1</code> 这样的参数。这时用等价的函数 <code>set_config(名字, 值, is_local)</code>，第三个参数 true 就是 LOCAL：
+</p>
+
+<div class="code" data-lang="sql"><pre>
+BEGIN;
+SELECT set_config('app.tenant_id', '2', true);   -- 应用里写成 set_config('app.tenant_id', $1, true)
+SELECT title FROM notes;
+COMMIT;
+</pre></div>
+<div class="code out"><pre>
+    title
+--------------
+ 盘点库存
+ 新书上架
+ 书店的新笔记
+(3 rows)
+</pre></div>
+
+<div class="box warn">
+  <div class="t">&#9888; 租户 ID 只能来自服务器端</div>
+  <p>
+    设置给 <code>app.tenant_id</code> 的值，必须来自<strong>服务器验证过的登录信息</strong>（session、JWT 里的声明），绝不能直接取请求参数。
+    否则用户把 URL 里的 tenant=1 改成 2，RLS 会忠实地把租户 2 的数据给他。RLS 只负责执行规则，“你是谁”仍然要由应用来认证。
+  </p>
+</div>
+
+<h3>坑：RESET 之后是空字符串，不是 NULL</h3>
+
+<p>一个自定义参数只要在会话里被设置过，之后再 RESET（或 SET LOCAL 所在的事务结束），它的值会变成<strong>空字符串</strong>，而 <code>''::int</code> 会报错：</p>
+
+<div class="code" data-lang="sql"><pre>
+SET app.tenant_id = '1';
+RESET app.tenant_id;
+SELECT current_setting('app.tenant_id', true) IS NULL AS is_null,
+       current_setting('app.tenant_id', true) = ''    AS is_empty;
+--  is_null | is_empty
+--  f       | t
+
+SELECT * FROM notes;
+-- ERROR:  invalid input syntax for type integer: ""
+</pre></div>
+
+<p>报错虽然不会泄露数据，但会让请求莫名其妙地失败。用 <code>nullif</code> 把空字符串变成 NULL，策略就稳妥了：</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER POLICY tenant_isolation ON notes
+  USING (tenant_id = nullif(current_setting('app.tenant_id', true), '')::int);
+
+SELECT * FROM notes;   -- (0 rows)   不再报错
+</pre></div>
+
+<p>顺手还可以把租户设为列的默认值，应用插入时就不必再写 tenant_id：</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE notes ALTER COLUMN tenant_id
+  SET DEFAULT nullif(current_setting('app.tenant_id', true), '')::int;
+
+BEGIN;
+SET LOCAL app.tenant_id = '2';
+INSERT INTO notes (title) VALUES ('不用写 tenant_id') RETURNING tenant_id, title;
+--  2 | 不用写 tenant_id
+COMMIT;
+</pre></div>
+
+<h2 id="bypass">谁不受 RLS 约束</h2>
+
+<p>这是 RLS 最容易踩的坑：<strong>你用来测试的那个账号，可能根本不受 RLS 约束</strong>，于是你以为“策略不生效”。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="哪些角色会绕过 RLS">
+  <rect class="cell-h" x="20" y="20" width="720" height="34"/>
+  <text class="sm b" x="30" y="42">谁在查询</text><text class="sm b" x="300" y="42">受 RLS 约束吗</text><text class="sm b" x="480" y="42">说明</text>
+  <rect class="cell" x="20" y="54" width="720" height="38"/>
+  <text class="sm" x="30" y="78">超级用户（如 postgres）</text><text class="sm on-r b" x="300" y="78">✗ 永远不受</text><text class="sm" x="480" y="78">FORCE 也管不了它</text>
+  <rect class="cell" x="20" y="92" width="720" height="38"/>
+  <text class="sm" x="30" y="116">表的所有者</text><text class="sm on-a b" x="300" y="116">✗ 默认不受</text><text class="sm" x="480" y="116">FORCE ROW LEVEL SECURITY 后受</text>
+  <rect class="cell" x="20" y="130" width="720" height="38"/>
+  <text class="sm" x="30" y="154">带 BYPASSRLS 属性的角色</text><text class="sm on-r b" x="300" y="154">✗ 不受</text><text class="sm" x="480" y="154">适合备份、后台报表</text>
+  <rect class="cell" x="20" y="168" width="720" height="38"/>
+  <text class="sm" x="30" y="192">通过普通视图查询</text><text class="sm on-a b" x="300" y="192">按视图所有者算</text><text class="sm" x="480" y="192">加 security_invoker = true</text>
+  <rect class="cell-g" x="20" y="206" width="720" height="38"/>
+  <text class="sm" x="30" y="230">其他普通角色（如 app_user）</text><text class="sm on-g b" x="300" y="230">✓ 受约束</text><text class="sm" x="480" y="230">应用应该用这样的角色连接</text>
+</svg>
+<figcaption>图 S3-5　测试 RLS 时，先确认你是谁</figcaption>
+</figure>
+
+<h3>超级用户与表的所有者</h3>
+
+<p>以 postgres（超级用户，也是表的所有者）身份查询，策略完全不起作用：</p>
+
+<div class="code" data-lang="sql"><pre>
+RESET ROLE;
+SELECT count(*) FROM notes;                     -- 5   全部行
+ALTER TABLE notes FORCE ROW LEVEL SECURITY;
+SELECT count(*) FROM notes;                     -- 5   超级用户连 FORCE 也无视
+</pre></div>
+
+<p>换一个普通角色当所有者，就能看到 FORCE 的作用：</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE notes NO FORCE ROW LEVEL SECURITY;
+CREATE ROLE app_owner LOGIN;
+ALTER TABLE notes OWNER TO app_owner;
+
+SET ROLE app_owner;
+SELECT count(*) FROM notes;                     -- 5   所有者默认绕过 RLS
+RESET ROLE;
+
+ALTER TABLE notes FORCE ROW LEVEL SECURITY;
+SET ROLE app_owner;
+SELECT count(*) FROM notes;                     -- 0   FORCE 之后，所有者也要遵守策略
+RESET ROLE;
+</pre></div>
+
+<div class="box key">
+  <div class="t">&#9733; 推荐的角色划分</div>
+  <ul>
+    <li><strong>迁移角色</strong>（如 app_owner）：拥有表，只在部署时用来执行建表、改表。</li>
+    <li><strong>应用角色</strong>（如 app_user）：只有 SELECT / INSERT / UPDATE / DELETE 权限，不拥有任何表，应用日常用它连接。</li>
+    <li><strong>永远不要让应用用超级用户连接数据库</strong>。用 postgres 连接，RLS 就形同虚设。</li>
+  </ul>
+</div>
+
+<h3>BYPASSRLS 与 row_security</h3>
+
+<div class="code" data-lang="sql"><pre>
+CREATE ROLE reporter LOGIN BYPASSRLS;     -- 后台报表、跨租户统计用
+GRANT SELECT ON notes TO reporter;
+SET ROLE reporter;
+SELECT count(*) FROM notes;               -- 5
+RESET ROLE;
+</pre></div>
+
+<p>普通角色想“关掉 RLS”是不行的。把 <code>row_security</code> 设成 off，查询不会悄悄返回全部数据，而是直接报错：</p>
+
+<div class="code" data-lang="sql"><pre>
+SET ROLE app_user;
+SET row_security = off;
+SELECT count(*) FROM notes;
+-- ERROR:  query would be affected by row-level security policy for table "notes"
+</pre></div>
+
+<p>这个设置主要给 <code>pg_dump</code> 用：它在备份时把 row_security 设为 off，确保要么备份到全部数据，要么报错，而不是悄无声息地只备份出一部分（见<a href="topic-backup.html">专题 6</a>）。</p>
+
+<h3>视图</h3>
+
+<p>视图默认以<strong>视图所有者</strong>的权限访问底层表。如果视图是 postgres 建的，通过它查询就绕过了 RLS：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE VIEW notes_v AS SELECT id, tenant_id, title FROM notes;   -- 以 postgres 身份创建
+GRANT SELECT ON notes_v TO app_user;
+
+SET ROLE app_user;
+SELECT count(*) FROM notes_v;            -- 5   ✗ 漏了！
+RESET ROLE;
+
+ALTER VIEW notes_v SET (security_invoker = true);   -- Postgres 15+
+SET ROLE app_user;
+SELECT count(*) FROM notes_v;            -- 2   ✓ 按查询者本人的身份检查
+</pre></div>
+
+<h2 id="combine">组合多条策略</h2>
+
+<p>一张表可以有多条策略。默认的策略是 <strong>PERMISSIVE（宽松）</strong>的，多条之间是 <strong>OR</strong>：满足任意一条就能看到。
+标成 <strong>RESTRICTIVE（限制）</strong>的策略之间、以及它和宽松策略之间是 <strong>AND</strong>：必须同时满足。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="宽松策略之间是 OR，再和限制策略做 AND">
+  <rect class="bx-g" x="20" y="30" width="200" height="50" rx="8"/><text class="sm" x="120" y="60" text-anchor="middle">宽松策略 1</text>
+  <rect class="bx-g" x="20" y="100" width="200" height="50" rx="8"/><text class="sm" x="120" y="130" text-anchor="middle">宽松策略 2</text>
+  <path class="ln-g" d="M222 55 L292 85" marker-end="url(#ar-g)"/><path class="ln-g" d="M222 125 L292 98" marker-end="url(#ar-g)"/>
+  <circle class="dot-g" cx="312" cy="90" r="18"/><text class="sm wh b" x="312" y="95" text-anchor="middle">OR</text>
+  <path class="ln" d="M332 90 L444 100" marker-end="url(#ar)"/>
+  <rect class="bx-r" x="290" y="140" width="200" height="50" rx="8"/><text class="sm" x="390" y="170" text-anchor="middle">限制策略（RESTRICTIVE）</text>
+  <path class="ln-r" d="M440 140 L456 118" marker-end="url(#ar-r)"/>
+  <circle class="dot-a" cx="470" cy="102" r="18"/><text class="sm wh b" x="470" y="107" text-anchor="middle">AND</text>
+  <path class="ln" d="M490 102 H546" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="550" y="70" width="190" height="64" rx="8"/><text class="sm" x="645" y="96" text-anchor="middle">这一行可见</text><text class="sm" x="645" y="116" text-anchor="middle">(宽松1 OR 宽松2) AND 限制</text>
+  <text class="sm" x="20" y="22">至少要有一条宽松策略，否则什么都看不到</text>
+</svg>
+<figcaption>图 S3-6　宽松策略扩大可见范围，限制策略收紧可见范围</figcaption>
+</figure>
+
+<p>例子：给 notes 加一个 archived 列，规定 app_user <strong>读取时</strong>看不到已归档的笔记：</p>
+
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE notes ADD COLUMN archived boolean NOT NULL DEFAULT false;
+UPDATE notes SET archived = true WHERE id = 4;     -- 归档“新书上架”
+
+CREATE POLICY hide_archived ON notes
+  AS RESTRICTIVE           -- 限制策略：和租户策略 AND
+  FOR SELECT               -- 只管读
+  TO app_user              -- 只对这个角色生效
+  USING (NOT archived);
+
+SET ROLE app_user;
+SET app.tenant_id = '2';
+SELECT id, title, archived FROM notes;
+</pre></div>
+<div class="code out"><pre>
+ id |    title     | archived
+----+--------------+----------
+  3 | 盘点库存     | f
+  6 | 书店的新笔记 | f
+(2 rows)
+</pre></div>
+
+<p>策略的完整语法就是这几个部分的组合：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE POLICY 名字 ON 表
+  [ AS { PERMISSIVE | RESTRICTIVE } ]                  -- 默认 PERMISSIVE
+  [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]  -- 默认 ALL
+  [ TO { 角色 | PUBLIC | CURRENT_USER } [, ...] ]      -- 默认 PUBLIC（所有角色）
+  [ USING ( 过滤已有行的条件 ) ]
+  [ WITH CHECK ( 检查新行的条件 ) ];
+</pre></div>
+
+<h3>另一种身份：每个数据库用户只看自己的行</h3>
+
+<p>如果每个最终用户都有自己的数据库角色（内部工具、数据分析平台常这样），可以直接用 <code>current_user</code>，不需要自定义参数：</p>
+
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE diary (
+  id serial PRIMARY KEY,
+  owner name NOT NULL DEFAULT current_user,
+  body text
+);
+ALTER TABLE diary ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON diary USING (owner = current_user);
+-- （给 alice、bob 授权的 GRANT 语句省略）
+
+SET ROLE alice;  INSERT INTO diary (body) VALUES ('alice 的日记');  RESET ROLE;
+SET ROLE bob;    INSERT INTO diary (body) VALUES ('bob 的日记');
+SELECT * FROM diary;
+--  2 | bob   | bob 的日记          只看到自己的
+
+INSERT INTO diary (owner, body) VALUES ('alice', '冒充 alice');
+-- ERROR:  new row violates row-level security policy for table "diary"
+</pre></div>
+
+<p>查看一张表上有哪些策略：psql 里 <code>\d notes</code> 的末尾会列出 Policies，或者查询系统视图 <code>pg_policies</code>。</p>
+
+<h2 id="perf">性能：给策略用到的列建索引</h2>
+
+<p>策略只是一个附加的 WHERE 条件，所以第 4 章的规则同样适用：条件里的列没有索引，就得全表扫描。50 万行、1000 个租户的 notes 表：</p>
+
+<div class="code" data-lang="sql"><pre>
+-- 当前租户 42，没有索引
+EXPLAIN ANALYZE SELECT count(*) FROM notes;
+--  Parallel Seq Scan on notes
+--    Filter: ((NOT archived) AND (tenant_id = (NULLIF(current_setting(…))…)
+--    Rows Removed by Filter: 166502
+--  Execution Time: 75.867 ms
+
+CREATE INDEX ON notes (tenant_id);
+
+EXPLAIN ANALYZE SELECT count(*) FROM notes;
+--  Bitmap Heap Scan on notes
+--    ->  Bitmap Index Scan on notes_tenant_id_idx
+--          Index Cond: (tenant_id = (NULLIF(current_setting(…))…)
+--  Execution Time: 0.700 ms
+</pre></div>
+
+<div class="tw"><table>
+<tr><th>情况</th><th>执行时间</th></tr>
+<tr><td>没有 tenant_id 索引（全表扫描 50 万行）</td><td>75.9 ms</td></tr>
+<tr><td>有 tenant_id 索引</td><td><strong>0.7 ms</strong></td></tr>
+</table></div>
+
+<p>
+  <code>current_setting()</code> 是 STABLE 函数，在一条语句里结果不变，所以规划器可以把它当成常量去用索引。
+  多租户表的复合索引一般把 tenant_id 放在<strong>最左边</strong>，如 <code>(tenant_id, created_at)</code>，因为每个查询都会带上它（第 4 章“最左前缀”规则）。
+  策略里尽量避免写子查询或复杂函数，它们会对每一行都执行一次。
+</p>
+
+<h2 id="limits">RLS 管不到的地方</h2>
+
+<ul>
+  <li><strong>唯一约束和外键会“泄露存在性”</strong>：如果 email 列在整张表上唯一，租户 2 插入一个租户 1 已经用过的 email 会报唯一冲突，从而得知它存在。多租户表的唯一约束通常应包含 tenant_id，如 <code>UNIQUE (tenant_id, email)</code>。</li>
+  <li><strong>RLS 不加密</strong>：能拿到超级用户、能读数据文件或备份的人，照样看得到所有数据。</li>
+  <li><strong>认证在应用</strong>：RLS 只保证“按 app.tenant_id 过滤”，这个值对不对由应用负责。</li>
+  <li><strong>TRUNCATE、表结构修改</strong>不受 RLS 管，它们由普通的表权限控制，应用角色不该有这些权限。</li>
+</ul>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>RLS 控制“表里哪些行”能被访问，和控制“哪些表”的 GRANT 叠加生效。</li>
+  <li><code>ENABLE ROW LEVEL SECURITY</code> 之后默认拒绝一切，再用 <code>CREATE POLICY</code> 放行。</li>
+  <li><code>USING</code> 过滤已有的行（看不到就改不了、删不了），<code>WITH CHECK</code> 检查新写入的行（不满足就报错）；只写 USING 时它兼任 WITH CHECK。</li>
+  <li>用 <code>SET LOCAL</code> 或 <code>set_config(…, true)</code> 在事务里设置当前租户，避免在连接池里串号；用 <code>nullif(…, '')</code> 防止空字符串报错。</li>
+  <li>超级用户、表的所有者（除非 FORCE）、BYPASSRLS 角色和普通视图都会绕过 RLS。应用必须用一个普通角色连接。</li>
+  <li>宽松策略之间是 OR，限制策略是 AND。</li>
+  <li>给策略用到的列（通常是 tenant_id）建索引。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>按本页步骤建好 notes 表，然后故意用 postgres 身份测试策略，体会“为什么策略好像没生效”。</li>
+    <li>给 notes 增加一条策略：<code>app.role</code> 为 <code>'admin'</code> 时可以看到本租户已归档的笔记（提示：再写一条针对归档的宽松策略，或者修改 hide_archived 的条件）。</li>
+    <li>建一张 <code>users(tenant_id, email)</code> 表，分别用 <code>UNIQUE (email)</code> 和 <code>UNIQUE (tenant_id, email)</code> 测试，观察跨租户插入同一个 email 时的区别。</li>
+    <li>写一个 <code>notes_summary</code> 视图统计每个租户的笔记数，分别在有、没有 <code>security_invoker</code> 时用 app_user 查询它。</li>
+    <li>用你熟悉的语言写一个请求处理函数：开启事务 → <code>set_config('app.tenant_id', $1, true)</code> → 查询 → 提交（可参考<a href="topic-app.html">专题 5</a>）。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SQL 练习场 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="20">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">工具 · 不用安装任何东西</span>
+<h1>SQL 练习场</h1>
+<p class="lede">
+  这一页在你的<strong>浏览器里</strong>运行一个真正的 Postgres（<a href="https://pglite.dev/">PGlite</a>，Postgres 编译成的 WebAssembly 版本），并预先装好了一家小咖啡店的示例数据。
+  写 SQL、按 <kbd>Ctrl</kbd> + <kbd>Enter</kbd>（Mac 上是 <kbd>⌘</kbd> + <kbd>Enter</kbd>）就能看到结果。改坏了也没关系，点“重置数据库”就回到初始状态。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 和书里的环境有什么不同</div>
+  <ul>
+    <li>这里是 <strong>Postgres 18</strong>，数据只在内存里，刷新页面就会恢复原样（你写的 SQL 会保存在本浏览器里）。</li>
+    <li>只有一个会话、一个数据库：<code>\c</code>、<code>\d</code> 这类 psql 命令用不了，会被跳过；并发、锁的实验要回到 Docker 里做。</li>
+    <li>pgvector、PostGIS、TimescaleDB 等扩展没有加载；第 8～10 章的内容请用 Docker 环境。</li>
+    <li>首次运行需要下载约 10 MB 文件（来自 cdn.jsdelivr.net），之后浏览器会缓存。</li>
+  </ul>
+</div>
+
+<h2 id="data">示例数据</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 262" role="img" aria-label="示例数据的四张表：customers、orders、order_items、products 及其关系">
+  <rect class="bx-b" x="20" y="30" width="160" height="150" rx="10"/>
+  <text class="ttl on-b" x="100" y="54" text-anchor="middle">customers</text>
+  <text class="sm" x="100" y="72" text-anchor="middle">8 位顾客</text>
+  <text class="mono" x="34" y="98">id</text><text class="mono" x="34" y="118">name</text><text class="mono" x="34" y="138">city</text><text class="mono" x="34" y="158">joined_at</text>
+  <rect class="bx-a" x="220" y="30" width="160" height="150" rx="10"/>
+  <text class="ttl on-a" x="300" y="54" text-anchor="middle">orders</text>
+  <text class="sm" x="300" y="72" text-anchor="middle">40 个订单</text>
+  <text class="mono" x="234" y="98">id</text><text class="mono" x="234" y="118">customer_id</text><text class="mono" x="234" y="138">ordered_at</text><text class="mono" x="234" y="158">status</text>
+  <rect class="bx-p" x="420" y="30" width="160" height="150" rx="10"/>
+  <text class="ttl on-p" x="500" y="54" text-anchor="middle">order_items</text>
+  <text class="sm" x="500" y="72" text-anchor="middle">126 条明细</text>
+  <text class="mono" x="434" y="98">order_id</text><text class="mono" x="434" y="118">product_id</text><text class="mono" x="434" y="138">quantity</text><text class="mono" x="434" y="158">price</text>
+  <rect class="bx-g" x="600" y="20" width="150" height="190" rx="10"/>
+  <text class="ttl on-g" x="675" y="44" text-anchor="middle">products</text>
+  <text class="sm" x="675" y="62" text-anchor="middle">10 种商品</text>
+  <text class="mono" x="612" y="88">id</text><text class="mono" x="612" y="108">name</text><text class="mono" x="612" y="128">category</text><text class="mono" x="612" y="148">price, stock</text><text class="mono" x="612" y="168">attrs (jsonb)</text><text class="mono" x="612" y="188">description</text>
+  <path class="ln" d="M182 98 H218" marker-end="url(#ar)"/><text class="sm" x="200" y="90" text-anchor="middle">1:N</text>
+  <path class="ln" d="M382 98 H418" marker-end="url(#ar)"/><text class="sm" x="400" y="90" text-anchor="middle">1:N</text>
+  <path class="ln" d="M598 118 H584" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="232" text-anchor="middle">orders.customer_id → customers.id　　order_items.order_id → orders.id　　order_items.product_id → products.id</text>
+  <text class="sm" x="380" y="252" text-anchor="middle">status 只能是 pending / paid / shipped / cancelled；price 必须大于 0</text>
+</svg>
+<figcaption>图 T-1　练习场里的四张表</figcaption>
+</figure>
+
+<details class="pg-seed">
+<summary>查看完整的建表和造数语句</summary>
+<div class="code" data-lang="sql"><pre id="pg-seed">
+-- 示例数据：一家小咖啡店
+CREATE TABLE customers (
+  id serial PRIMARY KEY,
+  name text NOT NULL,
+  city text NOT NULL,
+  joined_at date NOT NULL
+);
+CREATE TABLE products (
+  id serial PRIMARY KEY,
+  name text NOT NULL,
+  category text NOT NULL,
+  price numeric(8,2) NOT NULL CHECK (price &gt; 0),
+  stock int NOT NULL DEFAULT 0,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  description text
+);
+CREATE TABLE orders (
+  id serial PRIMARY KEY,
+  customer_id int NOT NULL REFERENCES customers,
+  ordered_at timestamptz NOT NULL,
+  status text NOT NULL CHECK (status IN ('pending', 'paid', 'shipped', 'cancelled'))
+);
+CREATE TABLE order_items (
+  order_id int REFERENCES orders,
+  product_id int REFERENCES products,
+  quantity int NOT NULL CHECK (quantity &gt; 0),
+  price numeric(8,2) NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);
+
+INSERT INTO customers (name, city, joined_at) VALUES
+  ('张伟', '北京', '2024-01-15'), ('李娜', '上海', '2024-02-03'), ('王芳', '杭州', '2024-03-20'),
+  ('刘洋', '北京', '2024-05-08'), ('陈静', '成都', '2024-06-30'), ('杨帆', '上海', '2024-09-12'),
+  ('赵磊', '杭州', '2025-01-05'), ('周敏', '成都', '2025-02-18');
+
+INSERT INTO products (name, category, price, stock, attrs, description) VALUES
+  ('耶加雪菲', '咖啡豆', 88.00, 40, '{"origin": "Ethiopia", "roast": "light", "weight_g": 250}', 'Bright and floral Ethiopian beans with notes of blueberry and jasmine'),
+  ('曼特宁',   '咖啡豆', 76.00, 25, '{"origin": "Indonesia", "roast": "dark", "weight_g": 250}', 'Full-bodied Sumatra beans, earthy with dark chocolate finish'),
+  ('哥伦比亚', '咖啡豆', 68.00, 60, '{"origin": "Colombia", "roast": "medium", "weight_g": 250}', 'Balanced and smooth, with caramel sweetness and a nutty aroma'),
+  ('意式拼配', '咖啡豆', 59.00, 80, '{"origin": "Blend", "roast": "dark", "weight_g": 500}', 'Classic espresso blend with rich crema and chocolate notes'),
+  ('手冲壶',   '器具',  199.00, 12, '{"material": "stainless steel", "capacity_ml": 600}', 'Gooseneck kettle for precise pour-over brewing'),
+  ('磨豆机',   '器具',  329.00,  6, '{"material": "steel burr", "electric": true}', 'Electric burr grinder with 40 grind settings'),
+  ('滤纸',     '耗材',   15.00, 300, '{"count": 100}', 'Paper filters for pour-over drippers'),
+  ('陶瓷杯',   '器具',   45.00, 50, '{"material": "ceramic", "capacity_ml": 350}', 'Handmade ceramic mug that keeps coffee warm'),
+  ('冷萃包',   '咖啡豆', 39.00, 0,  '{"origin": "Blend", "roast": "medium", "pieces": 10}', 'Cold brew bags, fruity and low in acidity'),
+  ('燕麦奶',   '耗材',   22.00, 90, '{"volume_ml": 1000, "vegan": true}', 'Creamy oat milk that foams well for latte art');
+
+-- 用确定的公式生成 40 个订单，每次重置得到的数据都一样
+INSERT INTO orders (customer_id, ordered_at, status)
+SELECT (ARRAY[1,3,2,5,1,4,6,2,8,3,1,7,2,5,3,1,6,4,2,8,1,3,5,2,7,1,4,3,6,2,1,5,8,3,2,4,1,6,7,3])[g],
+       timestamptz '2025-01-01 09:00+00' + (g * 4 || ' days')::interval + (g % 9 || ' hours')::interval,
+       (ARRAY['paid', 'shipped', 'shipped', 'paid', 'pending', 'cancelled', 'shipped'])[1 + g % 7]
+FROM generate_series(1, 40) AS g;
+
+INSERT INTO order_items (order_id, product_id, quantity, price)
+SELECT o.id, p.id, 1 + get_byte(decode(md5(o.id || '+' || p.id), 'hex'), 1) % 3, p.price
+FROM orders o
+JOIN products p ON get_byte(decode(md5(o.id || '-' || p.id), 'hex'), 0) % 10 &lt; 2
+                OR p.id = 1 + o.id % 10;   -- 保证每个订单至少有一件商品
+</pre></div>
+</details>
+
+<h2 id="editor">写 SQL</h2>
+
+<p>点一个例子会把它放进编辑器并运行，之后可以随意修改：</p>
+
+<div class="pg-examples" id="pg-examples"></div>
+
+<div class="pg-editor-wrap">
+  <div class="pg-bar">
+    <span class="tag">SQL 编辑器</span>
+    <span class="pg-actions">
+      <button type="button" class="pg-btn primary" id="pg-run">▶ 运行 <span class="kbd">Ctrl+Enter</span></button>
+      <button type="button" class="pg-btn" id="pg-reset">重置数据库</button>
+      <button type="button" class="pg-btn" id="pg-clear">清空</button>
+    </span>
+  </div>
+  <textarea id="pg-sql" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="SQL 编辑器"></textarea>
+</div>
+
+<div class="code out pg-out">
+  <pre id="pg-result">点“运行”或按 Ctrl+Enter。第一次会先下载并启动浏览器版 Postgres，需要几秒钟。</pre>
+</div>
+
+<h2 id="tips">小提示</h2>
+
+<div class="tw"><table>
+<tr><th>想做的事</th><th>psql 里的写法</th><th>这里用 SQL 代替</th></tr>
+<tr><td>列出所有表</td><td><code>\dt</code></td><td><code>SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';</code></td></tr>
+<tr><td>看表结构</td><td><code>\d products</code></td><td><code>SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = 'products';</code></td></tr>
+<tr><td>看索引</td><td><code>\di</code></td><td><code>SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public';</code></td></tr>
+<tr><td>看扩展</td><td><code>\dx</code></td><td><code>SELECT * FROM pg_available_extensions ORDER BY name;</code></td></tr>
+</table></div>
+
+<ul>
+  <li>一次可以写多条语句，用分号隔开；和 psql 一样，某一条出错，后面的照常执行。</li>
+  <li>事务里出错后，练习场会自动 ROLLBACK，免得后面的语句全部报 “current transaction is aborted”。</li>
+  <li>想练第 2～4 章的建表、约束、索引？直接在这里 <code>CREATE TABLE</code> 自己的表就行。</li>
+  <li>本站的<a href="topic-sql.html">专题 2</a> 里，代码块右上角也有“运行”按钮。</li>
+</ul>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+<script type="module">
+import { getDb, resetDb, runSql } from './assets/runner.js';
+
+const EXAMPLES = [{"t": "看看有哪些表", "sql": "-- 有哪些表？每张表多少行？\nSELECT 'customers' AS 表, count(*) AS 行数 FROM customers\nUNION ALL SELECT 'products', count(*) FROM products\nUNION ALL SELECT 'orders', count(*) FROM orders\nUNION ALL SELECT 'order_items', count(*) FROM order_items;"}, {"t": "过滤与排序", "sql": "-- 过滤与排序：最贵的 3 种咖啡豆\nSELECT name, price, stock\nFROM products\nWHERE category = '咖啡豆'\nORDER BY price DESC\nLIMIT 3;"}, {"t": "分组聚合", "sql": "-- 分组聚合：每个分类有几种商品、平均价格\nSELECT category,\n       count(*)             AS 商品数,\n       round(avg(price), 2) AS 平均价格,\n       sum(stock)           AS 总库存\nFROM products\nGROUP BY category\nORDER BY 商品数 DESC;"}, {"t": "JOIN 多表", "sql": "-- JOIN：每位顾客的订单数和消费总额（不含已取消的订单）\nSELECT c.name, c.city,\n       count(DISTINCT o.id)           AS 订单数,\n       sum(i.quantity * i.price)      AS 消费总额\nFROM customers c\nJOIN orders o      ON o.customer_id = c.id AND o.status <> 'cancelled'\nJOIN order_items i ON i.order_id = o.id\nGROUP BY c.id\nORDER BY 消费总额 DESC;"}, {"t": "CTE", "sql": "-- CTE（第 3 章）：先算出每个订单的金额，再找出高于平均值的订单\nWITH order_totals AS (\n  SELECT order_id, sum(quantity * price) AS total\n  FROM order_items\n  GROUP BY order_id\n)\nSELECT order_id, total\nFROM order_totals\nWHERE total > (SELECT avg(total) FROM order_totals)\nORDER BY total DESC\nLIMIT 5;"}, {"t": "窗口函数", "sql": "-- 窗口函数（第 3 章）：每个城市内，顾客按消费额排名\nWITH spend AS (\n  SELECT c.name, c.city, sum(i.quantity * i.price) AS total\n  FROM customers c\n  JOIN orders o      ON o.customer_id = c.id\n  JOIN order_items i ON i.order_id = o.id\n  GROUP BY c.id\n)\nSELECT city, name, total,\n       rank() OVER (PARTITION BY city ORDER BY total DESC) AS 城市内排名,\n       round(100.0 * total / sum(total) OVER (), 1)        AS 占比\nFROM spend\nORDER BY city, 城市内排名;"}, {"t": "JSONB", "sql": "-- JSONB（第 5 章）：取字段、按包含关系过滤\nSELECT name,\n       attrs->>'origin'               AS 产地,\n       attrs->>'roast'                AS 烘焙度,\n       (attrs->>'weight_g')::int      AS 克重\nFROM products\nWHERE attrs @> '{\"roast\": \"dark\"}';"}, {"t": "全文搜索", "sql": "-- 全文搜索（第 6 章）：在英文描述里搜 chocolate 或 fruity，按相关度排序\nSELECT name,\n       ts_rank(to_tsvector('english', description), q) AS 相关度,\n       ts_headline('english', description, q)          AS 高亮\nFROM products,\n     to_tsquery('english', 'chocolate | fruity') AS q\nWHERE to_tsvector('english', description) @@ q\nORDER BY 相关度 DESC;"}, {"t": "事务与回滚", "sql": "-- 事务（第 2 章）：转一笔库存，然后反悔\nBEGIN;\nUPDATE products SET stock = stock - 5 WHERE name = '曼特宁';\nSELECT name, stock FROM products WHERE name = '曼特宁';   -- 事务内：20\nROLLBACK;\nSELECT name, stock FROM products WHERE name = '曼特宁';   -- 回滚后：25"}, {"t": "UPSERT", "sql": "-- UPSERT（专题 2）：商品存在就加库存，不存在就新建\nCREATE UNIQUE INDEX IF NOT EXISTS products_name_key ON products (name);\n\nINSERT INTO products (name, category, price, stock)\nVALUES ('滤纸', '耗材', 15.00, 100), ('挂耳包', '咖啡豆', 49.00, 30)\nON CONFLICT (name) DO UPDATE SET stock = products.stock + EXCLUDED.stock\nRETURNING name, stock, (xmax = 0) AS 是新插入的;"}, {"t": "索引与 EXPLAIN", "sql": "-- 索引与 EXPLAIN（第 4 章）：建索引前后的执行计划\nEXPLAIN SELECT * FROM orders WHERE customer_id = 3;\n\nCREATE INDEX IF NOT EXISTS orders_customer_idx ON orders (customer_id);\nSET enable_seqscan = off;   -- 数据太少，规划器默认会选全表扫描；关掉它看看索引怎么用\nEXPLAIN SELECT * FROM orders WHERE customer_id = 3;\nRESET enable_seqscan;"}, {"t": "约束挡住坏数据", "sql": "-- 约束（第 2 章）：数据库替你挡住不合法的数据\nINSERT INTO products (name, category, price) VALUES ('免费咖啡', '咖啡豆', 0);\nINSERT INTO orders (customer_id, ordered_at, status) VALUES (99, now(), 'paid');\nINSERT INTO orders (customer_id, ordered_at, status) VALUES (1, now(), 'lost');"}];
+const SEED = document.getElementById('pg-seed').textContent;
+const KEY = 'jup-playground-sql';
+const ta = document.getElementById('pg-sql');
+const result = document.getElementById('pg-result');
+const status = document.querySelector('.pg-out .bar .tag');   // 标题栏由 site.js 生成
+const runBtn = document.getElementById('pg-run');
+let busy = false;
+
+function load(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+function save(key, v) { try { localStorage.setItem(key, v); } catch (e) { /* 隐私模式等情况下无法保存，忽略 */ } }
+
+ta.value = load(KEY) || EXAMPLES[0].sql;
+ta.addEventListener('input', () => save(KEY, ta.value));
+
+function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+async function run() {
+  if (busy) return;
+  busy = true; runBtn.disabled = true;
+  status.textContent = '运行中……';
+  try {
+    if (!document.body.dataset.pgReady) result.textContent = '正在下载并启动浏览器版 Postgres（首次约 10 MB）……';
+    const db = await getDb(SEED);
+    document.body.dataset.pgReady = '1';
+    const r = await runSql(db, ta.value);
+    result.innerHTML = esc(r.text).replace(/^(ERROR:.*)$/gm, '<span class="run-err">$1</span>');
+    status.textContent = r.ok ? '结果' : '结果（有错误）';
+  } catch (e) {
+    result.textContent = '加载失败：' + (e && e.message ? e.message : e) + '\n请检查网络能否访问 cdn.jsdelivr.net。';
+    status.textContent = '出错了';
+  } finally {
+    busy = false; runBtn.disabled = false;
+  }
+}
+
+runBtn.onclick = run;
+document.getElementById('pg-reset').onclick = async () => {
+  if (busy) return;
+  await resetDb();
+  delete document.body.dataset.pgReady;
+  result.textContent = '数据库已重置，下次运行时会重新导入示例数据。';
+  status.textContent = '结果';
+};
+document.getElementById('pg-clear').onclick = () => { ta.value = ''; save(KEY, ''); ta.focus(); };
+
+ta.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+  else if (e.key === 'Tab' && !e.shiftKey) {
+    e.preventDefault();
+    const s = ta.selectionStart;
+    ta.setRangeText('  ', s, ta.selectionEnd, 'end');
+    save(KEY, ta.value);
+  }
+});
+
+const box = document.getElementById('pg-examples');
+EXAMPLES.forEach(ex => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'pg-chip'; b.textContent = ex.t;
+  b.onclick = () => { ta.value = ex.sql; save(KEY, ex.sql); run(); };
+  box.appendChild(b);
+});
+</script>
+</body>
+</html>
