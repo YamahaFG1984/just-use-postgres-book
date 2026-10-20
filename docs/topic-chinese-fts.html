@@ -716,11 +716,119 @@ FROM articles WHERE title % '流浪的地球';     -- % 表示相似度超过阈
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>把“哪吒”“敖丙”“混元珠”加入自定义词典，验证它们能被正确切分，并重算 articles 表。</li>
-    <li>分别在 <code>multi_short</code> 开 / 关的情况下，搜索“人民”，比较对“中华人民共和国成立”这句话的命中情况。</li>
-    <li>给 articles 加一个用户评论表，用触发器或生成列为评论建立中文 tsvector，实现“片名 A、简介 B、评论 C”三档权重。</li>
-    <li>对 2 万行的表分别建 GIN（tsvector）和 GIN（gin_trgm_ops）索引，用 <code>pg_relation_size</code> 比较大小。</li>
-    <li>（需要第 8 章的环境）为这 6 部电影的简介生成向量嵌入，用“宇宙冒险”做语义搜索，再和 <code>to_tsquery('chinese','宇宙 &amp; 冒险')</code> 的结果对比。</li>
+    <li>把“哪吒”“敖丙”“混元珠”加入自定义词典，验证它们能被正确切分，并重算 articles 表。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT to_tsvector('chinese', '哪吒与敖丙一起守护混元珠');
+--  '元珠':5 '哪吒':1 '守护':3 '敖':2 '混':4         敖丙、混元珠被切错了
+
+INSERT INTO zhparser.zhprs_custom_word VALUES ('哪吒'), ('敖丙'), ('混元珠');
+SELECT sync_zhprs_custom_word();
+-- 断开重连（新词典只对新会话生效）
+
+SELECT to_tsvector('chinese', '哪吒与敖丙一起守护混元珠');
+--  '哪吒':1 '守护':3 '敖丙':2 '混元珠':4
+
+UPDATE articles SET title = title;   -- 让生成列 tsv 按新词典重算
+SELECT title FROM articles WHERE tsv @@ to_tsquery('chinese', '混元珠');
+--  哪吒之魔童降世
+</pre></div>
+<p>三个容易忘的步骤：sync 之后要新开会话；自定义词的词性是 x，配置里要有 x 的映射（本页已经加过）；已经存进表里的 tsvector 不会自动更新，要重算一遍。</p>
+      </details>
+    </li>
+    <li>分别在 <code>multi_short</code> 开 / 关的情况下，搜索“人民”，比较对“中华人民共和国成立”这句话的命中情况。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SET zhparser.multi_short = off;
+SELECT to_tsvector('chinese', '中华人民共和国成立'),
+       to_tsvector('chinese', '中华人民共和国成立') @@ to_tsquery('chinese', '人民') AS hit;
+--  '中华人民共和国':1 '成立':2                             | f
+
+SET zhparser.multi_short = on;
+SELECT …同上…;
+--  '中华':2 '中华人民共和国':1 '人民':3 '共和国':4 '成立':5  | t
+</pre></div>
+<p>关闭时“中华人民共和国”是一个整词，搜“人民”找不到；打开后长词额外拆出短词，就能命中了，代价是 tsvector 和索引变大。</p>
+      </details>
+    </li>
+    <li>给 articles 加一个用户评论表，用触发器或生成列为评论建立中文 tsvector，实现“片名 A、简介 B、评论 C”三档权重。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE comments (
+  id serial PRIMARY KEY,
+  article_id int NOT NULL REFERENCES articles ON DELETE CASCADE,
+  content text NOT NULL
+);
+-- 生成列只能引用本行的列，评论在另一张表，所以用触发器维护一列
+ALTER TABLE articles ADD COLUMN comments_tsv tsvector NOT NULL DEFAULT '';
+
+CREATE OR REPLACE FUNCTION refresh_comments_tsv() RETURNS trigger AS $$
+DECLARE aid int := coalesce(NEW.article_id, OLD.article_id);
+BEGIN
+  UPDATE articles a
+  SET comments_tsv = setweight(to_tsvector('chinese',
+        coalesce((SELECT string_agg(content, ' ') FROM comments c WHERE c.article_id = aid), '')), 'C')
+  WHERE a.id = aid;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER comments_tsv_trg
+AFTER INSERT OR UPDATE OR DELETE ON comments
+FOR EACH ROW EXECUTE FUNCTION refresh_comments_tsv();
+
+INSERT INTO comments (article_id, content) VALUES
+  ((SELECT id FROM articles WHERE title = '大圣归来'), '画面很燃，宇航员都想去花果山');
+
+SELECT title, ts_rank(tsv || comments_tsv, q) AS rank
+FROM articles, to_tsquery('chinese', '宇航员') q
+WHERE (tsv || comments_tsv) @@ q
+ORDER BY rank DESC;
+</pre></div>
+<div class="code out"><pre>
+  title   |  rank
+----------+--------
+ 星际穿越 | 0.2432      简介（B）里有“宇航员”
+ 火星救援 | 0.2432
+ 大圣归来 | 0.1216      只有评论（C）里有，分数正好一半
+</pre></div>
+<p>默认权重 A = 1.0、B = 0.4、C = 0.2，所以只在评论里命中的分数是简介命中的一半。要给 <code>tsv || comments_tsv</code> 建索引，可以建表达式 GIN 索引，查询里写同样的表达式。</p>
+      </details>
+    </li>
+    <li>对 2 万行的表分别建 GIN（tsvector）和 GIN（gin_trgm_ops）索引，用 <code>pg_relation_size</code> 比较大小。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname = 'articles';
+</pre></div>
+<div class="code out"><pre>
+    indexrelname    | pg_size_pretty
+--------------------+----------------
+ articles_body_trgm | 2896 kB
+ articles_tsv_gin   | 7352 kB
+</pre></div>
+<p>
+  这里 tsvector 的 GIN 反而更大，是被填充数据“带偏”了：那 2 万行是 md5 字符串，zhparser 把每串切成十几个毫无规律的片段，一共产生了 104,048 个不同的词素，每个都要在 GIN 里占一个键；
+  而十六进制字符组成的三元组总共只有 4,842 种，GIN 的键很少、行列表压缩得很好。换成真实的中文文本，结论可能完全不同，这正说明索引大小要用自己的数据去测。
+</p>
+      </details>
+    </li>
+    <li>（需要第 8 章的环境）为这 6 部电影的简介生成向量嵌入，用“宇宙冒险”做语义搜索，再和 <code>to_tsquery('chinese','宇宙 &amp; 冒险')</code> 的结果对比。
+      <details class="answer"><summary>参考答案</summary>
+<p>（需要第 8 章的 pgvector 环境和一个能处理中文的嵌入模型，本站没有实测。）思路：</p>
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION IF NOT EXISTS vector;
+ALTER TABLE articles ADD COLUMN embedding vector(1024);
+-- 在应用里为每部电影的 “标题 + 简介” 生成嵌入并写回，然后：
+SELECT title FROM articles ORDER BY embedding &lt;=&gt; $1 LIMIT 3;    -- $1 是“宇宙冒险”的嵌入
+SELECT title FROM articles WHERE tsv @@ to_tsquery('chinese', '宇宙 &amp; 冒险');
+</pre></div>
+<p>
+  注意第 8 章用的 mxbai-embed-large 主要面向英文，处理中文效果有限；中文语义搜索要选多语言模型，例如 BAAI/bge-m3 或 intfloat/multilingual-e5-large（维数以模型说明为准，列的维数要和它一致）。
+  预期的结果是：全文搜索要求“宇宙”和“冒险”两个词都出现，6 部电影的简介里都没有这两个词，返回 0 行；语义搜索不看字面，《流浪地球》《星际穿越》这类太空题材会排在前面。
+</p>
+      </details>
+    </li>
   </ol>
 </div>
 

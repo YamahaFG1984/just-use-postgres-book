@@ -1242,11 +1242,126 @@ GROUP BY period ORDER BY period;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>用 <code>time_bucket('1 day', …)</code> 统计用户 1 在 2025 年 5 月每天的睡眠时长（提示：睡眠测量的条数 ≈ 分钟数）。</li>
-    <li>用 <code>time_bucket</code> 的 offset 参数，把每天的桶改成从早上 6 点开始，计算“从 6 点到次日 6 点”的平均心率。</li>
-    <li>创建一个按小时汇总、按活动类型分组的连续聚合，用 <code>refresh_continuous_aggregate</code> 刷新某一天，查询它。</li>
-    <li>在一个新建的测试超表上，用 <code>add_retention_policy</code> 加 7 天保留策略，插入一些 30 天前的数据，然后用 <code>SELECT * FROM timescaledb_information.jobs;</code> 查看后台任务。</li>
-    <li>把清单 9.26 的时间范围改成整个 3 月，分别只保留 B-tree 或只保留 BRIN，比较执行计划和耗时。</li>
+    <li>用 <code>time_bucket('1 day', …)</code> 统计用户 1 在 2025 年 5 月每天的睡眠时长（提示：睡眠测量的条数 ≈ 分钟数）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT time_bucket('1 day', recorded_at) AS day,
+       count(*)                          AS sleep_minutes,
+       round(count(*) / 60.0, 1)         AS sleep_hours
+FROM watch.heart_rate_measurements
+WHERE watch_id = 1 AND activity = 'sleeping'
+  AND recorded_at &gt;= '2025-05-01' AND recorded_at &lt; '2025-06-01'
+GROUP BY day
+ORDER BY day;
+</pre></div>
+<div class="code out"><pre>
+          day           | sleep_minutes | sleep_hours
+------------------------+---------------+-------------
+ 2025-05-01 00:00:00+00 |           466 |         7.8
+ 2025-05-02 00:00:00+00 |           464 |         7.7
+ 2025-05-03 00:00:00+00 |           467 |         7.8
+ …（共 31 天）
+</pre></div>
+<p>测量基本每分钟一条，偶尔漏一两分钟，所以条数略少于实际分钟数。时间桶按 UTC 的零点切分，跨过午夜的一晚会被算到两天里；想按“一晚”统计，可以看下一题的 offset。</p>
+      </details>
+    </li>
+    <li>用 <code>time_bucket</code> 的 offset 参数，把每天的桶改成从早上 6 点开始，计算“从 6 点到次日 6 点”的平均心率。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT time_bucket('1 day', recorded_at, '6 hours'::interval) AS day_from_6am,
+       AVG(heart_rate)::int AS avg_rate
+FROM watch.heart_rate_measurements
+WHERE watch_id = 1
+  AND recorded_at &gt;= '2025-05-01 06:00' AND recorded_at &lt; '2025-05-04 06:00'
+GROUP BY day_from_6am
+ORDER BY day_from_6am;
+</pre></div>
+<div class="code out"><pre>
+      day_from_6am      | avg_rate
+------------------------+----------
+ 2025-05-01 06:00:00+00 |       71
+ 2025-05-02 06:00:00+00 |       71
+ 2025-05-03 06:00:00+00 |       71
+(3 rows)
+</pre></div>
+<p>第三个参数 offset 把每个桶的起点整体平移 6 小时，于是每个桶是“当天 6:00 到次日 6:00”，一整晚的睡眠都落在同一个桶里。</p>
+      </details>
+    </li>
+    <li>创建一个按小时汇总、按活动类型分组的连续聚合，用 <code>refresh_continuous_aggregate</code> 刷新某一天，查询它。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE MATERIALIZED VIEW watch.hourly_by_activity
+WITH (timescaledb.continuous) AS
+SELECT watch_id, activity,
+       time_bucket('1 hour', recorded_at) AS bucket,
+       AVG(heart_rate)::int AS avg_rate,
+       count(*)             AS measurements
+FROM watch.heart_rate_measurements
+GROUP BY watch_id, activity, bucket
+WITH NO DATA;                        -- 先不计算，下面手动刷新一天
+
+CALL refresh_continuous_aggregate('watch.hourly_by_activity', '2025-05-01', '2025-05-02');
+
+SELECT bucket, activity, avg_rate, measurements
+FROM watch.hourly_by_activity
+WHERE watch_id = 1 ORDER BY bucket LIMIT 3;
+</pre></div>
+<div class="code out"><pre>
+         bucket         | activity | avg_rate | measurements
+------------------------+----------+----------+--------------
+ 2025-05-01 00:00:00+00 | sleeping |       57 |           57
+ 2025-05-01 01:00:00+00 | sleeping |       57 |           58
+ 2025-05-01 02:00:00+00 | sleeping |       57 |           58
+</pre></div>
+<p>刷新后视图里只有 5 月 1 日的 117 行：每块手表、每小时、该小时里出现过的每种活动各一行（3 × 24 = 72 个小时桶，有的小时里不止一种活动）。实际使用时再加 <code>add_continuous_aggregate_policy</code> 让它在后台定期刷新。</p>
+      </details>
+    </li>
+    <li>在一个新建的测试超表上，用 <code>add_retention_policy</code> 加 7 天保留策略，插入一些 30 天前的数据，然后用 <code>SELECT * FROM timescaledb_information.jobs;</code> 查看后台任务。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE public.test_metrics (ts timestamptz NOT NULL, v int);
+SELECT create_hypertable('public.test_metrics', by_range('ts', interval '1 day'));
+INSERT INTO public.test_metrics
+SELECT now() - (g || ' days')::interval, g FROM generate_series(0, 30) g;   -- 31 天、31 个 chunk
+
+SELECT add_retention_policy('public.test_metrics', drop_after =&gt; interval '7 days');   -- 返回 job_id，如 1000
+SELECT job_id, application_name, schedule_interval, proc_name, config
+FROM timescaledb_information.jobs WHERE hypertable_name = 'test_metrics';
+</pre></div>
+<div class="code out"><pre>
+ job_id |    application_name     | schedule_interval |    proc_name     |                    config
+--------+-------------------------+-------------------+------------------+----------------------------------------------
+   1000 | Retention Policy [1000] | 1 day             | policy_retention | {"drop_after": "7 days", "hypertable_id": 3}
+</pre></div>
+<div class="code" data-lang="sql"><pre>
+CALL run_job(1000);   -- 不想等一天：手动立刻执行一次（参数要写常量，不能写子查询）
+SELECT count(*) FROM public.test_metrics;   -- 31 → 8
+</pre></div>
+<p>保留策略按 chunk 整块删除超过 7 天的数据，比 DELETE 快得多，也不会留下死元组。</p>
+      </details>
+    </li>
+    <li>把清单 9.26 的时间范围改成整个 3 月，分别只保留 B-tree 或只保留 BRIN，比较执行计划和耗时。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, costs off)
+SELECT time_bucket('1 hour', recorded_at) AS period, AVG(heart_rate)::int
+FROM watch.heart_rate_measurements
+WHERE activity = 'sleeping'
+  AND recorded_at &gt;= '2025-03-01' AND recorded_at &lt; '2025-04-01'
+GROUP BY period ORDER BY period;
+</pre></div>
+<div class="tw"><table>
+<tr><th>只保留的索引</th><th>执行计划</th><th>耗时</th></tr>
+<tr><td>B-tree (recorded_at, watch_id)</td><td>两个 chunk 上各一次 Index Scan</td><td>约 34 ms</td></tr>
+<tr><td>BRIN (recorded_at)</td><td>两个 chunk 上各一次 <strong>Seq Scan</strong>（没用 BRIN）</td><td>约 24 ms</td></tr>
+<tr><td>都不要</td><td>同上，Seq Scan</td><td>约 25 ms</td></tr>
+</table></div>
+<p>
+  范围扩大到整个月，结论就变了：TimescaleDB 先做 <strong>chunk 排除</strong>，只剩下覆盖 3 月的两个 chunk，而查询要读的正是这两个 chunk 里的大部分数据。
+  这时顺序扫描比按索引逐行读更快，规划器连 BRIN 都不用。索引的价值在“窄”的时间范围（比如清单 9.26 的一天）；宽范围的分析查询，靠分区裁剪就够了。
+</p>
+      </details>
+    </li>
   </ol>
 </div>
 

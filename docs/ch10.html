@@ -350,6 +350,15 @@ docker run --name osm2pgsql --network="host" `
   <code>--network="host"</code> 让容器使用宿主机网络，从而能通过 127.0.0.1:5432 连到 Postgres 容器。
 </p>
 
+<div class="box warn">
+  <div class="t">&#9888; 补充（原书之外）：2.1.1 镜像只有 ARM 版本</div>
+  <p>
+    本站实测时发现，<code>iboates/osm2pgsql:2.1.1</code> 只发布了 arm64（Apple Silicon）版本，在普通 x86 的 Linux / Windows 机器上会报
+    <code>no matching manifest for linux/amd64</code>。这时把镜像换成 <strong><code>iboates/osm2pgsql:2.1.0</code></strong>（同时提供 amd64 和 arm64，只差一个补丁版本），其他参数不变。
+    另外，导入全州数据需要几 GB 的磁盘空间和不少内存，磁盘紧张时先用 <code>df -h</code> 确认一下。
+  </p>
+</div>
+
 <div class="code" data-lang="sql" data-file="清单 10.7 · 列出为数据集创建的表">
 <pre>
 SELECT tablename
@@ -738,7 +747,42 @@ ORDER BY distance_meters LIMIT 5;
 <figcaption>图 10-8　“附近的餐厅”= 先圈范围，再算距离</figcaption>
 </figure>
 
-<p>3857 投影下，ST_DWithin 和 ST_Distance 的单位都是米。</p>
+<p>3857 投影下，ST_DWithin 和 ST_Distance 的单位是“米”，但要注意这是<strong>墨卡托投影平面上的米</strong>：只在赤道上和地面距离相等，纬度越高被放大得越多（放大倍数 ≈ 1 / cos 纬度）。</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 补充（原书之外）：3857 里的“500 米”不是真的 500 米</div>
+  <p>
+    坦帕在北纬约 28°，cos 28° ≈ 0.883，所以 <code>ST_DWithin(…, 500)</code> 在地面上实际圈出的是半径约 <strong>442 米</strong>的范围，
+    Wagamama 的“68 米”实际约 60 米。下面的交互地图把两个圆画在一起。用 PostGIS 实测：
+  </p>
+</div>
+
+<div class="code" data-lang="sql"><pre>
+WITH p AS (
+  SELECT ST_SetSRID(ST_MakePoint(-9178356.224987695, 3242002.0503882724), 3857) AS hotel,
+         ST_SetSRID(ST_MakePoint(-9179231.997685665, 3242389.052874039), 3857) AS tampa
+)
+SELECT ST_AsText(ST_Transform(hotel, 4326)) AS hotel_lonlat,
+       round(ST_Distance(hotel, tampa)::numeric, 1) AS 墨卡托距离,
+       round(ST_Distance(ST_Transform(hotel, 4326)::geography,
+                         ST_Transform(tampa, 4326)::geography)::numeric, 1) AS 地面距离
+FROM p;
+</pre></div>
+<div class="code out"><pre>
+             hotel_lonlat              | 墨卡托距离 | 地面距离
+---------------------------------------+------------+----------
+ POINT(-82.4505768 27.944688399952422) |      957.5 |    845.7
+(1 row)
+</pre></div>
+
+<p>坦帕市中心到酒店，墨卡托距离 957.5，地面上其实只有 845.7 米，差了约 12%。要得到真实距离，像上面这样转换成 <code>geography</code> 再算（本章开头讲过，geography 在球面上计算），或者转换到当地的投影坐标系（坦帕位于 UTM 17N 带，即 EPSG:32617）。对“步行可达的餐厅”这种排序问题，3857 的误差不影响先后顺序，但不要把数字当成精确的米。</p>
+
+<figure>
+<div id="map-tampa" class="leaflet-map" role="img" aria-label="坦帕市中心和 Roost 酒店的交互地图，画出了 3857 下 500 单位的实际范围和真实 500 米的范围">
+  <noscript>交互地图需要 JavaScript。</noscript>
+</div>
+<figcaption>交互地图 10-A　蓝点是坦帕市中心，橙点是 Roost 酒店；实心圆是 <code>ST_DWithin(…, 500)</code> 在 3857 下的实际范围（≈ 442 米），虚线圆是真正的 500 米。可以拖动、缩放，点击圆点看坐标。底图 © OpenStreetMap 贡献者</figcaption>
+</figure>
 
 <h4>用坐标直接创建点</h4>
 
@@ -1375,11 +1419,139 @@ ORDER BY distance_meters LIMIT 10;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>找出迈阿密市中心（<code>name = 'Miami' AND place = 'city'</code> 的点）1 公里内所有的咖啡馆（<code>amenity = 'cafe'</code>），并生成每家的 OSM 链接。</li>
-    <li>把清单 10.17 改用 geography 计算：<code>ST_Area(ST_Transform(way, 4326)::geography)</code>，和 Web Mercator 下的 96 km² 比较 —— 差别有多大？为什么？（提示：Web Mercator 离赤道越远面积放大越多）</li>
-    <li>统计迪士尼世界六个乐园各自的面积，按大小排序。</li>
-    <li>用 <code>ST_Intersects</code> 找出穿过迪士尼世界边界的所有道路，并按 highway 类型分组计数。</li>
-    <li>在 planet_osm_point 的 way 列上再建一个 SP-GiST 索引（<code>USING spgist (way)</code>），比较它和 GiST 索引的大小，以及清单 10.26 的执行计划。</li>
+    <li>找出迈阿密市中心（<code>name = 'Miami' AND place = 'city'</code> 的点）1 公里内所有的咖啡馆（<code>amenity = 'cafe'</code>），并生成每家的 OSM 链接。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+WITH miami AS (
+  SELECT way FROM florida.planet_osm_point
+  WHERE name = 'Miami' AND place = 'city'
+)
+SELECT p.name,
+       round(ST_Distance(m.way, p.way)) AS distance,
+       'https://www.openstreetmap.org/?mlat=' || ST_Y(ST_Transform(p.way, 4326)) ||
+       '&amp;mlon=' || ST_X(ST_Transform(p.way, 4326)) AS osm_url
+FROM miami m
+JOIN florida.planet_osm_point p ON ST_DWithin(m.way, p.way, 1000)
+WHERE p.amenity = 'cafe'
+ORDER BY distance;
+</pre></div>
+<div class="code out"><pre>
+           name           | distance |                          osm_url
+--------------------------+----------+------------------------------------------------------------
+ Atlantis Cafe            |      112 | https://www.openstreetmap.org/?mlat=25.775031…&amp;mlon=-80.193948…
+ Rigattis Cafe            |      122 | https://www.openstreetmap.org/?mlat=25.773218…&amp;mlon=-80.193903…
+ Cafe Galleria            |      183 | …
+ …（共 17 家）
+</pre></div>
+<p>
+  注意本章补充里讲的问题：3857 下的 1000 在迈阿密（北纬约 26°）实际只有约 900 米。想要真正的 1 公里，用 geography：
+  <code>ST_DWithin(ST_Transform(m.way, 4326)::geography, ST_Transform(p.way, 4326)::geography, 1000)</code>，这样会找到 20 家。
+</p>
+      </details>
+    </li>
+    <li>把清单 10.17 改用 geography 计算：<code>ST_Area(ST_Transform(way, 4326)::geography)</code>，和 Web Mercator 下的 96 km² 比较 —— 差别有多大？为什么？（提示：Web Mercator 离赤道越远面积放大越多）
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT name,
+       ST_Area(way) / 1e6                                   AS km2_web_mercator,
+       ST_Area(ST_Transform(way, 4326)::geography) / 1e6    AS km2_true
+FROM florida.planet_osm_polygon
+WHERE name = 'Walt Disney World';
+</pre></div>
+<div class="code out"><pre>
+       name        | km2_web_mercator | km2_true
+-------------------+------------------+----------
+ Walt Disney World |            96.08 |    74.10
+</pre></div>
+<p>
+  真实面积约 74 km²，Web Mercator 多算了约 30%。Mercator 在纬度 φ 处把长度放大 1/cos φ 倍，面积就放大 1/cos² φ 倍：
+  迪士尼世界在北纬约 28.4°，cos² ≈ 0.774，而 74.10 / 96.08 ≈ 0.771，正好对上。离赤道越远放大越多，所以 3857 只适合画地图，不适合量面积。
+</p>
+      </details>
+    </li>
+    <li>统计迪士尼世界六个乐园各自的面积，按大小排序。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+WITH disney_world AS (
+  SELECT way AS boundaries FROM florida.planet_osm_polygon
+  WHERE name = 'Walt Disney World'
+)
+SELECT p.name,
+       round((ST_Area(ST_Transform(p.way, 4326)::geography) / 1e6)::numeric, 2) AS area_km2
+FROM florida.planet_osm_polygon AS p
+JOIN disney_world AS d ON ST_Within(p.way, d.boundaries)
+WHERE p.name IS NOT NULL
+  AND p.tourism = 'theme_park'
+  AND NOT ST_Equals(p.way, d.boundaries)
+ORDER BY area_km2 DESC;
+</pre></div>
+<div class="code out"><pre>
+            name            | area_km2
+----------------------------+----------
+ Disney's Animal Kingdom    |     1.55
+ EPCOT                      |     1.02
+ Magic Kingdom              |     0.71
+ Disney's Hollywood Studios |     0.48
+ Disney's Blizzard Beach    |     0.15
+ Disney's Typhoon Lagoon    |     0.14
+(6 rows)
+</pre></div>
+<p>在清单 10.18 的基础上加一列面积即可（这里直接用了上一题的 geography 写法，得到真实面积）。六个乐园加起来只有约 4 km²，迪士尼世界的大部分土地是酒店、高尔夫球场、道路和保护区。</p>
+      </details>
+    </li>
+    <li>用 <code>ST_Intersects</code> 找出穿过迪士尼世界边界的所有道路，并按 highway 类型分组计数。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+WITH disney_world AS (
+  SELECT way AS boundaries FROM florida.planet_osm_polygon
+  WHERE name = 'Walt Disney World'
+)
+SELECT l.highway, count(*) AS roads
+FROM florida.planet_osm_line l
+JOIN disney_world d ON ST_Intersects(l.way, ST_Boundary(d.boundaries))
+WHERE l.highway IS NOT NULL
+GROUP BY l.highway
+ORDER BY roads DESC;
+</pre></div>
+<div class="code out"><pre>
+    highway     | roads
+----------------+-------
+ service        |    12
+ motorway_link  |    10
+ secondary      |     7
+ motorway       |     6
+ footway        |     5
+ tertiary       |     4
+ …
+</pre></div>
+<p>
+  关键是 <code>ST_Boundary</code>：直接用 <code>ST_Intersects(l.way, d.boundaries)</code> 会把完全在园区<strong>里面</strong>的道路也算上；
+  和边界线（多边形的轮廓）相交，才是“穿过边界”的道路。
+</p>
+      </details>
+    </li>
+    <li>在 planet_osm_point 的 way 列上再建一个 SP-GiST 索引（<code>USING spgist (way)</code>），比较它和 GiST 索引的大小，以及清单 10.26 的执行计划。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX florida_point_way_spgist ON florida.planet_osm_point USING spgist (way);
+
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname = 'planet_osm_point';
+</pre></div>
+<div class="code out"><pre>
+       indexrelname       | pg_size_pretty
+--------------------------+----------------
+ planet_osm_point_way_idx | 11 MB        ← osm2pgsql 建的 GiST（fillfactor = 100）
+ florida_point_way_spgist | 14 MB
+</pre></div>
+<p>
+  两个索引都在时，规划器在清单 10.26 里选了 SP-GiST；删掉它再跑，就用回 GiST。两者的索引扫描都不到 1 毫秒（实测 0.5 ms 和 0.2～0.8 ms），差别可以忽略；
+  整条查询约 40 ms，时间几乎全花在按名字找 Brickell City Centre 的顺序扫描上，清单 10.25 的 name 部分索引才是这里的关键。
+  SP-GiST 适合分布很不均匀的点数据（城市密集、乡村稀疏），对多边形和线则只能用 GiST。
+</p>
+<p class="sm-src">说明：本题的大小是在只导入迈阿密和迪士尼两个区域（同一个 2025-05-01 数据文件）时测得的，导入全州数据后两个索引都会大得多，但对比关系类似。前四题的结果与全州数据一致（迪士尼世界的 3857 面积与本章清单 10.17 的 96.08 km² 完全相同）。</p>
+      </details>
+    </li>
   </ol>
 </div>
 
@@ -1387,5 +1559,48 @@ ORDER BY distance_meters LIMIT 10;
 </main>
 </div>
 <script src="assets/site.js"></script>
+<script>
+/* 交互地图 10-A：只在滚动到附近时才加载 Leaflet */
+(function () {
+  var el = document.getElementById('map-tampa');
+  if (!el) return;
+  var HOTEL = [27.944688399952422, -82.4505768], TAMPA = [27.947759499952074, -82.458444];
+  function draw() {
+    var map = L.map(el, { scrollWheelZoom: false }).setView([27.9462, -82.4545], 15);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> 贡献者'
+    }).addTo(map);
+    L.circle(HOTEL, { radius: 500, color: '#7a6f62', weight: 2, dashArray: '6 6', fill: false })
+      .addTo(map).bindTooltip('真正的 500 米');
+    L.circle(HOTEL, { radius: 441.7, color: '#d9762b', weight: 2, fillColor: '#d9762b', fillOpacity: .18 })
+      .addTo(map).bindTooltip('ST_DWithin(…, 500) 在 3857 下的实际范围 ≈ 442 米');
+    L.polyline([TAMPA, HOTEL], { color: '#2f6fb0', weight: 2, dashArray: '2 6' })
+      .addTo(map).bindTooltip('墨卡托距离 957.5 / 地面距离 845.7 米', { sticky: true });
+    L.circleMarker(TAMPA, { radius: 7, color: '#fff', weight: 2, fillColor: '#2f6fb0', fillOpacity: 1 })
+      .addTo(map).bindPopup('<b>坦帕市中心</b><br>POINT(-82.458444 27.947760)<br>3857：POINT(-9179231.998 3242389.053)');
+    L.circleMarker(HOTEL, { radius: 7, color: '#fff', weight: 2, fillColor: '#d9762b', fillOpacity: 1 })
+      .addTo(map).bindPopup('<b>Roost Apartment Hotel</b><br>POINT(-82.4505768 27.944688)<br>3857：POINT(-9178356.225 3242002.050)');
+    map.on('click', function () { map.scrollWheelZoom.enable(); });   // 点一下地图后才允许滚轮缩放，免得滚动页面时误缩放
+  }
+  function load() {
+    var css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css';
+    document.head.appendChild(css);
+    var js = document.createElement('script');
+    js.src = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js';
+    js.onload = draw;
+    js.onerror = function () { el.textContent = '地图加载失败（需要能访问 cdnjs.cloudflare.com 和 openstreetmap.org）。'; };
+    document.head.appendChild(js);
+  }
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (es) {
+      if (es[0].isIntersecting) { io.disconnect(); load(); }
+    }, { rootMargin: '400px' });
+    io.observe(el);
+  } else load();
+})();
+</script>
 </body>
 </html>

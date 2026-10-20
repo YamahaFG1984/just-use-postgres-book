@@ -472,10 +472,97 @@ FROM pizzeria.order_items;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>挑本书任意一条查询，分别用 <code>EXPLAIN</code>、<code>EXPLAIN ANALYZE</code>、<code>EXPLAIN (analyze, buffers on)</code> 执行，逐项对照图 A-1 解读输出。</li>
-    <li>对 <code>game.player_stats</code>（第 4 章）执行 <code>SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE schemaname = 'game';</code>，找出从来没被用过的索引 —— 它们就是过度索引的候选。</li>
-    <li>对第 8 章的 <code>omdb.movies</code> 比较 <code>SELECT *</code> 和 <code>SELECT id, name</code> 的 <code>EXPLAIN (analyze)</code> 输出中的 width，体会 1024 维向量列有多“重”。</li>
-    <li>用你熟悉的语言写一个小程序，分别用“每次新建连接”和“连接池”执行 1000 次简单查询，比较总耗时。</li>
+    <li>挑本书任意一条查询，分别用 <code>EXPLAIN</code>、<code>EXPLAIN ANALYZE</code>、<code>EXPLAIN (analyze, buffers on)</code> 执行，逐项对照图 A-1 解读输出。
+      <details class="answer"><summary>参考答案</summary>
+<p>以第 4 章清单 4.7 为例（先按第 4 章建好 idx_region_score_win_count）：</p>
+<div class="code" data-lang="sql"><pre>
+EXPLAIN
+SELECT username, region, score, win_count FROM game.player_stats
+WHERE region = 'NA' AND score &gt; 5000 AND win_count &gt; 10;
+
+EXPLAIN ANALYZE
+SELECT …;                    -- 同一条查询
+
+EXPLAIN (analyze, buffers on)
+SELECT …;
+</pre></div>
+<p>
+  三者的区别：<code>EXPLAIN</code> 只有估算（cost、rows、width），查询并不执行；<code>ANALYZE</code> 真的执行一遍，多出 actual time、实际 rows 和 loops，可以和估算对比，差得多说明统计信息不准；
+  <code>buffers</code> 再加上读了多少页（shared hit 来自缓存，read 来自磁盘或系统缓存）。注意 ANALYZE 会真的执行，对 UPDATE / DELETE 用它时记得放在事务里再 ROLLBACK。
+</p>
+      </details>
+    </li>
+    <li>对 <code>game.player_stats</code>（第 4 章）执行 <code>SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE schemaname = 'game';</code>，找出从来没被用过的索引 —— 它们就是过度索引的候选。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE schemaname = 'game'
+ORDER BY idx_scan, indexrelname;
+</pre></div>
+<p>
+  idx_scan 是这个索引自统计重置以来被扫描的次数，为 0 的就是候选。但要注意三点：
+  主键和唯一约束的索引即使 idx_scan = 0 也<strong>不能删</strong>，它们在保证约束（每次插入都要检查）；
+  统计是从上次 <code>pg_stat_reset()</code> 或建库以来累计的，刚建的索引、只在月底报表用的索引也可能是 0；
+  有只读副本时，副本上的使用情况要去副本上查。确认没用后再 <code>DROP INDEX CONCURRENTLY</code>。
+</p>
+      </details>
+    </li>
+    <li>对第 8 章的 <code>omdb.movies</code> 比较 <code>SELECT *</code> 和 <code>SELECT id, name</code> 的 <code>EXPLAIN (analyze)</code> 输出中的 width，体会 1024 维向量列有多“重”。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze) SELECT * FROM omdb.movies;
+--  Seq Scan on movies  (cost=0.00..220.24 rows=4224 width=304) (actual time=0.007..0.536 rows=4224 loops=1)
+EXPLAIN (analyze) SELECT id, name FROM omdb.movies;
+--  Seq Scan on movies  (cost=0.00..220.24 rows=4224 width=24)  (actual time=0.005..0.454 rows=4224 loops=1)
+</pre></div>
+<p>
+  width 从 24 字节变成 304 字节，但两条查询的执行时间几乎一样，这是个陷阱：1024 维向量（约 4 KB）太大，被 TOAST 存到了表外，
+  EXPLAIN ANALYZE 只扫描表本身，既不取出 TOAST 里的数据，也不把结果发给客户端。Postgres 17 新增的 <code>SERIALIZE</code> 选项能把这部分算进来：
+</p>
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, serialize, costs off) SELECT * FROM omdb.movies;
+--  Serialization: time=139.983 ms  output=53843kB  format=text
+--  Execution Time: 141.080 ms
+EXPLAIN (analyze, serialize, costs off) SELECT id, name FROM omdb.movies;
+--  Serialization: time=0.441 ms  output=127kB  format=text
+--  Execution Time: 1.449 ms
+</pre></div>
+<p>在 psql 里用 <code>\timing</code> 实际跑一遍：<code>SELECT *</code> 约 200 ms、返回 55 MB；<code>SELECT id, name</code> 约 2.5 ms、95 KB。差了约 80 倍，这就是 A.4 节“只查询真正需要的”的意义。</p>
+      </details>
+    </li>
+    <li>用你熟悉的语言写一个小程序，分别用“每次新建连接”和“连接池”执行 1000 次简单查询，比较总耗时。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="python"><pre>
+import time, psycopg
+from psycopg_pool import ConnectionPool
+DSN = "postgresql://postgres:password@localhost:5432/postgres"
+N = 1000
+
+t = time.perf_counter()
+for _ in range(N):
+    with psycopg.connect(DSN) as conn:           # 每次新建连接
+        conn.execute("SELECT 1").fetchone()
+new_conn = time.perf_counter() - t
+
+with ConnectionPool(DSN, min_size=1, max_size=4, open=True) as pool:
+    pool.wait()
+    t = time.perf_counter()
+    for _ in range(N):
+        with pool.connection() as conn:         # 从池里借已经建好的连接
+            conn.execute("SELECT 1").fetchone()
+    pooled = time.perf_counter() - t
+
+print(f"每次新建连接: {new_conn:.2f} s；连接池: {pooled:.2f} s")
+</pre></div>
+<div class="code out"><pre>
+每次新建连接: 7.39 s（平均 7.39 ms/次）
+连接池:       0.19 s（平均 0.19 ms/次）
+快了约 39 倍
+</pre></div>
+<p>每次新建连接都要经过 TCP 握手、密码认证（这里是 SCRAM，本身就要做几千次哈希）、Postgres 新起一个进程；查询本身只占零头。各语言的写法见<a href="topic-app.html#pool">专题 5</a>。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

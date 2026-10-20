@@ -1918,11 +1918,91 @@ CREATE TABLE test (id int);
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>给 <code>customers.accounts.email</code> 加一个 <code>UNIQUE</code> 约束，然后尝试插入一个邮箱重复的顾客，观察报错。</li>
-    <li>在一个显式事务里先 <code>DELETE FROM products.reviews;</code>，查询确认评论没了，然后执行 <code>ROLLBACK;</code>，再查一次 —— 评论回来了吗？</li>
-    <li>调用 <code>sales.order_checkout(1)</code>（Alice 没有购物车），观察 <code>RAISE EXCEPTION</code> 的效果。</li>
-    <li>给 Jake 的店加一件库存只有 1 的商品，让两位顾客都把它加入购物车，依次结账，看第二个人会遇到什么。</li>
-    <li>为咖啡店的顾客创建一个只读角色 <code>coffee_chain_reader</code>：只能 <code>SELECT</code> products 模式里的表，然后用它登录验证。</li>
+    <li>给 <code>customers.accounts.email</code> 加一个 <code>UNIQUE</code> 约束，然后尝试插入一个邮箱重复的顾客，观察报错。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE customers.accounts ADD CONSTRAINT accounts_email_key UNIQUE (email);
+
+INSERT INTO customers.accounts (name, email, passwd_hash)
+VALUES ('Bob Clone', 'bob.smith@example.com', md5('x'));
+</pre></div>
+<div class="code out"><pre>
+ERROR:  duplicate key value violates unique constraint "accounts_email_key"
+DETAIL:  Key (email)=(bob.smith@example.com) already exists.
+</pre></div>
+<p>加 UNIQUE 约束时 Postgres 会自动建一个唯一索引。如果表里已经有重复的邮箱，ALTER TABLE 本身就会失败，要先清理数据。</p>
+      </details>
+    </li>
+    <li>在一个显式事务里先 <code>DELETE FROM products.reviews;</code>，查询确认评论没了，然后执行 <code>ROLLBACK;</code>，再查一次 —— 评论回来了吗？
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+BEGIN;
+DELETE FROM products.reviews;            -- DELETE 1
+SELECT count(*) FROM products.reviews;   -- 0：事务内已经看不到了
+ROLLBACK;
+SELECT count(*) FROM products.reviews;   -- 1：评论回来了
+</pre></div>
+<p>回来了。事务提交之前的修改都可以撤销，其他会话在此期间也一直能看到那条评论（读已提交看不到未提交的删除）。</p>
+      </details>
+    </li>
+    <li>调用 <code>sales.order_checkout(1)</code>（Alice 没有购物车），观察 <code>RAISE EXCEPTION</code> 的效果。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM sales.order_checkout(1);
+</pre></div>
+<div class="code out"><pre>
+ERROR:  No pending order found for customer 1
+CONTEXT:  PL/pgSQL function sales.order_checkout(integer) line 13 at RAISE
+</pre></div>
+<p><code>RAISE EXCEPTION</code> 让函数立刻以错误结束，调用它的语句（以及所在的事务）也随之失败。应用拿到的就是一个普通的 SQL 错误，可以提示用户“购物车是空的”。</p>
+      </details>
+    </li>
+    <li>给 Jake 的店加一件库存只有 1 的商品，让两位顾客都把它加入购物车，依次结账，看第二个人会遇到什么。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+-- category 只能是 coffee / mug / t-shirt（CHECK 约束），这里加一只限量杯子
+INSERT INTO products.catalog (name, description, category, price, stock_quantity)
+VALUES ('Limited Edition Mug', 'Only one left', 'mug', 29.00, 1) RETURNING id;   -- 6
+
+SELECT * FROM sales.order_add_item(customer_id_param => 2, product_id_param => 6, quantity_param => 1);
+SELECT * FROM sales.order_add_item(customer_id_param => 3, product_id_param => 6, quantity_param => 1);
+
+SELECT * FROM sales.order_checkout(2);   -- Bob 先结账：成功，库存变成 0
+SELECT * FROM sales.order_checkout(3);   -- Charlie 后结账
+</pre></div>
+<div class="code out"><pre>
+ERROR:  new row for relation "catalog" violates check constraint "catalog_stock_quantity_check"
+DETAIL:  Failing row contains (6, Limited Edition Mug, Only one left, mug, 29.00, -1).
+CONTEXT:  SQL statement "UPDATE products.catalog
+    SET stock_quantity = stock_quantity - oi.quantity …
+</pre></div>
+<p>
+  加入购物车时并不检查库存，所以两个人都能放进去；结账扣库存时，Charlie 会让库存变成 −1，被清单 2.1 建表时定义的 <code>CHECK (stock_quantity &gt;= 0)</code> 拦下。
+  整个函数在一个事务里执行，所以 Charlie 的订单状态没有被改成 ordered，仍然是 pending。库存约束在这里成了最后一道防线。
+</p>
+      </details>
+    </li>
+    <li>为咖啡店的顾客创建一个只读角色 <code>coffee_chain_reader</code>：只能 <code>SELECT</code> products 模式里的表，然后用它登录验证。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE ROLE coffee_chain_reader WITH LOGIN PASSWORD 'password';
+GRANT CONNECT ON DATABASE coffee_chain TO coffee_chain_reader;
+GRANT USAGE ON SCHEMA products TO coffee_chain_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA products TO coffee_chain_reader;
+</pre></div>
+<div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U coffee_chain_reader -d coffee_chain
+</pre></div>
+<div class="code out"><pre>
+SELECT count(*) FROM products.catalog;            -- 正常返回
+UPDATE products.catalog SET price = 1 WHERE id = 1;
+ERROR:  permission denied for table catalog
+SELECT count(*) FROM customers.accounts;
+ERROR:  permission denied for schema customers
+</pre></div>
+<p>只授予了 products 模式的 USAGE 和 SELECT：能读商品，不能改，也看不到顾客表。注意 <code>ON ALL TABLES</code> 只对<strong>现有</strong>的表生效，以后新建的表要再授权，或者用 <code>ALTER DEFAULT PRIVILEGES</code>。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

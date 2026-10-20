@@ -1246,11 +1246,99 @@ WHERE pizza ? 'special_instructions';
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>统计每种饼底（crust）的订单数和平均价格（price），按订单数从多到少排列。</li>
-    <li>用 <code>jsonb_path_query</code> 找出最受欢迎的蔬菜配料（参考清单 5.8）。</li>
-    <li>用 <code>jsonb_set</code> 的第四个参数 <code>true</code>，给 order_id = 1 的所有披萨加上 <code>"special_instructions": "cut into 8 slices"</code>，然后再运行本章最后那条 <code>?</code> 查询。</li>
-    <li>用 <code>jsonb_agg</code> 和 <code>jsonb_build_object</code> 把 order_id = 100 的三个披萨组装成一个 JSON 数组，形如 <code>[{"item": 1, "type": "margherita", "price": …}, …]</code>。</li>
-    <li>删掉 jsonb_path_ops 索引，对比 <code>@&gt;</code> 查询在默认 GIN 和没有 GIN 两种情况下的执行时间。</li>
+    <li>统计每种饼底（crust）的订单数和平均价格（price），按订单数从多到少排列。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT pizza->>'crust'       AS crust,
+       count(*)              AS orders,
+       round(avg(price), 2)  AS avg_price
+FROM pizzeria.order_items
+GROUP BY crust
+ORDER BY orders DESC;
+</pre></div>
+<div class="code out"><pre>
+    crust    | orders | avg_price
+-------------+--------+-----------
+ regular     |    751 |     12.57
+ gluten_free |    749 |     12.52
+ stuffed     |    719 |     12.55
+ thin        |    719 |     12.38
+(4 rows)
+</pre></div>
+<p>要用 <code>-&gt;&gt;</code> 取出文本再分组；用 <code>-&gt;</code> 得到的是 jsonb，分组也能用，但显示出来会带引号。</p>
+      </details>
+    </li>
+    <li>用 <code>jsonb_path_query</code> 找出最受欢迎的蔬菜配料（参考清单 5.8）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT count(*) AS total_cnt,
+       jsonb_object_keys(
+         jsonb_path_query(pizza, '$.toppings.veggies[*]')
+       ) AS veggie_topping
+FROM pizzeria.order_items
+GROUP BY veggie_topping
+ORDER BY total_cnt DESC;
+</pre></div>
+<div class="code out"><pre>
+ total_cnt | veggie_topping
+-----------+----------------
+      1251 | tomato
+       680 | onion
+       129 | bell_pepper
+       121 | spinach
+       108 | mushroom
+(5 rows)
+</pre></div>
+<p>把清单 5.8 路径里的 <code>cheese</code> 换成 <code>veggies</code> 即可。番茄遥遥领先，因为玛格丽特披萨默认就带番茄。</p>
+      </details>
+    </li>
+    <li>用 <code>jsonb_set</code> 的第四个参数 <code>true</code>，给 order_id = 1 的所有披萨加上 <code>"special_instructions": "cut into 8 slices"</code>，然后再运行本章最后那条 <code>?</code> 查询。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+UPDATE pizzeria.order_items
+SET pizza = jsonb_set(pizza, '{special_instructions}', '"cut into 8 slices"', true)
+WHERE order_id = 1;
+-- UPDATE 5
+
+SELECT count(*) FROM pizzeria.order_items WHERE pizza ? 'special_instructions';
+-- 5（修改前是 0）
+</pre></div>
+<p>第四个参数 <code>create_if_missing</code> 为 true 时，路径不存在就新建这个键；为 false 时，不存在的路径会被忽略，数据原样不变。注意第三个参数必须是合法的 JSON，所以字符串要写成 <code>'"…"'</code>。</p>
+      </details>
+    </li>
+    <li>用 <code>jsonb_agg</code> 和 <code>jsonb_build_object</code> 把 order_id = 100 的三个披萨组装成一个 JSON 数组，形如 <code>[{"item": 1, "type": "margherita", "price": …}, …]</code>。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT jsonb_agg(
+         jsonb_build_object('item', order_item_id, 'type', pizza->>'type', 'price', price)
+         ORDER BY order_item_id
+       ) AS pizzas
+FROM pizzeria.order_items
+WHERE order_id = 100;
+</pre></div>
+<div class="code out"><pre>
+[{"item": 1, "type": "margherita", "price": 11.01}, {"item": 2, "type": "custom", "price": 10.10}, {"item": 3, "type": "pepperoni", "price": 11.68}]
+</pre></div>
+<p>jsonb_build_object 把每一行变成一个对象，jsonb_agg 再把多行聚合成数组；聚合函数里的 ORDER BY 决定数组里元素的顺序。</p>
+      </details>
+    </li>
+    <li>删掉 jsonb_path_ops 索引，对比 <code>@&gt;</code> 查询在默认 GIN 和没有 GIN 两种情况下的执行时间。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+DROP INDEX pizzeria.idx_pizza_orders_paths_ops_gin;
+EXPLAIN (analyze, costs off) SELECT count(*) FROM pizzeria.order_items WHERE pizza @> '{"type": "custom"}';
+--  Bitmap Index Scan on idx_pizza_orders_gin …   Execution Time: 0.346 ms
+
+DROP INDEX pizzeria.idx_pizza_orders_gin;
+EXPLAIN (analyze, costs off) SELECT count(*) FROM pizzeria.order_items WHERE pizza @> '{"type": "custom"}';
+--  Seq Scan on order_items …                    Execution Time: 0.610 ms
+</pre></div>
+<p>
+  默认 GIN 和 jsonb_path_ops 速度几乎一样（实测 0.35 ms 和 0.33 ms），没有 GIN 时约 0.6 ms。差距不大，是因为这张表只有 2938 行、816 kB，全表扫描本来就很快。
+  索引的价值随数据量增长：表大几百倍时，顺序扫描的时间也会跟着涨几百倍，而索引查找几乎不变。
+</p>
+      </details>
+    </li>
   </ol>
 </div>
 

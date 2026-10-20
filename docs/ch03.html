@@ -1097,11 +1097,132 @@ ORDER BY song_rank;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>用 CTE 找出“听歌总时长最长的用户”，并显示他的名字（需要 join <code>streaming.users</code>）。</li>
-    <li>修改清单 3.9，让结果每个序列只返回<strong>一行</strong>：起始播放 id、歌曲数量、总时长（提示：在主语句里对 <code>sequence[1]</code> 分组）。</li>
-    <li>把清单 3.14 的 <code>RANK()</code> 分别换成 <code>ROW_NUMBER()</code> 和 <code>DENSE_RANK()</code>，人为制造两首总时长相同的歌，比较三者的区别。</li>
-    <li>用 <code>LAG(play_start_time) OVER (PARTITION BY user_id ORDER BY play_start_time)</code> 计算每位用户两次播放之间的时间间隔。</li>
-    <li>用 <code>EXPLAIN</code> 对比清单 3.11（自连接）和清单 3.12（窗口函数）的执行计划，数一数各扫描了 plays 表几次。</li>
+    <li>用 CTE 找出“听歌总时长最长的用户”，并显示他的名字（需要 join <code>streaming.users</code>）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+WITH user_totals AS (
+  SELECT user_id, sum(play_duration) AS total_duration
+  FROM streaming.plays
+  GROUP BY user_id
+)
+SELECT u.name, t.total_duration
+FROM user_totals t
+JOIN streaming.users u ON u.id = t.user_id
+ORDER BY t.total_duration DESC
+LIMIT 1;
+</pre></div>
+<div class="code out"><pre>
+  name   | total_duration
+---------+----------------
+ Charlie |           2873
+(1 row)
+</pre></div>
+      </details>
+    </li>
+    <li>修改清单 3.9，让结果每个序列只返回<strong>一行</strong>：起始播放 id、歌曲数量、总时长（提示：在主语句里对 <code>sequence[1]</code> 分组）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+WITH RECURSIVE play_sequence(parent_id, sequence, total_duration) AS (
+    SELECT id, ARRAY[id], play_duration
+    FROM streaming.plays
+    WHERE played_after IS NULL          -- 所有序列的第一首（只看一个序列就保留 id = 5）
+    UNION ALL
+    SELECT p.id, ps.sequence || p.id, total_duration + p.play_duration
+    FROM streaming.plays p
+    JOIN play_sequence ps ON p.played_after = ps.parent_id
+)
+SELECT sequence[1]                AS start_play_id,
+       max(cardinality(sequence)) AS songs,
+       max(total_duration)        AS total_duration
+FROM play_sequence
+GROUP BY sequence[1]
+ORDER BY start_play_id;
+</pre></div>
+<div class="code out"><pre>
+ start_play_id | songs | total_duration
+---------------+-------+----------------
+             1 |     4 |            754
+             5 |     4 |            403
+             9 |     4 |            625
+            13 |     5 |            920
+           …（共 13 个序列）
+</pre></div>
+<p>递归每走一步就产生一行“到目前为止的序列”，所以同一个序列有多行。按起点 <code>sequence[1]</code> 分组后，最长的数组和最大的累计时长就是整个序列的结果。id = 5 的序列是 4 首、403 秒，和清单 3.9 的最后一行一致。</p>
+      </details>
+    </li>
+    <li>把清单 3.14 的 <code>RANK()</code> 分别换成 <code>ROW_NUMBER()</code> 和 <code>DENSE_RANK()</code>，人为制造两首总时长相同的歌，比较三者的区别。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+BEGIN;   -- 在事务里做实验，最后回滚，不改动数据集
+-- 歌曲 7 总时长 798，歌曲 1 是 706：给歌曲 1 补一次 92 秒的播放，两者打平
+INSERT INTO streaming.plays (id, user_id, song_id, play_start_time, play_duration)
+VALUES (1000, 1, 1, now(), 92);
+
+SELECT song_id, SUM(play_duration) AS total,
+       RANK()       OVER (ORDER BY SUM(play_duration) DESC) AS rank,
+       DENSE_RANK() OVER (ORDER BY SUM(play_duration) DESC) AS dense_rank,
+       ROW_NUMBER() OVER (ORDER BY SUM(play_duration) DESC) AS row_number
+FROM streaming.plays
+GROUP BY song_id
+ORDER BY total DESC, song_id
+LIMIT 5;
+ROLLBACK;
+</pre></div>
+<div class="code out"><pre>
+ song_id | total | rank | dense_rank | row_number
+---------+-------+------+------------+------------
+       4 |  1200 |    1 |          1 |          1
+       1 |   798 |    2 |          2 |          2
+       7 |   798 |    2 |          2 |          3
+       2 |   654 |    4 |          3 |          4
+       9 |   463 |    5 |          4 |          5
+(5 rows)
+</pre></div>
+<p>并列时 RANK 同为 2、下一名跳到 4；DENSE_RANK 同为 2、下一名是 3；ROW_NUMBER 照样编 2、3。注意并列的两行谁拿 2 谁拿 3 是不确定的，想固定就在 OVER 的 ORDER BY 里再加一列，如 <code>ORDER BY SUM(play_duration) DESC, song_id</code>。</p>
+      </details>
+    </li>
+    <li>用 <code>LAG(play_start_time) OVER (PARTITION BY user_id ORDER BY play_start_time)</code> 计算每位用户两次播放之间的时间间隔。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT user_id, id, play_start_time,
+       play_start_time - LAG(play_start_time)
+         OVER (PARTITION BY user_id ORDER BY play_start_time) AS gap
+FROM streaming.plays
+ORDER BY user_id, play_start_time;
+</pre></div>
+<div class="code out"><pre>
+ user_id | id |   play_start_time   |   gap
+---------+----+---------------------+----------
+       1 |  5 | 2024-09-15 01:34:00 |
+       1 |  6 | 2024-09-15 01:37:30 | 00:03:30
+       1 |  7 | 2024-09-15 01:42:00 | 00:04:30
+       1 |  8 | 2024-09-15 01:45:00 | 00:03:00
+       1 |  1 | 2024-09-15 12:14:00 | 10:29:00
+       …
+</pre></div>
+<p>每个用户的第一次播放没有“上一次”，LAG 返回 NULL。两个时间戳相减得到 interval。</p>
+      </details>
+    </li>
+    <li>用 <code>EXPLAIN</code> 对比清单 3.11（自连接）和清单 3.12（窗口函数）的执行计划，数一数各扫描了 plays 表几次。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (costs off) SELECT DISTINCT p.song_id, p.user_id, t.total_duration …;   -- 清单 3.11
+EXPLAIN (costs off) WITH plays_with_total AS (…) SELECT DISTINCT …;           -- 清单 3.12
+</pre></div>
+<div class="code out"><pre>
+清单 3.11（自连接）                         清单 3.12（窗口函数）
+ Unique                                      Sort
+   ->  Sort                                    ->  HashAggregate
+         ->  Hash Join                               ->  WindowAgg
+               ->  Seq Scan on plays p                     ->  Sort
+               ->  Hash                                          ->  Seq Scan on plays
+                     ->  Subquery Scan on t
+                           ->  HashAggregate
+                                 ->  Seq Scan on plays
+</pre></div>
+<p>自连接扫描了 plays 两次（一次算总和、一次取明细再连接），窗口函数只扫描一次。表越大，这个差别越明显。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

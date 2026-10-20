@@ -532,11 +532,147 @@ COPY:        0.09s       约快 20 倍
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>用你熟悉的语言连接第 1 章的数据库，查询第 2 章的 <code>sales.products</code> 中库存最少的 5 个商品。</li>
-    <li>写一个“注册用户”函数，邮箱重复时捕获 23505，返回友好的提示，而不是抛出 500 错误。</li>
-    <li>把本页的 <code>run_serializable</code> 改成 node-postgres 版本，用两个并发的 Promise 测试它。</li>
-    <li>把 Python 连接池的 max_size 设为 2，同时启动 5 个线程各执行 <code>SELECT pg_sleep(1)</code>，观察总耗时，理解“请求在池里排队”。</li>
-    <li>用 COPY 把一个 CSV 文件导入 Postgres，并和逐行 INSERT 比较耗时。</li>
+    <li>用你熟悉的语言连接第 1 章的数据库，查询第 2 章的 <code>products.catalog</code> 中库存最少的 5 个商品。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="python"><pre>
+import psycopg
+DSN = "postgresql://postgres:password@localhost:5432/coffee_chain"
+
+with psycopg.connect(DSN) as conn:
+    for name, stock in conn.execute(
+        "SELECT name, stock_quantity FROM products.catalog ORDER BY stock_quantity LIMIT 5"
+    ):
+        print(name, stock)
+</pre></div>
+<div class="code out"><pre>
+Sunrise Brew Co. T-Shirt 24
+Morning Glory 76
+Sunrise Brew Co. Mug 99
+Sunrise Blend 195
+</pre></div>
+<p>第 2 章的数据只有 4 个商品，所以只返回 4 行。注意连的是 <code>coffee_chain</code> 库，不是默认的 postgres 库。</p>
+      </details>
+    </li>
+    <li>写一个“注册用户”函数，邮箱重复时捕获 23505，返回友好的提示，而不是抛出 500 错误。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="python"><pre>
+from psycopg import errors
+
+def register(conn, name, email, passwd_hash):
+    try:
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO customers.accounts (name, email, passwd_hash) VALUES (%s, %s, %s)",
+                (name, email, passwd_hash),
+            )
+        return {"ok": True}
+    except errors.UniqueViolation:            # SQLSTATE 23505
+        return {"ok": False, "error": "这个邮箱已经注册过了"}
+
+# 前提：email 列上有唯一约束（第 2 章练习 1）
+print(register(conn, "Dana", "dana@example.com", "…"))     # {'ok': True}
+print(register(conn, "Dana 2", "dana@example.com", "…"))   # {'ok': False, 'error': '这个邮箱已经注册过了'}
+</pre></div>
+<p>不要先 SELECT 查“邮箱存在吗”再 INSERT：两个请求同时注册会都查到“不存在”。让唯一约束来裁决，捕获 23505 就是最可靠的写法。</p>
+      </details>
+    </li>
+    <li>把本页的 <code>run_serializable</code> 改成 node-postgres 版本，用两个并发的 Promise 测试它。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="js"><pre>
+import pg from 'pg';
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+const sleep = ms =&gt; new Promise(r =&gt; setTimeout(r, ms));
+
+async function runSerializable(fn, retries = 5) {
+  for (let attempt = 1; attempt &lt;= retries; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK');
+      if ((e.code === '40001' || e.code === '40P01') &amp;&amp; attempt &lt; retries) {
+        console.log(`  第 ${attempt} 次失败（${e.code}），重试`);
+        await sleep(50 * attempt);
+        continue;
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+async function withdraw(client, amount) {
+  const { rows } = await client.query('SELECT balance FROM accounts WHERE id = 1');
+  await sleep(200);                                   // 模拟耗时的业务逻辑
+  const next = Number(rows[0].balance) - amount;      // numeric 返回的是字符串
+  await client.query('UPDATE accounts SET balance = $1 WHERE id = 1', [next]);
+  return next;
+}
+
+const results = await Promise.all([10, 20].map(a =&gt; runSerializable(c =&gt; withdraw(c, a))));
+console.log('结果', results);
+</pre></div>
+<div class="code out"><pre>
+  第 1 次失败（40001），重试
+结果 [ 90, 70 ]
+最终余额 70
+</pre></div>
+<p>COMMIT 也可能抛出 40001（串行化冲突有时在提交时才被发现），所以 COMMIT 也要放在 try 里，这里的写法已经覆盖了。</p>
+      </details>
+    </li>
+    <li>把 Python 连接池的 max_size 设为 2，同时启动 5 个线程各执行 <code>SELECT pg_sleep(1)</code>，观察总耗时，理解“请求在池里排队”。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="python"><pre>
+import time, threading
+from psycopg_pool import ConnectionPool
+
+with ConnectionPool(DSN, min_size=2, max_size=2, open=True) as pool:
+    pool.wait()
+    def work():
+        with pool.connection() as c:
+            c.execute("SELECT pg_sleep(1)")
+    t = time.perf_counter()
+    threads = [threading.Thread(target=work) for _ in range(5)]
+    for x in threads: x.start()
+    for x in threads: x.join()
+    print(f"{time.perf_counter() - t:.2f} s")      # 3.01 s
+</pre></div>
+<p>5 个请求只有 2 个连接：第一批 2 个、第二批 2 个、最后 1 个，各 1 秒，总共约 3 秒。请求在池里排队，数据库同时只处理 2 个查询。等待超过 <code>timeout</code>（默认 30 秒）还借不到连接，psycopg_pool 会抛出 PoolTimeout。</p>
+      </details>
+    </li>
+    <li>用 COPY 把一个 CSV 文件导入 Postgres，并和逐行 INSERT 比较耗时。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="python"><pre>
+import csv, time, psycopg
+
+with psycopg.connect(DSN) as conn:
+    conn.execute("CREATE TABLE items_copy (name text, price numeric, stock int)")
+    conn.execute("CREATE TABLE items_insert (name text, price numeric, stock int)")
+
+    t = time.perf_counter()
+    with open('items.csv') as f, conn.cursor() as cur:
+        with cur.copy("COPY items_copy (name, price, stock) FROM STDIN WITH (FORMAT csv, HEADER)") as copy:
+            while data := f.read(65536):
+                copy.write(data)                    # 原样把文件内容流给服务器
+    print(f"COPY:        {time.perf_counter() - t:.2f} s")
+
+    t = time.perf_counter()
+    with open('items.csv') as f, conn.cursor() as cur:
+        for row in list(csv.reader(f))[1:]:
+            cur.execute("INSERT INTO items_insert VALUES (%s, %s, %s)", row)
+    print(f"逐行 INSERT: {time.perf_counter() - t:.2f} s")
+</pre></div>
+<div class="code out"><pre>
+COPY:        0.04 s
+逐行 INSERT: 7.20 s       （10 万行的 CSV）
+</pre></div>
+<p>逐行 INSERT 每一行都要一次网络往返；COPY 一次把整个文件流过去，由服务器批量解析写入。在 psql 里也可以直接 <code>\copy items_copy FROM 'items.csv' CSV HEADER</code>。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

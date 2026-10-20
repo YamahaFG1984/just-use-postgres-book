@@ -1,0 +1,119 @@
+# 《Just Use Postgres》教程的一键环境
+#
+# 每一章用的镜像不同，又都占用 5432 端口，所以按“profile”分组，一次只启动一组：
+#
+#   docker compose --profile core up -d        # 第 1～7 章、附录、补充专题 2～6
+#   docker compose --profile pgvector up -d    # 第 8 章（Postgres + pgvector + Ollama）
+#   docker compose --profile timescale up -d   # 第 9 章
+#   docker compose --profile postgis up -d     # 第 10 章
+#   docker compose --profile pgmq up -d        # 第 11 章
+#   docker compose --profile zh up -d --build  # 补充专题 1：中文全文搜索（首次需要构建镜像）
+#
+#   docker compose --profile core down          # 停掉并删除容器（数据卷保留）
+#
+# 容器名、数据卷名和教程里的 docker run 命令完全一致，所以教程中的
+# docker exec -it postgres psql -U postgres 等命令可以原样使用。
+#
+# 额外的便利：仓库的 data/ 目录以只读方式挂载到容器的 /data，导入数据集时可以省掉 docker cp：
+#   docker exec -it postgres psql -U postgres -c "\i /data/streaming/streaming_ddl.sql"
+#
+# 5432 端口被占用时，换一个宿主机端口：PG_PORT=5433 docker compose --profile core up -d
+
+x-postgres: &postgres
+  environment:
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: password
+  ports:
+    - "${PG_PORT:-5432}:5432"
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
+services:
+  postgres:
+    <<: *postgres
+    profiles: [core]
+    image: postgres:17.2
+    container_name: postgres
+    volumes:
+      - postgres-volume:/var/lib/postgresql/data
+      - ./data:/data:ro
+
+  postgres-pgvector:
+    <<: *postgres
+    profiles: [pgvector]
+    image: pgvector/pgvector:0.8.0-pg17
+    container_name: postgres-pgvector
+    volumes:
+      - postgres-pgvector-volume:/var/lib/postgresql/data
+      - ./data:/data:ro
+
+  ollama:
+    profiles: [pgvector]
+    image: ollama/ollama:0.5.11
+    container_name: ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-volume:/root/.ollama
+    # 模型需要手动下载一次：
+    #   docker exec -it ollama ollama pull mxbai-embed-large:335m
+    #   docker exec -it ollama ollama pull tinyllama
+
+  postgres-timescale:
+    <<: *postgres
+    profiles: [timescale]
+    image: timescale/timescaledb:2.19.2-pg17
+    container_name: postgres-timescale
+    volumes:
+      - postgres-timescale-volume:/var/lib/postgresql/data
+      - ./data:/data:ro
+
+  postgres-postgis:
+    <<: *postgres
+    profiles: [postgis]
+    image: postgis/postgis:17-3.5
+    container_name: postgres-postgis
+    # Apple Silicon（M 系列芯片）的 Mac 上没有原生镜像，取消下一行的注释：
+    # platform: linux/amd64
+    volumes:
+      - postgres-postgis-volume:/var/lib/postgresql/data
+      - ./data:/data:ro
+
+  postgres-pgmq:
+    <<: *postgres
+    profiles: [pgmq]
+    image: ghcr.io/pgmq/pg17-pgmq:v1.5.1
+    container_name: postgres-pgmq
+    volumes:
+      - postgres-pgmq-volume:/var/lib/postgresql/data
+      - ./data:/data:ro
+
+  postgres-zh:
+    <<: *postgres
+    profiles: [zh]
+    build: extras/zhparser
+    image: postgres-zhparser:17
+    container_name: postgres-zh
+    volumes:
+      - postgres-zh-volume:/var/lib/postgresql/data
+      - ./data:/data:ro
+
+# name 固定为教程里的卷名：之前按教程手动创建过的卷会被直接复用
+volumes:
+  postgres-volume:
+    name: postgres-volume
+  postgres-pgvector-volume:
+    name: postgres-pgvector-volume
+  ollama-volume:
+    name: ollama-volume
+  postgres-timescale-volume:
+    name: postgres-timescale-volume
+  postgres-postgis-volume:
+    name: postgres-postgis-volume
+  postgres-pgmq-volume:
+    name: postgres-pgmq-volume
+  postgres-zh-volume:
+    name: postgres-zh-volume

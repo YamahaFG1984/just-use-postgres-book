@@ -1032,11 +1032,119 @@ SELECT msg_id, message FROM pgmq.a_visitors_queue;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>开两个 psql 会话，都执行 <code>BEGIN; SELECT * FROM mq.dequeue(1);</code>（先不提交），确认两人拿到的是不同的消息。再把函数里的 <code>SKIP LOCKED</code> 去掉重做一次，观察第二个会话的表现。</li>
-    <li>给 mq.queue 加一列 <code>processing_started_at</code>，修改 dequeue 在出队时写入当前时间，再写一条 SQL 把超过 1 分钟仍在 processing 的消息重置为 new。</li>
-    <li>修改清单 11.5，让 <code>pg_notify</code> 的 payload 带上新消息的 id（提示：<code>INSERT … RETURNING id INTO 变量</code>）。</li>
-    <li>用 <code>pgmq.send</code> 的 delay 参数发一条 30 秒后才可见的消息，验证在此之前 read 不到它。</li>
-    <li>反复 read 同一条消息（每次等 vt 过期），观察 <code>read_ct</code> 列的变化。想一想：怎样利用它实现“失败超过 3 次就移入死信队列”？</li>
+    <li>开两个 psql 会话，都执行 <code>BEGIN; SELECT * FROM mq.dequeue(1);</code>（先不提交），确认两人拿到的是不同的消息。再把函数里的 <code>SKIP LOCKED</code> 去掉重做一次，观察第二个会话的表现。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+-- 会话 A                                    -- 会话 B（随后执行）
+BEGIN;                                       BEGIN;
+SELECT msg_id, message FROM mq.dequeue(1);   SELECT msg_id, message FROM mq.dequeue(1);
+--  1 | {"visitor" : 1}                      --  2 | {"visitor" : 2}      立刻返回，拿到下一条
+</pre></div>
+<p>把函数里的 <code>SKIP LOCKED</code> 去掉（只留 <code>FOR UPDATE</code>）再做一次：</p>
+<div class="code out"><pre>
+会话 B：SELECT msg_id FROM mq.dequeue(1);
+ msg_id
+--------
+      4
+Time: 2005.405 ms     ← 一直卡住，直到会话 A 提交（实验里 A 3 秒后提交）
+</pre></div>
+<p>没有 SKIP LOCKED 时，B 会排队等 A 释放行锁；A 提交后，那条消息已经不是 new 了，B 才继续找到下一条。消费者越多，排队越严重，多个消费者实际上变成了串行处理。</p>
+      </details>
+    </li>
+    <li>给 mq.queue 加一列 <code>processing_started_at</code>，修改 dequeue 在出队时写入当前时间，再写一条 SQL 把超过 1 分钟仍在 processing 的消息重置为 new。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE mq.queue ADD COLUMN processing_started_at timestamptz;
+
+CREATE OR REPLACE FUNCTION mq.dequeue(messages_cnt INT)
+RETURNS TABLE (msg_id BIGINT, message JSON, enqueued_at TIMESTAMPTZ) AS $$
+BEGIN
+  RETURN QUERY
+  WITH new_messages AS (
+     SELECT id FROM mq.queue
+     WHERE status = 'new' ORDER BY created_at
+     FOR UPDATE SKIP LOCKED
+     LIMIT messages_cnt
+  )
+  UPDATE mq.queue q
+  SET status = 'processing',
+      processing_started_at = now()          -- 新增：记下开始处理的时间
+  FROM new_messages WHERE q.id = new_messages.id
+  RETURNING q.id, q.message, date_trunc('seconds', q.created_at) AS created_at;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 处理超过 1 分钟还没完成的（消费者可能崩溃了），放回队列
+UPDATE mq.queue
+SET status = 'new', processing_started_at = NULL
+WHERE status = 'processing'
+  AND processing_started_at &lt; now() - interval '1 minute'
+RETURNING id;
+</pre></div>
+<p>这条重置语句可以用 pg_cron 每分钟跑一次。这其实就是 pgmq 的“可见性超时”（vt）在做的事：超时没删除的消息会自动重新可见。</p>
+      </details>
+    </li>
+    <li>修改清单 11.5，让 <code>pg_notify</code> 的 payload 带上新消息的 id（提示：<code>INSERT … RETURNING id INTO 变量</code>）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE OR REPLACE FUNCTION mq.enqueue(new_message JSON)
+RETURNS VOID AS $$
+DECLARE
+  new_id BIGINT;
+BEGIN
+  INSERT INTO mq.queue (message) VALUES (new_message)
+  RETURNING id INTO new_id;
+
+  PERFORM pg_notify('queue_new_message', new_id::text);   -- payload 只能是文本
+END;
+$$ LANGUAGE plpgsql;
+
+LISTEN queue_new_message;
+SELECT mq.enqueue('{"visitor": 99}');
+</pre></div>
+<div class="code out"><pre>
+Asynchronous notification "queue_new_message" with payload "6" received from server process with PID 283.
+</pre></div>
+<p>payload 最长约 8000 字节，所以一般只传 id，监听者收到后再按 id 查完整的消息。</p>
+      </details>
+    </li>
+    <li>用 <code>pgmq.send</code> 的 delay 参数发一条 30 秒后才可见的消息，验证在此之前 read 不到它。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT pgmq.send(queue_name =&gt; 'visitors_queue', msg =&gt; '{"task": "later"}', delay =&gt; 30);
+
+SELECT msg_id, read_ct, enqueued_at, vt FROM pgmq.q_visitors_queue;   -- vt = 入队时间 + 30 秒
+SELECT * FROM pgmq.read('visitors_queue', 10, 1);   -- 30 秒内：(0 rows)
+-- 等 30 秒后再读：
+SELECT msg_id, read_ct, message FROM pgmq.read('visitors_queue', 10, 1);
+--  msg_id | read_ct |      message
+--       1 |       1 | {"task": "later"}
+</pre></div>
+<p>delay 的原理就是把消息的 vt（可见时间）设到未来，read 只返回 vt 已过的消息。用它可以实现“30 分钟后提醒”这类延时任务。</p>
+      </details>
+    </li>
+    <li>反复 read 同一条消息（每次等 vt 过期），观察 <code>read_ct</code> 列的变化。想一想：怎样利用它实现“失败超过 3 次就移入死信队列”？
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+-- vt = 2 秒，每次等 vt 过期再读同一条消息
+SELECT msg_id, read_ct FROM pgmq.read('visitors_queue', 2, 1);   -- read_ct = 2
+SELECT msg_id, read_ct FROM pgmq.read('visitors_queue', 2, 1);   -- read_ct = 3
+SELECT msg_id, read_ct FROM pgmq.read('visitors_queue', 2, 1);   -- read_ct = 4
+</pre></div>
+<p>每被读一次 read_ct 加 1。消费者读到消息后先看 read_ct：超过 3 次说明它反复处理失败，就转进一个死信队列并从原队列删除（放在同一个事务里，保证不会丢也不会重复）：</p>
+<div class="code" data-lang="sql"><pre>
+SELECT pgmq.create('visitors_queue_dlq');
+
+BEGIN;
+-- 假设刚读到的消息 msg_id = 1、read_ct = 5
+SELECT pgmq.send('visitors_queue_dlq',
+                 jsonb_build_object('original_id', 1, 'read_ct', 5, 'payload', '{"task": "later"}'::jsonb));
+SELECT pgmq.delete('visitors_queue', 1);
+COMMIT;
+</pre></div>
+<p>之后可以单独查看、修复死信队列里的消息，而不会让一条“毒消息”一直卡住正常的处理。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

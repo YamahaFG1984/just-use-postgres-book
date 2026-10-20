@@ -149,6 +149,28 @@ cd just-use-postgres-book
 
 <p>以后每章加载数据的方式都一样：<code>docker cp</code> 把数据目录复制进容器，再用 psql 的 <code>\i</code> 执行里面的 SQL 脚本。</p>
 
+<div class="box tip">
+  <div class="t">&#128161; 懒人方式：docker compose</div>
+  <p>
+    本站所在的仓库根目录有一个 <a href="https://github.com/YamahaFG1984/just-use-postgres-book/blob/main/docker-compose.yml">docker-compose.yml</a>，
+    把上图所有容器按章节分组成 profile，容器名、卷名都和教程一致。克隆<a href="https://github.com/YamahaFG1984/just-use-postgres-book">这个仓库</a>后：
+  </p>
+</div>
+
+<div class="code" data-lang="bash"><pre>
+docker compose --profile core up -d        # 第 1～7 章、附录、补充专题 2～6
+docker compose --profile pgvector up -d    # 第 8 章（含 Ollama）
+docker compose --profile timescale up -d   # 第 9 章
+docker compose --profile postgis up -d     # 第 10 章
+docker compose --profile pgmq up -d        # 第 11 章
+docker compose --profile zh up -d --build  # 专题 1：中文全文搜索
+
+docker compose --profile core down         # 换章节前先停掉上一组（数据卷会保留）
+
+# 仓库的 data/ 目录已挂载到容器的 /data，可以省掉 docker cp：
+docker exec -it postgres psql -U postgres -c "\i /data/streaming/streaming_ddl.sql"
+</pre></div>
+
 <h2 id="how">怎么用这套教程</h2>
 
 <ul>

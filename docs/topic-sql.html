@@ -660,11 +660,116 @@ HINT:  The transaction might succeed if retried.
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>用 ON CONFLICT 实现一个“页面访问计数器”：<code>page_views(path PRIMARY KEY, views int)</code>，每次访问 +1。开两个会话各执行 1000 次，确认总数正好是 2000。</li>
-    <li>给 bookings 表再加一条规则：每个预订不能超过 4 小时（提示：<code>CHECK (upper(during) - lower(during) &lt;= interval '4 hours')</code>）。</li>
-    <li>用 <code>daterange</code> 和排他约束实现“同一间酒店客房不能被重复预订”，并查询 6 月 3 日哪些房间是空的。</li>
-    <li>复现本页的死锁，然后按“先锁 id 小的”改写，确认不再死锁。</li>
-    <li>用你熟悉的语言写一个带重试的转账函数：在 SERIALIZABLE 下运行，捕获 40001 后最多重试 3 次。</li>
+    <li>用 ON CONFLICT 实现一个“页面访问计数器”：<code>page_views(path PRIMARY KEY, views int)</code>，每次访问 +1。开两个会话各执行 1000 次，确认总数正好是 2000。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE page_views (path text PRIMARY KEY, views int NOT NULL DEFAULT 0);
+
+-- 每次访问执行一次（两个会话各执行 1000 次）
+INSERT INTO page_views (path, views) VALUES ('/home', 1)
+ON CONFLICT (path) DO UPDATE SET views = page_views.views + 1;
+
+SELECT * FROM page_views;
+--  path  | views
+--  /home |  2000
+</pre></div>
+<p>
+  本站用两个 psql 同时各执行 1000 条这样的语句，结果正好是 2000。ON CONFLICT 的 UPDATE 在行锁下基于最新值加一，既不会丢失计数，第一次插入时两个会话撞车也不会报主键冲突。
+  如果改成应用里“先 SELECT 读出次数、加一、再 UPDATE 写回”，就会出现<a href="#locks">丢失更新</a>。
+</p>
+      </details>
+    </li>
+    <li>给 bookings 表再加一条规则：每个预订不能超过 4 小时（提示：<code>CHECK (upper(during) - lower(during) &lt;= interval '4 hours')</code>）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+ALTER TABLE bookings ADD CONSTRAINT max_4_hours
+  CHECK (upper(during) - lower(during) &lt;= interval '4 hours');
+
+INSERT INTO bookings (room, during) VALUES ('A101', '[2025-06-01 14:00, 2025-06-01 19:00)');
+-- ERROR:  new row for relation "bookings" violates check constraint "max_4_hours"
+</pre></div>
+<p>但实测发现一个漏洞：上界不写的范围（“从 14:00 起一直订下去”）能插进去：</p>
+<div class="code" data-lang="sql"><pre>
+INSERT INTO bookings (room, during) VALUES ('A101', '[2025-06-01 14:00,)');
+-- INSERT 0 1
+</pre></div>
+<p>
+  因为无上界时 <code>upper(during)</code> 是 NULL，整个表达式是 NULL，而 <strong>CHECK 约束只拒绝 false，NULL 算通过</strong>。更严谨的写法：
+</p>
+<div class="code" data-lang="sql"><pre>
+CHECK (NOT upper_inf(during) AND NOT lower_inf(during)
+       AND upper(during) - lower(during) &lt;= interval '4 hours')
+</pre></div>
+      </details>
+    </li>
+    <li>用 <code>daterange</code> 和排他约束实现“同一间酒店客房不能被重复预订”，并查询 6 月 3 日哪些房间是空的。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE rooms (no text PRIMARY KEY);
+INSERT INTO rooms VALUES ('201'), ('202'), ('203');
+
+CREATE TABLE stays (
+  id serial PRIMARY KEY,
+  room text NOT NULL REFERENCES rooms,
+  nights daterange NOT NULL,                       -- [入住日, 退房日)
+  EXCLUDE USING gist (room WITH =, nights WITH &amp;&amp;)
+);
+INSERT INTO stays (room, nights) VALUES
+  ('201', '[2025-06-01, 2025-06-04)'),             -- 住 6/1、6/2、6/3 三晚
+  ('202', '[2025-06-04, 2025-06-06)');
+
+INSERT INTO stays (room, nights) VALUES ('201', '[2025-06-03, 2025-06-05)');   -- ✗ 冲突
+INSERT INTO stays (room, nights) VALUES ('201', '[2025-06-04, 2025-06-05)');   -- ✓ 前一位 6/4 退房，当天可以入住
+
+-- 6 月 3 日晚上哪些房间空着
+SELECT r.no FROM rooms r
+WHERE NOT EXISTS (SELECT 1 FROM stays s WHERE s.room = r.no AND s.nights @&gt; date '2025-06-03')
+ORDER BY r.no;
+--  202
+--  203
+</pre></div>
+<p>daterange 默认左闭右开，正好对应“入住日到退房日”：退房当天不算住，下一位客人可以当天入住。</p>
+      </details>
+    </li>
+    <li>复现本页的死锁，然后按“先锁 id 小的”改写，确认不再死锁。
+      <details class="answer"><summary>参考答案</summary>
+<p>本站用两个会话同时执行“1 → 2 转账”和“2 → 1 转账”。不排序时，必然有一方收到 <code>ERROR:  deadlock detected</code>；改成先按 id 顺序把两行都锁住：</p>
+<div class="code" data-lang="sql"><pre>
+-- 两个会话都先执行这一句（不管谁转给谁）
+BEGIN;
+SELECT id FROM accounts WHERE id IN (1, 2) ORDER BY id FOR UPDATE;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;   -- 另一个会话是 id = 2
+UPDATE accounts SET balance = balance + 10 WHERE id = 2;   -- 另一个会话是 id = 1
+COMMIT;
+</pre></div>
+<p>后来的会话会在第一句 SELECT 上等待（而不是先拿到一行再等另一行），两笔转账都成功，余额和预期一致。等待不会形成环，所以不会死锁。</p>
+      </details>
+    </li>
+    <li>用你熟悉的语言写一个带重试的转账函数：在 SERIALIZABLE 下运行，捕获 40001 后最多重试 3 次。
+      <details class="answer"><summary>参考答案</summary>
+<p>Python 版本（思路同<a href="topic-app.html#errors">专题 5</a> 里实测过的 run_serializable）：</p>
+<div class="code" data-lang="python"><pre>
+import time, psycopg
+from psycopg import errors
+
+def transfer(dsn, src, dst, amount, retries=3):
+    for attempt in range(1, retries + 1):
+        try:
+            with psycopg.connect(dsn) as conn:
+                conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE
+                with conn.transaction():
+                    conn.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amount, src))
+                    conn.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amount, dst))
+                return True
+        except (errors.SerializationFailure, errors.DeadlockDetected):   # 40001 / 40P01
+            if attempt == retries:
+                raise
+            time.sleep(0.05 * attempt)       # 退避一下再重来
+</pre></div>
+<p>要点：重试的是整个事务；只对 40001、40P01 这类“重来可能成功”的错误重试，余额不足这类业务错误不要重试；重试之间稍等片刻，避免再次撞车。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

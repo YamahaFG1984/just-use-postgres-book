@@ -602,11 +602,98 @@ EXPLAIN ANALYZE SELECT count(*) FROM notes;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>按本页步骤建好 notes 表，然后故意用 postgres 身份测试策略，体会“为什么策略好像没生效”。</li>
-    <li>给 notes 增加一条策略：<code>app.role</code> 为 <code>'admin'</code> 时可以看到本租户已归档的笔记（提示：再写一条针对归档的宽松策略，或者修改 hide_archived 的条件）。</li>
-    <li>建一张 <code>users(tenant_id, email)</code> 表，分别用 <code>UNIQUE (email)</code> 和 <code>UNIQUE (tenant_id, email)</code> 测试，观察跨租户插入同一个 email 时的区别。</li>
-    <li>写一个 <code>notes_summary</code> 视图统计每个租户的笔记数，分别在有、没有 <code>security_invoker</code> 时用 app_user 查询它。</li>
-    <li>用你熟悉的语言写一个请求处理函数：开启事务 → <code>set_config('app.tenant_id', $1, true)</code> → 查询 → 提交（可参考<a href="topic-app.html">专题 5</a>）。</li>
+    <li>按本页步骤建好 notes 表，然后故意用 postgres 身份测试策略，体会“为什么策略好像没生效”。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+RESET ROLE;                      -- 回到 postgres
+SET app.tenant_id = '1';
+SELECT count(*) FROM notes;      -- 所有租户的行都返回了，好像策略“没生效”
+SELECT current_user, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user;
+--  postgres | t | t
+</pre></div>
+<p>postgres 是超级用户（也是表的所有者），超级用户永远绕过 RLS，FORCE ROW LEVEL SECURITY 也管不了它。测试策略一定要 <code>SET ROLE app_user</code> 或者直接用应用角色登录（见本页“谁不受 RLS 约束”）。</p>
+      </details>
+    </li>
+    <li>给 notes 增加一条策略：<code>app.role</code> 为 <code>'admin'</code> 时可以看到本租户已归档的笔记（提示：再写一条针对归档的宽松策略，或者修改 hide_archived 的条件）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+ALTER POLICY hide_archived ON notes
+  USING (NOT archived OR current_setting('app.role', true) = 'admin');
+
+SET ROLE app_user;
+BEGIN;
+SET LOCAL app.tenant_id = '2';
+SELECT id, title, archived FROM notes ORDER BY id;     -- 看不到已归档的“新书上架”
+SET LOCAL app.role = 'admin';
+SELECT id, title, archived FROM notes ORDER BY id;     -- 看到了，而且仍然只有租户 2 的行
+COMMIT;
+</pre></div>
+<div class="code out"><pre>
+ id |    title     | archived
+----+--------------+----------
+  3 | 盘点库存     | f
+  4 | 新书上架     | t       ← app.role = 'admin' 后才出现
+  6 | 书店的新笔记 | f
+</pre></div>
+<p>hide_archived 是限制策略，和租户策略之间是 AND，所以管理员也只能看到本租户的归档笔记。和租户 ID 一样，app.role 必须由服务器根据登录信息设置，不能来自请求参数。</p>
+      </details>
+    </li>
+    <li>建一张 <code>users(tenant_id, email)</code> 表，分别用 <code>UNIQUE (email)</code> 和 <code>UNIQUE (tenant_id, email)</code> 测试，观察跨租户插入同一个 email 时的区别。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE users (id serial PRIMARY KEY, tenant_id int NOT NULL, email text NOT NULL, UNIQUE (email));
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY users_tenant ON users
+  USING (tenant_id = nullif(current_setting('app.tenant_id', true), '')::int);
+-- （GRANT 给 app_user 的语句省略）
+
+-- 租户 1 注册了 boss@example.com；然后以租户 2 的身份：
+SELECT count(*) FROM users WHERE email = 'boss@example.com';   -- 0，看不到
+INSERT INTO users (tenant_id, email) VALUES (2, 'boss@example.com');
+-- ERROR:  duplicate key value violates unique constraint "users_email_key"
+</pre></div>
+<p>
+  查询看不到这行，插入却报“重复”，租户 2 由此得知这个邮箱在别的租户里存在。（开启了 RLS 的表，Postgres 会特意省略错误里的 DETAIL，不显示冲突的键值，但“冲突了”这件事本身已经泄露了信息。）
+  改成 <code>UNIQUE (tenant_id, email)</code> 之后，同一个邮箱可以在不同租户里各注册一次，插入成功，也就没有泄露。
+</p>
+      </details>
+    </li>
+    <li>写一个 <code>notes_summary</code> 视图统计每个租户的笔记数，分别在有、没有 <code>security_invoker</code> 时用 app_user 查询它。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE VIEW notes_summary AS
+  SELECT tenant_id, count(*) AS notes FROM notes GROUP BY tenant_id;    -- 以 postgres 身份创建
+GRANT SELECT ON notes_summary TO app_user;
+
+SET ROLE app_user;
+BEGIN; SET LOCAL app.tenant_id = '2';
+SELECT count(*) FROM notes_summary;      -- 1000：所有租户的统计都看到了 ✗
+COMMIT;
+RESET ROLE;
+
+ALTER VIEW notes_summary SET (security_invoker = true);
+SET ROLE app_user;
+BEGIN; SET LOCAL app.tenant_id = '2';
+SELECT * FROM notes_summary;             -- 只有 2 | 503 ✓
+COMMIT;
+</pre></div>
+<p>没有 security_invoker 时，视图以所有者 postgres 的身份读表，绕过了 RLS；加上之后按查询者 app_user 的身份检查策略，连限制策略（隐藏归档）也一起生效了，所以是 503 而不是 504。</p>
+      </details>
+    </li>
+    <li>用你熟悉的语言写一个请求处理函数：开启事务 → <code>set_config('app.tenant_id', $1, true)</code> → 查询 → 提交（可参考<a href="topic-app.html">专题 5</a>）。
+      <details class="answer"><summary>参考答案</summary>
+<p>Python 版本，和<a href="topic-app.html#pool">专题 5</a> 里实测过的写法一样：</p>
+<div class="code" data-lang="python"><pre>
+def handle_list_notes(pool, session_user):
+    tenant_id = session_user.tenant_id          # 来自服务器端验证过的登录信息
+    with pool.connection() as conn:
+        with conn.transaction():
+            conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+            return conn.execute("SELECT id, title FROM notes ORDER BY id").fetchall()
+</pre></div>
+<p>三个要点：每个请求一个事务；set_config 的第三个参数为 true（等同于 SET LOCAL），事务结束自动清除；租户 ID 绝不能直接取自 URL 或请求体。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

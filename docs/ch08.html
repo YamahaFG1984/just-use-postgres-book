@@ -1137,6 +1137,11 @@ COMMIT;
 
 <p>按仓库 <code>ai_samples/README.md</code> 的说明，用 Ollama 在本地部署这两个模型：</p>
 
+<div class="box tip">
+  <div class="t">&#128161; 不想装 Ollama？</div>
+  <p>本章前面的相似度搜索和索引实验<strong>完全不需要 Ollama</strong>，嵌入已经预先算好放在数据集里了。只有“为新句子生成嵌入”和 RAG 的“生成回答”两步需要模型，替代做法见本章末尾的<a href="#no-ollama">补充：不装 Ollama 的做法</a>。</p>
+</div>
+
 <div class="code" data-lang="bash" data-file="ai_samples/README.md · 启动 Ollama 并下载模型">
 <pre>
 docker volume create ollama-volume
@@ -1437,6 +1442,138 @@ for row in cursor.fetchall():
   <li><strong>基于 Postgres pgvector 的 ChatGPT 插件</strong>：从一个用 LLM + pgvector + Spring AI 的 RAG 应用开始，加入让 AI 按用户提示执行操作（比如管理“想看”清单）的能力，最后做成插件发布到 OpenAI 市场。（<a href="https://youtu.be/4vz02j9wvDc">视频</a> · <a href="https://github.com/dmagda/openai-gpt-plugin-pgvector">代码</a>）</li>
 </ul>
 
+<h2 id="no-ollama">补充：不装 Ollama 的做法</h2>
+
+<p>本节是原书之外的补充。先分清楚本章哪些步骤真的需要模型：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="本章三类操作分别需要什么：搜索预先算好的嵌入不需要模型；新句子要用同一个嵌入模型；RAG 生成回答需要一个 LLM">
+  <rect class="bx-g" x="14" y="20" width="236" height="150" rx="10"/>
+  <text class="ttl on-g" x="132" y="46" text-anchor="middle">① 搜索数据集里的句子</text>
+  <text class="sm" x="28" y="74">phrases_dictionary 里的短语</text>
+  <text class="sm" x="28" y="94">嵌入已经预先算好</text>
+  <text class="sm" x="28" y="124">本章的距离运算、IVFFlat、</text>
+  <text class="sm" x="28" y="144">HNSW 实验都属于这一类</text>
+  <text class="sm on-g b" x="132" y="196" text-anchor="middle">不需要任何模型</text>
+
+  <rect class="bx-a" x="262" y="20" width="236" height="150" rx="10"/>
+  <text class="ttl on-a" x="380" y="46" text-anchor="middle">② 用新句子搜索</text>
+  <text class="sm" x="276" y="74">要先把新句子变成向量</text>
+  <text class="sm b" x="276" y="98">必须用和数据集相同的模型</text>
+  <text class="sm" x="276" y="118">mxbai-embed-large（1024 维）</text>
+  <text class="sm" x="276" y="144">否则向量没有可比性</text>
+  <text class="sm on-a b" x="380" y="196" text-anchor="middle">Ollama → 可换成 fastembed</text>
+
+  <rect class="bx-p" x="510" y="20" width="236" height="150" rx="10"/>
+  <text class="ttl on-p" x="628" y="46" text-anchor="middle">③ RAG：生成回答</text>
+  <text class="sm" x="524" y="74">把检索到的电影交给 LLM</text>
+  <text class="sm" x="524" y="94">由它组织成自然语言回答</text>
+  <text class="sm" x="524" y="124">任何聊天模型都可以，</text>
+  <text class="sm" x="524" y="144">和嵌入模型无关</text>
+  <text class="sm on-p b" x="628" y="196" text-anchor="middle">TinyLlama → 可换成云端 LLM</text>
+  <text class="sm" x="380" y="236" text-anchor="middle">如果连嵌入模型也想换（比如改用云端嵌入 API），就要把 4224 部电影的嵌入全部重新生成</text>
+</svg>
+<figcaption>图 8-补　三类操作，各需要什么</figcaption>
+</figure>
+
+<h3>新句子的嵌入：用 fastembed 在 Python 里直接跑同一个模型</h3>
+
+<p>
+  <a href="https://github.com/qdrant/fastembed">fastembed</a> 用 ONNX Runtime 在 CPU 上运行嵌入模型，不需要 Ollama、Docker 或 GPU，<code>pip install</code> 就能用。
+  它支持 <code>mixedbread-ai/mxbai-embed-large-v1</code>，就是 Ollama 里 <code>mxbai-embed-large</code> 的同一个模型，所以生成的向量能直接和数据集里的嵌入比较：
+</p>
+
+<div class="code" data-lang="bash"><pre>
+pip install fastembed "psycopg[binary]"
+</pre></div>
+
+<div class="code" data-lang="python"><pre>
+# search_without_ollama.py
+import psycopg
+from fastembed import TextEmbedding
+
+# 第一次运行会下载模型（约 1.3 GB），之后从缓存加载
+model = TextEmbedding("mixedbread-ai/mxbai-embed-large-v1")
+
+def embed(text):
+    vec = next(iter(model.embed([text])))
+    return "[" + ",".join(str(float(x)) for x in vec) + "]"   # pgvector 的文本格式
+
+phrase = "A team of superheroes come together to save the world"
+with psycopg.connect("postgresql://postgres:password@localhost:5432/postgres") as conn:
+    rows = conn.execute(
+        "SELECT name FROM omdb.movies ORDER BY movie_embedding <=> %s::vector LIMIT 3",
+        (embed(phrase),),
+    ).fetchall()
+    for (name,) in rows:
+        print(name)
+</pre></div>
+
+<p>本站拿数据集自带的 4 个短语做了对比：用同一个模型在本地生成向量，和数据集里由 Ollama 生成的向量逐一比较，再分别做相似度搜索：</p>
+
+<div class="tw"><table>
+<tr><th>短语</th><th>与数据集向量的余弦相似度</th><th>前 5 名相同的电影</th></tr>
+<tr><td>May the force be with you</td><td>0.991</td><td>4 / 5</td></tr>
+<tr><td>A movie about a Jedi who fights against the dark side of the force</td><td>0.993</td><td>4 / 5</td></tr>
+<tr><td>A pirate captain who sails the seven seas in search of treasure</td><td>0.992</td><td>5 / 5</td></tr>
+<tr><td>A clown fish who gets lost in the ocean and tries to find his way home</td><td>0.988</td><td>4 / 5</td></tr>
+</table></div>
+
+<p>
+  四个短语的前两名完全一致，差别只在第 4、5 名这种距离本来就很接近的位置。用新句子搜索也符合直觉：
+  “A team of superheroes come together to save the world”返回 <em>The Incredibles</em>、<em>X-Men</em>、<em>Heroes</em>；“dinosaurs”返回三部《侏罗纪公园》。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 关于这组数字</div>
+  <p>
+    受测试机内存所限（完整精度的模型加载时内存占用超过 1.3 GB，测试机放不下），上表用的是同一模型仓库里的 <strong>int8 量化版</strong>（<code>onnx/model_quantized.onnx</code>），
+    搜索结果是用 numpy 在数据集的 4224 个电影向量上按余弦距离排序得到的，和 pgvector 的 <code>&lt;=&gt;</code> 是同一种计算。
+    量化会带来少量误差，用 fastembed 默认的完整精度模型，结果只会和数据集更接近。内存小于 2 GB 的机器，也可以直接用 onnxruntime 加载量化版。
+  </p>
+</div>
+
+<h3>RAG 的生成部分：换成云端 LLM</h3>
+
+<p>
+  RAG 里负责“组织语言”的 LLM 和嵌入模型是两回事，可以独立替换。把 <code>rag.ipynb</code> 里的 <code>answer_question</code> 换成调用任意云端聊天模型即可，检索部分（<code>retrieve_context_from_postgres</code>）不用动。以 Anthropic 的 Python SDK 为例：
+</p>
+
+<div class="code" data-lang="python"><pre>
+# pip install anthropic   需要在环境变量 ANTHROPIC_API_KEY 里配置 API Key
+import anthropic
+
+client = anthropic.Anthropic()
+
+def answer_question(question, context):
+    prompt = f"""You're a movie expert. Answer the user's question using ONLY the movies in the context.
+If the context is not enough, say so instead of making things up.
+
+Question: {question}
+Context (title, vote average, budget, revenue, release date, description):
+{context}"""
+    msg = client.messages.create(
+        model="claude-haiku-5-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return msg.content[0].text
+</pre></div>
+
+<p>
+  这段代码没有在本站实测（需要付费的 API Key），用 OpenAI 等其他服务时写法类似。
+  云端大模型比 TinyLlama 强得多，上文提到的“对《聚魂棺》的描述完全是错的”这类问题会少很多，但仍要在提示词里要求它只依据上下文回答。
+  另外要意识到：<strong>检索到的上下文会发送给第三方服务</strong>，涉及私有数据时要先确认是否允许。
+</p>
+
+<h3>如果连嵌入模型也要换</h3>
+
+<p>
+  想改用云端嵌入 API（如 OpenAI 的 <code>text-embedding-3-small</code>，或 Anthropic 推荐的 Voyage AI），记住一条：<strong>查询向量和数据向量必须来自同一个模型</strong>。不同模型的向量空间互不相通，维数也往往不同。
+  所以要先 <code>ALTER TABLE omdb.movies ALTER COLUMN movie_embedding TYPE vector(新维数)</code>（旧数据维数不符时要先清空该列），
+  再按 <a href="#repo">embeddings_generator.ipynb</a> 的循环，用新模型把 4224 部电影的嵌入全部重新生成，索引也要重建。
+</p>
+
 <h2 id="summary">小结</h2>
 
 <ul>
@@ -1450,11 +1587,117 @@ for row in cursor.fetchall():
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>用字典表里的另外两个短语（海盗船长、迷路的小丑鱼）做相似度搜索，看看结果是否符合直觉。</li>
-    <li>把清单 8.5 的 <code>&lt;=&gt;</code> 换成 <code>&lt;-&gt;</code>（欧氏距离）和 <code>&lt;#&gt;</code>（负内积），比较结果顺序。为什么对归一化的向量，三者排序基本一致？</li>
-    <li>用不同的 <code>lists</code>（比如 1、5、20、65）重建 IVFFlat 索引，配合不同的 <code>ivfflat.probes</code>，记录召回结果和耗时。</li>
-    <li>用 <code>pg_relation_size</code> 比较 IVFFlat 和 HNSW 索引的大小。</li>
-    <li>（需要 Ollama）运行 rag.ipynb，把问题换成“推荐几部关于恐龙的电影”，并尝试修改提示词，让 LLM 只基于上下文回答、不要编造。</li>
+    <li>用字典表里的另外两个短语（海盗船长、迷路的小丑鱼）做相似度搜索，看看结果是否符合直觉。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+WITH phrase AS (
+  SELECT omdb.get_embedding('A pirate captain who sails the seven seas in search of treasure') AS e
+)
+SELECT name, m.movie_embedding &lt;=&gt; p.e AS distance
+FROM omdb.movies m, phrase p
+ORDER BY distance LIMIT 3;
+</pre></div>
+<div class="code out"><pre>
+                          name                           | distance
+---------------------------------------------------------+----------
+ Pirates of the Caribbean: Dead Man's Chest              |   0.3091
+ Pirates of  the Caribbean: The Curse of the Black Pearl |   0.3516
+ 20,000 Leagues Under the Sea                            |   0.3718
+
+-- 'A clown fish who gets lost in the ocean and tries to find his way home'
+ Finding Nemo |   0.3569
+ Little Fish  |   0.3943
+ Djúpið       |   0.4486
+</pre></div>
+<p>都很符合直觉：两部《加勒比海盗》、《海底总动员》排第一。描述越具体，距离越小，结果也越准，这和清单 8.7 的结论一致。</p>
+      </details>
+    </li>
+    <li>把清单 8.5 的 <code>&lt;=&gt;</code> 换成 <code>&lt;-&gt;</code>（欧氏距离）和 <code>&lt;#&gt;</code>（负内积），比较结果顺序。为什么对归一化的向量，三者排序基本一致？
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+WITH p AS (SELECT omdb.get_embedding('May the force be with you') AS e)
+SELECT name,
+       movie_embedding &lt;=&gt; e AS cosine,
+       movie_embedding &lt;-&gt; e AS l2,
+       movie_embedding &lt;#&gt; e AS neg_inner
+FROM omdb.movies, p
+ORDER BY movie_embedding &lt;=&gt; e LIMIT 3;
+</pre></div>
+<div class="code out"><pre>
+                    name                    | cosine |   l2   | neg_inner
+--------------------------------------------+--------+--------+-----------
+ Star Wars: Episode VI - Return of the Jedi | 0.3926 | 0.8861 |   -0.6074
+ The Acolyte                                | 0.4038 | 0.8987 |   -0.5962
+ On Your Mark                               | 0.4117 | 0.9074 |   -0.5883
+</pre></div>
+<p>
+  分别按三种运算符取前 10 名，顺序<strong>完全相同</strong>。因为 mxbai-embed-large 输出的向量都已归一化（<code>vector_norm</code> 全是 1.0000）。
+  对长度为 1 的向量：内积就等于余弦相似度，所以 <code>&lt;#&gt;</code> = −cos = 余弦距离 − 1；欧氏距离满足 L2² = 2 − 2·cos（验算：0.8861² ≈ 0.7852 = 2 × 0.3926）。
+  三者都是余弦距离的单调函数，排序必然一致。这种情况下用 <code>&lt;#&gt;</code> 计算量最小。
+</p>
+      </details>
+    </li>
+    <li>用不同的 <code>lists</code>（比如 1、5、20、65）重建 IVFFlat 索引，配合不同的 <code>ivfflat.probes</code>，记录召回结果和耗时。
+      <details class="answer"><summary>参考答案</summary>
+<p>对字典里 4 个短语分别取前 10 名，和精确搜索（不用索引）的结果比较，召回率 = 找对的个数 / 40；耗时是平均每次查询：</p>
+<div class="code" data-lang="sql"><pre>
+DROP INDEX IF EXISTS omdb.ivf;
+CREATE INDEX ivf ON omdb.movies USING ivfflat (movie_embedding vector_cosine_ops) WITH (lists = 20);
+SET ivfflat.probes = 5;
+SELECT id FROM omdb.movies ORDER BY movie_embedding &lt;=&gt; (…短语的嵌入…) LIMIT 10;
+</pre></div>
+<div class="tw"><table>
+<tr><th>lists</th><th>probes</th><th>召回率</th><th>每次查询</th></tr>
+<tr><td>1</td><td>1</td><td>1.000</td><td>约 22 ms（规划器不用这个索引，直接全表扫描）</td></tr>
+<tr><td>5</td><td>1 / 2 / 5</td><td>0.575 / 0.800 / 1.000</td><td>1.1 / 1.8 / 4.0 ms</td></tr>
+<tr><td>20</td><td>1 / 2 / 5 / 10</td><td>0.450 / 0.675 / 0.875 / 0.950</td><td>0.4 / 0.5 / 1.1 / 2.0 ms</td></tr>
+<tr><td>65</td><td>1 / 2 / 5 / 10</td><td>0.425 / 0.725 / 0.825 / 0.950</td><td>0.3 / 0.2 / 0.4 / 0.6 ms</td></tr>
+</table></div>
+<p>
+  规律很清楚：lists 越多，每个列表越小，查得越快，但只查 1 个列表时漏掉的也越多；probes 越大召回越高、越慢。
+  probes = lists 时等于把所有列表都查一遍，召回率回到 100%。pgvector 文档建议的起点是 lists ≈ 行数 / 1000（这里约 4～5）、probes ≈ √lists，再按自己对召回率和延迟的要求调整。
+  （数字来自一次实测，机器不同会有差异，但趋势一样。）
+</p>
+      </details>
+    </li>
+    <li>用 <code>pg_relation_size</code> 比较 IVFFlat 和 HNSW 索引的大小。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS size
+FROM pg_class
+WHERE relname IN ('movie_embeddings_ivfflat_idx', 'movie_embeddings_hnsw_idx', 'movies');
+</pre></div>
+<div class="code out"><pre>
+           relname            |  size
+------------------------------+---------
+ movies                       | 1424 kB
+ movie_embeddings_ivfflat_idx | 33 MB
+ movie_embeddings_hnsw_idx    | 33 MB
+</pre></div>
+<p>
+  两个索引几乎一样大（34,652,160 和 34,611,200 字节），因为它们都在索引里保存了每个向量的完整副本：4224 × 1024 × 4 字节 ≈ 17 MB，加上页面开销。HNSW 的 m = 8 很小，图的连接只占很少的空间；m 调大，HNSW 会明显变大。
+  有趣的是表本身只有 1.4 MB：向量太大，被 TOAST 移到了单独的存储里（<code>pg_total_relation_size</code> 是 90 MB）。
+</p>
+      </details>
+    </li>
+    <li>（需要 Ollama）运行 rag.ipynb，把问题换成“推荐几部关于恐龙的电影”，并尝试修改提示词，让 LLM 只基于上下文回答、不要编造。
+      <details class="answer"><summary>参考答案</summary>
+<p>（这一题需要 Ollama 或其他 LLM，本站没有实测。）修改 rag.ipynb 里的问题和提示词即可：</p>
+<div class="code" data-lang="python"><pre>
+question = "Recommend a few movies about dinosaurs."
+
+prompt = f"""You're a movie expert. Answer ONLY with movies listed in the context below.
+If none of them fit the question, say "I don't know" instead of guessing.
+
+Question: {question}
+Context: {context}"""
+</pre></div>
+<p>
+  检索部分我们可以验证：用同一个嵌入模型搜“dinosaurs”，前三名是三部《侏罗纪公园》（见上文<a href="#no-ollama">补充：不装 Ollama 的做法</a>）。
+  TinyLlama 很小，即使提示词要求“只基于上下文”，它也可能编造；换一个更大的模型或者云端 LLM，效果会好很多。
+</p>
+      </details>
+    </li>
   </ol>
 </div>
 

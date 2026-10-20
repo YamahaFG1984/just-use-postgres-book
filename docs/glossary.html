@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>术语表 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="22">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">工具 · 中英对照</span>
+<h1>术语表</h1>
+<p class="lede">
+  读文档、看报错、搜资料时，常常是英文术语。这里收了本教程里出现的主要概念：中文名、英文名、一句话解释，以及在哪一章讲过。
+  在下面的框里输入中文或英文，可以即时筛选。
+</p>
+
+<input type="search" id="g-filter" class="g-filter" placeholder="筛选术语，如：索引、vacuum、MVCC……" aria-label="筛选术语">
+<p class="g-count" id="g-count"></p>
+
+<h2 id="map">一张图串起核心概念</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="一条 UPDATE 语句在 Postgres 里经过的组件：连接、规划器、执行器、共享缓冲区、WAL、数据文件和 VACUUM">
+  <rect class="bx-b" x="14" y="20" width="130" height="52" rx="8"/><text class="sm b" x="79" y="42" text-anchor="middle">应用 / psql</text><text class="sm" x="79" y="60" text-anchor="middle">UPDATE …</text>
+  <path class="ln" d="M146 46 H182" marker-end="url(#ar)"/>
+  <rect class="bx" x="186" y="20" width="130" height="52" rx="8"/><text class="sm b" x="251" y="42" text-anchor="middle">连接（一个进程）</text><text class="sm" x="251" y="60" text-anchor="middle">连接池复用它</text>
+  <path class="ln" d="M318 46 H354" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="358" y="20" width="170" height="52" rx="8"/><text class="sm b" x="443" y="42" text-anchor="middle">解析 → 规划器</text><text class="sm" x="443" y="60" text-anchor="middle">靠统计信息选执行计划</text>
+  <path class="ln" d="M530 46 H566" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="570" y="20" width="176" height="52" rx="8"/><text class="sm b" x="658" y="42" text-anchor="middle">执行器</text><text class="sm" x="658" y="60" text-anchor="middle">顺序扫描 / 索引扫描</text>
+  <path class="ln" d="M658 74 V110" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="430" y="114" width="316" height="62" rx="8"/><text class="sm b" x="588" y="138" text-anchor="middle">共享缓冲区：以 8 KB 的“页”为单位缓存数据</text><text class="sm" x="588" y="160" text-anchor="middle">MVCC：写入新版本，旧版本留给还在读的事务</text>
+  <path class="ln-r" d="M430 145 H306" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="130" y="114" width="172" height="62" rx="8"/><text class="sm b" x="216" y="138" text-anchor="middle">WAL（预写日志）</text><text class="sm" x="216" y="160" text-anchor="middle">COMMIT 前先落盘</text>
+  <path class="ln" d="M588 178 V214" marker-end="url(#ar)"/><text class="sm" x="596" y="200">检查点时写回</text>
+  <rect class="bx-g" x="430" y="218" width="316" height="62" rx="8"/><text class="sm b" x="588" y="242" text-anchor="middle">数据文件：堆表 + 索引（+ TOAST 存大字段）</text><text class="sm" x="588" y="264" text-anchor="middle">旧版本变成“死元组”</text>
+  <path class="ln-g" d="M430 249 H306" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="130" y="218" width="172" height="62" rx="8"/><text class="sm b" x="216" y="242" text-anchor="middle">(auto)VACUUM</text><text class="sm" x="216" y="264" text-anchor="middle">回收死元组、冻结旧行</text>
+  <path class="ln-r" d="M130 160 Q60 160 60 200 L60 300" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="72" y="316">WAL 还用于：崩溃恢复、复制、PITR</text>
+</svg>
+<figcaption>图 T-4　一条 UPDATE 经过的地方，几乎覆盖了下面一半的术语</figcaption>
+</figure>
+
+<h2 id="basics">基础</h2>
+<dl class="gloss">
+  <div id="g-cluster"><dt>实例 / 数据库集簇 <span class="en">instance / database cluster</span></dt><dd>一个运行中的 Postgres 服务器，里面可以有多个数据库。角色属于整个实例。<a href="ch02.html#structure">第 2 章</a></dd></div>
+  <div id="g-database"><dt>数据库 <span class="en">database</span></dt><dd>实例里相互隔离的一组对象。一个连接只能连一个库，跨库查询需要扩展（如 postgres_fdw）。<a href="ch02.html#structure">第 2 章</a></dd></div>
+  <div id="g-schema"><dt>模式 <span class="en">schema</span></dt><dd>数据库里的“命名空间”，用来给表分组，如 <code>sales.orders</code>。默认是 public。<a href="ch02.html#structure">第 2 章</a></dd></div>
+  <div id="g-tuple"><dt>行 / 元组 <span class="en">row / tuple</span></dt><dd>表里的一条记录。Postgres 内部文档常称 tuple，一行可以有多个版本（见 MVCC）。<a href="topic-vacuum.html#dead">专题 4</a></dd></div>
+  <div id="g-pk"><dt>主键 / 外键 <span class="en">primary key / foreign key</span></dt><dd>主键唯一标识一行；外键要求列值必须在另一张表的主键（或唯一键）里存在。<a href="ch02.html#integrity">第 2 章</a></dd></div>
+  <div id="g-constraint"><dt>约束 <span class="en">constraint</span></dt><dd>数据库强制的规则：NOT NULL、UNIQUE、CHECK、主键、外键、排他约束 EXCLUDE。<a href="ch02.html#integrity">第 2 章</a></dd></div>
+  <div id="g-role"><dt>角色 / 权限 <span class="en">role / privilege</span></dt><dd>Postgres 里用户和用户组都是角色；用 GRANT / REVOKE 授予或收回对库、模式、表的权限。<a href="ch02.html#roles">第 2 章</a></dd></div>
+  <div id="g-view"><dt>视图 / 物化视图 <span class="en">view / materialized view</span></dt><dd>视图是存起来的查询，每次访问时执行；物化视图把结果存成表，需要 REFRESH 更新。<a href="ch02.html#views">第 2 章</a></dd></div>
+  <div id="g-function"><dt>函数 / 存储过程 / 触发器 <span class="en">function / procedure / trigger</span></dt><dd>在数据库里运行的代码（常用 PL/pgSQL）；触发器在 INSERT/UPDATE/DELETE 时自动调用函数。<a href="ch02.html#functions">第 2 章</a></dd></div>
+  <div id="g-extension"><dt>扩展 <span class="en">extension</span></dt><dd>给 Postgres 增加类型、函数、索引方法的插件，用 CREATE EXTENSION 安装到某个库。<a href="ch07.html">第 7 章</a></dd></div>
+  <div id="g-psql"><dt>psql</dt><dd>Postgres 自带的命令行客户端，<code>\</code> 开头的是它自己的命令，不是 SQL。<a href="ch01.html#psql">第 1 章</a>、<a href="cheatsheet.html#psql">速查表</a></dd></div>
+  <div id="g-sqlstate"><dt>SQLSTATE</dt><dd>每个错误附带的 5 位代码，如 23505 唯一冲突、40001 串行化失败。应用应按它而不是错误文字处理错误。<a href="topic-app.html#errors">专题 5</a></dd></div>
+</dl>
+
+<h2 id="query">查询</h2>
+<dl class="gloss">
+  <div id="g-join"><dt>连接 <span class="en">JOIN</span></dt><dd>按条件把多张表的行拼起来：INNER（两边都匹配）、LEFT（左表全保留）、FULL、CROSS 等。<a href="ch02.html#joins">第 2 章</a></dd></div>
+  <div id="g-cte"><dt>公用表表达式 <span class="en">CTE, WITH 子句</span></dt><dd>用 WITH 给子查询起名字，让复杂查询分步书写。<a href="ch03.html#cte">第 3 章</a></dd></div>
+  <div id="g-recursive"><dt>递归查询 <span class="en">recursive CTE</span></dt><dd>WITH RECURSIVE：结果不断引用自己，直到不再产生新行。用于树、层级、图。<a href="ch03.html#recursive">第 3 章</a></dd></div>
+  <div id="g-window"><dt>窗口函数 <span class="en">window function</span></dt><dd>带 OVER (…) 的函数，在一组相关行上计算（排名、累计、前后行），但不把行合并。<a href="ch03.html#window">第 3 章</a></dd></div>
+  <div id="g-upsert"><dt>UPSERT <span class="en">INSERT … ON CONFLICT</span></dt><dd>“存在就更新、不存在就插入”，借助唯一索引在并发下也是原子的。<a href="topic-sql.html#upsert">专题 2</a></dd></div>
+  <div id="g-planner"><dt>规划器 / 执行计划 <span class="en">planner / query plan</span></dt><dd>规划器根据统计信息估算成本，为每条查询挑一个执行计划；EXPLAIN 显示它。<a href="ch04.html#explain">第 4 章</a></dd></div>
+  <div id="g-explain"><dt>EXPLAIN / EXPLAIN ANALYZE</dt><dd>前者只显示计划和估算；加 ANALYZE 会真的执行，显示实际行数和耗时。<a href="appendix-a.html#explain">附录 A.1</a></dd></div>
+  <div id="g-stats"><dt>统计信息 <span class="en">statistics, ANALYZE</span></dt><dd>每列的值分布摘要，规划器靠它估算行数。ANALYZE（autovacuum 也会自动做）负责更新。<a href="ch04.html#explain">第 4 章</a></dd></div>
+  <div id="g-seqscan"><dt>顺序扫描 / 索引扫描 / 位图扫描 <span class="en">Seq Scan / Index Scan / Bitmap Heap Scan</span></dt><dd>读整张表；按索引逐行回表；先用索引收集所有位置再按物理顺序读表。<a href="ch04.html#single">第 4 章</a></dd></div>
+</dl>
+
+<h2 id="index">索引</h2>
+<dl class="gloss">
+  <div id="g-btree"><dt>B-tree</dt><dd>默认的索引类型，支持等值、范围、排序、前缀 LIKE。<a href="ch04.html#types">第 4 章</a></dd></div>
+  <div id="g-gin"><dt>GIN <span class="en">Generalized Inverted Index</span></dt><dd>倒排索引：一个值（键、元素、词素）对应包含它的所有行。用于 JSONB、数组、全文搜索、pg_trgm。<a href="ch05.html#index">第 5 章</a></dd></div>
+  <div id="g-gist"><dt>GiST <span class="en">Generalized Search Tree</span></dt><dd>通用的平衡树框架，用于几何（PostGIS）、范围类型、排他约束、最近邻。<a href="ch10.html#index">第 10 章</a></dd></div>
+  <div id="g-brin"><dt>BRIN <span class="en">Block Range Index</span></dt><dd>只记录每段数据块的最小 / 最大值，极小。适合按时间顺序写入的超大表。<a href="ch09.html#index">第 9 章</a></dd></div>
+  <div id="g-hnsw"><dt>HNSW / IVFFlat</dt><dd>pgvector 的两种近似最近邻索引：HNSW 是多层图，召回好、建得慢；IVFFlat 先聚类再搜索，建得快。<a href="ch08.html#index">第 8 章</a></dd></div>
+  <div id="g-composite"><dt>复合索引 / 最左前缀 <span class="en">composite index / leftmost prefix</span></dt><dd>多列索引 (a, b) 能用于只按 a、或按 a 和 b 过滤的查询，单独按 b 一般用不上。<a href="ch04.html#composite">第 4 章</a></dd></div>
+  <div id="g-covering"><dt>覆盖索引 / 仅索引扫描 <span class="en">covering index / Index Only Scan</span></dt><dd>查询要的列都在索引里（可用 INCLUDE 补充），无需回表读数据。<a href="ch04.html#covering">第 4 章</a></dd></div>
+  <div id="g-partial"><dt>部分索引 <span class="en">partial index</span></dt><dd>带 WHERE 的索引，只收录满足条件的行，更小更快。<a href="ch04.html#partial">第 4 章</a></dd></div>
+  <div id="g-expr"><dt>表达式索引 <span class="en">expression index</span></dt><dd>对表达式（如 lower(email)）建索引，查询里要写同样的表达式才能用上。<a href="ch04.html#expression">第 4 章</a></dd></div>
+</dl>
+
+<h2 id="concurrency">事务与并发</h2>
+<dl class="gloss">
+  <div id="g-tx"><dt>事务 / ACID <span class="en">transaction</span></dt><dd>一组要么全部成功、要么全部撤销的操作。ACID 指原子性、一致性、隔离性、持久性。<a href="ch02.html#tx">第 2 章</a></dd></div>
+  <div id="g-mvcc"><dt>多版本并发控制 <span class="en">MVCC</span></dt><dd>更新时写入新版本而不是覆盖，读写互不阻塞；每个事务按自己的快照看数据。<a href="ch02.html#tx">第 2 章</a>、<a href="topic-vacuum.html#dead">专题 4</a></dd></div>
+  <div id="g-snapshot"><dt>快照 <span class="en">snapshot</span></dt><dd>某一时刻“哪些事务已提交”的视图，决定一个语句或事务能看到哪些行版本。<a href="topic-sql.html#isolation">专题 2</a></dd></div>
+  <div id="g-isolation"><dt>隔离级别 <span class="en">isolation level</span></dt><dd>READ COMMITTED（默认）、REPEATABLE READ、SERIALIZABLE，级别越高防住的并发现象越多。<a href="topic-sql.html#isolation">专题 2</a></dd></div>
+  <div id="g-anomaly"><dt>不可重复读 / 幻读 / 写偏斜 <span class="en">non-repeatable read / phantom / write skew</span></dt><dd>同一行读两次不同 / 同样条件查出新行 / 两个事务各改不同行、合起来违反规则。<a href="topic-sql.html#isolation">专题 2</a></dd></div>
+  <div id="g-lostupdate"><dt>丢失更新 <span class="en">lost update</span></dt><dd>两个事务都基于旧值计算并写回，先写的结果被覆盖。用原子 UPDATE 或 FOR UPDATE 避免。<a href="topic-sql.html#locks">专题 2</a></dd></div>
+  <div id="g-rowlock"><dt>行锁 <span class="en">row lock, FOR UPDATE</span></dt><dd>UPDATE/DELETE 或 SELECT … FOR UPDATE 会锁住行，其他想修改它的事务要等待。<a href="topic-sql.html#locks">专题 2</a></dd></div>
+  <div id="g-skiplocked"><dt>SKIP LOCKED / NOWAIT</dt><dd>遇到被锁的行：跳过它 / 立刻报错，而不是等待。SKIP LOCKED 是用 Postgres 做队列的关键。<a href="ch11.html#custom">第 11 章</a></dd></div>
+  <div id="g-deadlock"><dt>死锁 <span class="en">deadlock</span></dt><dd>事务互相等待对方持有的锁。Postgres 自动检测并取消其中一个（40P01）。<a href="topic-sql.html#locks">专题 2</a></dd></div>
+  <div id="g-advisory"><dt>咨询锁 <span class="en">advisory lock</span></dt><dd>以数字命名、含义由应用约定的锁，用来锁“一件事”而不是某一行。<a href="topic-sql.html#locks">专题 2</a></dd></div>
+  <div id="g-listen"><dt>LISTEN / NOTIFY</dt><dd>Postgres 内置的轻量发布 / 订阅：一个会话 NOTIFY，监听该频道的会话收到通知。<a href="ch11.html#notify">第 11 章</a></dd></div>
+</dl>
+
+<h2 id="storage">存储与运维</h2>
+<dl class="gloss">
+  <div id="g-page"><dt>页 / 堆表 <span class="en">page / heap</span></dt><dd>数据文件按 8 KB 的页组织；表本身叫堆表（行无固定顺序），索引是独立的文件。<a href="topic-vacuum.html#dead">专题 4</a></dd></div>
+  <div id="g-toast"><dt>TOAST</dt><dd>一行里的大字段（长文本、大 JSON，超过约 2 KB）会被压缩或移到单独的 TOAST 表里存放。本教程未展开，见<a href="https://www.postgresql.org/docs/current/storage-toast.html">官方文档</a></dd></div>
+  <div id="g-wal"><dt>预写日志 <span class="en">WAL, Write-Ahead Log</span></dt><dd>所有修改先写进 WAL 再改数据文件；用于崩溃恢复、复制和时间点恢复。<a href="topic-backup.html#pitr">专题 6</a></dd></div>
+  <div id="g-checkpoint"><dt>检查点 <span class="en">checkpoint</span></dt><dd>把内存里修改过的页写回数据文件的时刻，之前的 WAL 不再是崩溃恢复所必需。<a href="topic-backup.html#pitr">专题 6</a></dd></div>
+  <div id="g-dead"><dt>死元组 / 表膨胀 <span class="en">dead tuple / bloat</span></dt><dd>已经没有事务需要的旧行版本；积累多了表和索引会变大变慢。<a href="topic-vacuum.html#dead">专题 4</a></dd></div>
+  <div id="g-vacuum"><dt>VACUUM / autovacuum</dt><dd>回收死元组空间、更新可见性映射、冻结旧行；autovacuum 是在后台自动做这件事的进程。<a href="topic-vacuum.html#vacuum">专题 4</a></dd></div>
+  <div id="g-hot"><dt>HOT 更新 / fillfactor <span class="en">heap-only tuple</span></dt><dd>被改的列没有索引、页内又有空位时，新版本放在同一页且不改索引；fillfactor 预留这个空位。<a href="topic-vacuum.html#hot">专题 4</a></dd></div>
+  <div id="g-wraparound"><dt>事务 ID 回卷 / 冻结 <span class="en">XID wraparound / freeze</span></dt><dd>32 位事务 ID 会绕圈；VACUUM 把足够老的行“冻结”以防误判。不处理会导致数据库拒绝写入。<a href="topic-vacuum.html#wraparound">专题 4</a></dd></div>
+  <div id="g-pool"><dt>连接池 / PgBouncer <span class="en">connection pool</span></dt><dd>复用数据库连接（每个连接是一个进程）；PgBouncer 是常用的服务端连接池。<a href="appendix-a.html#pooling">附录 A.3</a>、<a href="topic-app.html#pool">专题 5</a></dd></div>
+  <div id="g-partition"><dt>分区 <span class="en">partitioning</span></dt><dd>把一张大表按范围、列表或哈希拆成多张子表，查询和清理旧数据都更快。<a href="ch11.html#considerations">第 11 章</a></dd></div>
+  <div id="g-replication"><dt>复制 / 逻辑复制 <span class="en">replication</span></dt><dd>物理复制传 WAL，得到一模一样的副本；逻辑复制按表传数据变更，可跨大版本。<a href="topic-backup.html#upgrade">专题 6</a></dd></div>
+  <div id="g-dump"><dt>pg_dump / pg_restore</dt><dd>逻辑备份与恢复工具；角色要用 pg_dumpall --globals-only 另外备份。<a href="topic-backup.html#dump">专题 6</a></dd></div>
+  <div id="g-pitr"><dt>时间点恢复 <span class="en">PITR</span></dt><dd>基础备份 + 持续归档的 WAL，可以恢复到任意时刻。<a href="topic-backup.html#pitr">专题 6</a></dd></div>
+  <div id="g-rls"><dt>行级安全 <span class="en">RLS, row-level security</span></dt><dd>用策略控制每个角色能看到、修改表里的哪些行，常用于多租户。<a href="topic-rls.html">专题 3</a></dd></div>
+</dl>
+
+<h2 id="features">JSON、搜索、AI、时序、地理</h2>
+<dl class="gloss">
+  <div id="g-jsonb"><dt>JSON / JSONB</dt><dd>json 原样存文本；jsonb 解析成二进制，去掉重复键，可以建索引，绝大多数情况选 jsonb。<a href="ch05.html#storing">第 5 章</a></dd></div>
+  <div id="g-jsonpath"><dt>JSONPath</dt><dd>在 JSON 里按路径和条件取值的查询语言，如 <code>$.items[*] ? (@.price &gt; 10)</code>。<a href="ch05.html#query">第 5 章</a></dd></div>
+  <div id="g-tsvector"><dt>tsvector / tsquery / 词素 <span class="en">lexeme</span></dt><dd>文档被处理成词素（归一化后的词）及位置的列表；查询也转成词素表达式，用 @@ 匹配。<a href="ch06.html#basics">第 6 章</a></dd></div>
+  <div id="g-dictionary"><dt>文本搜索配置 / 词典 / 分词 <span class="en">text search configuration / dictionary / parser</span></dt><dd>分词器把文本切成词，词典把词归一化、去掉停用词；配置把两者组合起来，如 'english'。<a href="ch06.html#basics">第 6 章</a>、<a href="topic-chinese-fts.html#config">专题 1</a></dd></div>
+  <div id="g-trgm"><dt>三元组 <span class="en">trigram, pg_trgm</span></dt><dd>把字符串切成连续 3 个字符的片段，用来算相似度、加速 LIKE '%x%'。<a href="topic-chinese-fts.html#trgm">专题 1</a></dd></div>
+  <div id="g-embedding"><dt>向量嵌入 <span class="en">embedding</span></dt><dd>模型把文本、图片转成的一串数字，语义相近的内容向量距离也近。<a href="ch08.html#embeddings">第 8 章</a></dd></div>
+  <div id="g-distance"><dt>余弦距离 / 欧氏距离 / 内积 <span class="en">cosine / L2 / inner product</span></dt><dd>衡量向量相似度的三种方式，pgvector 运算符分别是 &lt;=&gt;、&lt;-&gt;、&lt;#&gt;（负内积）。<a href="ch08.html#search">第 8 章</a></dd></div>
+  <div id="g-rag"><dt>检索增强生成 <span class="en">RAG</span></dt><dd>先用向量搜索找出相关资料，再把它们和问题一起交给大模型生成回答。<a href="ch08.html#rag">第 8 章</a></dd></div>
+  <div id="g-hypertable"><dt>超表 / 数据块 <span class="en">hypertable / chunk</span></dt><dd>TimescaleDB 的表，按时间自动切成许多 chunk，写入和按时间删除都更高效。<a href="ch09.html#hypertable">第 9 章</a></dd></div>
+  <div id="g-cagg"><dt>连续聚合 <span class="en">continuous aggregate</span></dt><dd>TimescaleDB 的“自动增量刷新的物化视图”，常用于按小时 / 天的汇总。<a href="ch09.html#caggs">第 9 章</a></dd></div>
+  <div id="g-srid"><dt>坐标参考系 / SRID <span class="en">spatial reference ID</span></dt><dd>说明坐标的含义，如 4326 是经纬度（WGS 84）。算距离、面积前常要 ST_Transform 到合适的投影。<a href="ch10.html#geodata">第 10 章</a></dd></div>
+  <div id="g-geometry"><dt>geometry / geography</dt><dd>PostGIS 的两种类型：geometry 在平面上计算；geography 在球面上计算，结果以米为单位。<a href="ch10.html#geodata">第 10 章</a></dd></div>
+  <div id="g-pglite"><dt>PGlite</dt><dd>编译成 WebAssembly 的 Postgres，可以在浏览器里运行，本站的练习场就是用它做的。<a href="playground.html">SQL 练习场</a></dd></div>
+</dl>
+
+<p class="g-empty" id="g-empty" hidden>没有匹配的术语。试试<a href="#" id="g-search">站内搜索</a>？</p>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+<script>
+(function () {
+  var input = document.getElementById('g-filter');
+  var items = Array.prototype.slice.call(document.querySelectorAll('.gloss > div'));
+  var count = document.getElementById('g-count');
+  var empty = document.getElementById('g-empty');
+  function apply() {
+    var q = input.value.trim().toLowerCase(), shown = 0;
+    items.forEach(function (it) {
+      var hit = !q || it.textContent.toLowerCase().indexOf(q) >= 0;
+      it.hidden = !hit;
+      if (hit) shown++;
+    });
+    // 整组都被筛掉时，连组标题一起隐藏
+    document.querySelectorAll('.gloss').forEach(function (dl) {
+      var any = dl.querySelector('div:not([hidden])');
+      dl.hidden = !any;
+      var h = dl.previousElementSibling;
+      if (h && h.tagName === 'H2') h.hidden = !any;
+    });
+    count.textContent = q ? '筛选出 ' + shown + ' / ' + items.length + ' 个术语' : '共 ' + items.length + ' 个术语';
+    empty.hidden = shown > 0;
+  }
+  input.addEventListener('input', apply);
+  document.getElementById('g-search').onclick = function (e) {
+    e.preventDefault();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true }));
+  };
+  apply();
+})();
+</script>
+</body>
+</html>

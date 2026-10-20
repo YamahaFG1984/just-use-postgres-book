@@ -25,7 +25,9 @@
     { n: 17, label: 'S4', f: 'topic-vacuum.html',      t: 'VACUUM 与表膨胀', d: '死元组从哪来、怎么回收、怎么监控' },
     { n: 18, label: 'S5', f: 'topic-app.html',         t: '从应用连接 Postgres', d: '驱动、参数化查询、事务与 ORM' },
     { n: 19, label: 'S6', f: 'topic-backup.html',      t: '备份、恢复与升级', d: 'pg_dump、pg_restore 与大版本升级' },
-    { n: 20, label: '练', f: 'playground.html', tag: '工具', t: 'SQL 练习场', d: '在浏览器里直接写 SQL，自带示例数据', part: '工具与速查' }
+    { n: 20, label: '练', f: 'playground.html', tag: '工具', t: 'SQL 练习场', d: '在浏览器里直接写 SQL，自带示例数据', part: '工具与速查' },
+    { n: 21, label: '速', f: 'cheatsheet.html', tag: '工具', t: '速查表', d: 'psql 命令、常用语法、索引选择、运维查询' },
+    { n: 22, label: '词', f: 'glossary.html', tag: '工具', t: '术语表', d: '中英对照的概念速查，附出处' }
   ];
 
   var cur = parseInt(document.body.dataset.chapter || '0', 10);
@@ -41,7 +43,8 @@
   var side = document.getElementById('sidebar');
   if (side) {
     var html = '<a class="brand" href="index.html"><span class="flame">&#128024;</span>' +
-      '<span>Just Use Postgres<small>一个数据库，够你用很久</small></span></a>';
+      '<span>Just Use Postgres<small>一个数据库，够你用很久</small></span></a>' +
+      '<button type="button" class="search-btn"><span>&#128269; 搜索教程</span><kbd>/</kbd></button>';
     CHAPTERS.forEach(function (c) {
       if (c.part) html += '<div class="part">' + c.part + '</div>';
       html += '<a class="ch' + (c.n === cur ? ' active' : '') + '" href="' + c.f +
@@ -57,6 +60,27 @@
       if (top > 0) side.scrollTop = top;
     }, 0);
   }
+
+  /* ---------- 站内搜索：按 / 或 Ctrl+K 打开，search.js 按需加载 ---------- */
+  window.JUP_CHAPTERS = CHAPTERS;
+  var searchLoading = null;
+  function openSearch() {
+    document.body.classList.remove('nav-open');
+    if (window.JUPSearch) return window.JUPSearch.open();
+    if (!searchLoading) {
+      searchLoading = document.createElement('script');
+      searchLoading.src = 'assets/search.js';
+      searchLoading.onload = function () { window.JUPSearch.open(); };
+      document.body.appendChild(searchLoading);
+    }
+  }
+  var sb = side && side.querySelector('.search-btn');
+  if (sb) sb.onclick = openSearch;
+  document.addEventListener('keydown', function (e) {
+    var t = e.target, typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+    if ((e.key === 'k' || e.key === 'K') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openSearch(); }
+    else if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); openSearch(); }
+  });
 
   /* ---------- 移动端菜单 ---------- */
   var btn = document.createElement('button');

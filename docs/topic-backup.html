@@ -517,11 +517,132 @@ docker exec postgres18 psql -U postgres -d rlstopic -c "SELECT count(*) FROM not
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>用 <code>docker exec</code> 把第 2 章的数据库备份到宿主机，然后恢复到一个叫 <code>shop_copy</code> 的新库里，比较两边 <code>sales.orders</code> 的行数。</li>
-    <li>只恢复 <code>sales.products</code> 一张表，分别用 <code>-t</code> 和 <code>-L 清单</code> 两种方式，用 <code>\d</code> 比较结果。</li>
-    <li>写一个 shell 脚本：备份所有数据库和 globals，文件名带日期，并删除 7 天前的备份。</li>
-    <li>启动一个 <code>postgres:18.1</code> 容器（注意卷的挂载路径），把第 1 章的数据库迁移过去，并验证数据。</li>
-    <li>做一次恢复演练：从备份恢复，给每张表数一次行数，记下从开始到完成一共花了多久。</li>
+    <li>用 <code>docker exec</code> 把第 2 章的数据库备份到宿主机，然后恢复到一个叫 <code>shop_copy</code> 的新库里，比较两边 <code>sales.orders</code> 的行数。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="bash"><pre>
+docker exec postgres pg_dump -U postgres -Fc coffee_chain &gt; coffee_chain.dump
+docker exec postgres createdb -U postgres shop_copy
+docker exec -i postgres pg_restore -U postgres -d shop_copy &lt; coffee_chain.dump
+
+for db in coffee_chain shop_copy; do
+  echo "$db: $(docker exec postgres psql -U postgres -d $db -Atc 'SELECT count(*) FROM sales.orders')"
+done
+</pre></div>
+<div class="code out"><pre>
+coffee_chain: 4
+shop_copy: 4
+</pre></div>
+<p>pg_dump 的 -Fc 输出是二进制，<code>docker exec</code> 不能加 <code>-t</code>（伪终端会改写换行符，损坏文件）；恢复时要加 <code>-i</code>，才能把宿主机的文件送进容器的标准输入。</p>
+      </details>
+    </li>
+    <li>只恢复 <code>products.catalog</code> 一张表，分别用 <code>-t</code> 和 <code>-L 清单</code> 两种方式，用 <code>\d</code> 比较结果。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="bash"><pre>
+# 方式一：-t。注意 -t 不认“模式.表名”，要和 -n 分开写，而且目标库里要先有这个模式
+docker exec postgres psql -U postgres -d only_t -c "CREATE SCHEMA products"
+docker exec -i postgres pg_restore -U postgres -d only_t -n products -t catalog &lt; coffee_chain.dump
+
+# 方式二：-L 清单，把表、序列、默认值、主键、模式都挑出来
+docker exec -i postgres pg_restore -l &lt; coffee_chain.dump \
+  | grep -E ' products catalog|catalog_id_seq|catalog_pkey|SCHEMA - products' &gt; list.txt
+docker cp list.txt postgres:/tmp/list.txt
+docker cp coffee_chain.dump postgres:/tmp/cc.dump
+docker exec postgres pg_restore -U postgres -d only_l -L /tmp/list.txt /tmp/cc.dump
+</pre></div>
+<div class="code out"><pre>
+-t 恢复的结果（\d products.catalog）：
+ id             | integer   | not null |                                    ← 没有默认值
+Check constraints:  …                                                    ← CHECK 约束在（它属于表定义）
+                                                                         ← 没有 Indexes: catalog_pkey
+
+-L 恢复的结果：
+ id             | integer   | not null | nextval('products.catalog_id_seq'::regclass)
+Indexes:
+    "catalog_pkey" PRIMARY KEY, btree (id)
+</pre></div>
+<p>
+  实测还有一个坑：写成 <code>-t products.catalog</code> 时 pg_restore <strong>什么都不恢复，也不报错</strong>，退出码照样是 0。用 -t 之后一定要用 <code>\d</code> 检查结果。
+  -L 方式要读懂清单里每一行是什么；外键（比如 reviews 引用 catalog 的那条）没挑进来，是因为 reviews 表本身没有恢复。
+</p>
+      </details>
+    </li>
+    <li>写一个 shell 脚本：备份所有数据库和 globals，文件名带日期，并删除 7 天前的备份。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="bash"><pre>
+#!/usr/bin/env bash
+# 每天备份 Docker 里 Postgres 的所有数据库和全局对象，保留 7 天
+set -euo pipefail
+
+CONTAINER=${CONTAINER:-postgres}
+BACKUP_DIR=${BACKUP_DIR:-$HOME/pg-backups}
+DAY=$(date +%F)
+mkdir -p "$BACKUP_DIR/$DAY"
+
+docker exec "$CONTAINER" pg_dumpall -U postgres --globals-only &gt; "$BACKUP_DIR/$DAY/globals.sql"
+
+for db in $(docker exec "$CONTAINER" psql -U postgres -Atc \
+            "SELECT datname FROM pg_database WHERE NOT datistemplate"); do
+  docker exec "$CONTAINER" pg_dump -U postgres -Fc "$db" &gt; "$BACKUP_DIR/$DAY/$db.dump"
+done
+
+# 删除 7 天前的备份目录
+find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +
+echo "备份完成：$BACKUP_DIR/$DAY"
+</pre></div>
+<p>
+  本站实测：所有库各生成一个 .dump 加一个 globals.sql，事先放的一个“10 天前”的目录被删除了。<code>set -euo pipefail</code> 让任何一步失败时脚本立刻以非 0 退出，配合 cron 的邮件或监控告警才能发现备份失败。
+  用 <code>crontab -e</code> 加一行 <code>0 3 * * * /path/to/backup.sh &gt;&gt; /var/log/pg-backup.log 2&gt;&amp;1</code> 即可每天凌晨 3 点执行。
+</p>
+      </details>
+    </li>
+    <li>启动一个 <code>postgres:18.1</code> 容器（注意卷的挂载路径），把第 1 章的数据库迁移过去，并验证数据。
+      <details class="answer"><summary>参考答案</summary>
+<p>按本页“方法一：dump + restore”的步骤做（本站已经实测过 17 → 18 的迁移）。要点：</p>
+<div class="code" data-lang="bash"><pre>
+# 注意：18 起数据卷要挂到 /var/lib/postgresql（上一级目录）
+docker run --name postgres18 -e POSTGRES_PASSWORD=password -p 5433:5432 \
+    -v postgres18-volume:/var/lib/postgresql \
+    -d postgres:18.1
+
+docker network create pgnet
+docker network connect pgnet postgres
+docker network connect pgnet postgres18
+
+docker exec -e PGPASSWORD=password postgres18 pg_dumpall -h postgres -U postgres --globals-only -f /tmp/globals.sql
+docker exec -e PGPASSWORD=password postgres18 pg_dump -h postgres -U postgres -Fc -f /tmp/postgres.dump postgres
+docker exec postgres18 psql -U postgres -q -f /tmp/globals.sql      # role "postgres" already exists 可忽略
+docker exec postgres18 pg_restore -U postgres -d postgres /tmp/postgres.dump
+docker exec postgres18 psql -U postgres -c "SELECT count(*) FROM trades"     # 和旧库对比
+</pre></div>
+<p>用 18 的 pg_dump 去连 17 的服务器；两个容器放进同一个 Docker 网络后，可以直接用容器名当主机名。</p>
+      </details>
+    </li>
+    <li>做一次恢复演练：从备份恢复，给每张表数一次行数，记下从开始到完成一共花了多久。
+      <details class="answer"><summary>参考答案</summary>
+<p>恢复演练可以这样记录：</p>
+<div class="code" data-lang="bash"><pre>
+time (docker exec postgres createdb -U postgres drill &amp;&amp;
+      docker exec -i postgres pg_restore -U postgres -d drill --single-transaction --exit-on-error &lt; coffee_chain.dump)
+</pre></div>
+<div class="code" data-lang="sql"><pre>
+-- 每张表的行数（n_live_tup 是估计值，恢复后先 ANALYZE；要精确就逐表 count(*)）
+ANALYZE;
+SELECT schemaname || '.' || relname AS table_name, n_live_tup
+FROM pg_stat_user_tables ORDER BY 1;
+</pre></div>
+<div class="code out"><pre>
+         table_name          | n_live_tup
+-----------------------------+------------
+ customers.accounts          |          3
+ products.catalog            |          4
+ products.reviews            |          1
+ sales.order_items           |          7
+ sales.orders                |          4
+ …
+</pre></div>
+<p>把这次的耗时、行数和生产库对比的结果写进演练记录。数据量越大，恢复耗时越有参考价值：它就是你出事时真正需要的时间（RTO）。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

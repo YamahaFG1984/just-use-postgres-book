@@ -1402,11 +1402,109 @@ WHERE schemaname = 'game' AND tablename = 'player_stats';
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>对 <code>SELECT count(*) FROM game.player_stats WHERE win_count &gt; 100;</code> 建一个索引，用 EXPLAIN 观察：规划器用了吗？为什么？（提示：8061 行 / 10000 行）</li>
-    <li>把 <code>idx_champion_title</code> 换成 B-tree 索引，比较执行计划和 <code>pg_relation_size('game.idx_champion_title')</code> 的大小差异。</li>
-    <li>建一个 <code>lower(username)</code> 的表达式索引，然后分别用 <code>WHERE lower(username) = 'kfowler'</code> 和 <code>WHERE username ILIKE 'kfowler'</code> 查询，看哪个用上了索引。</li>
-    <li>为“每个地区按胜场排名”的清单 4.9 建一个合适的复合索引，确认 Sort 步骤消失了。</li>
-    <li>用 <code>EXPLAIN (analyze, buffers on)</code> 跑一次全表扫描，观察 <code>shared hit</code> 和 <code>read</code> 的数字；重启容器后再跑一次，看看有什么变化。</li>
+    <li>对 <code>SELECT count(*) FROM game.player_stats WHERE win_count &gt; 100;</code> 建一个索引，用 EXPLAIN 观察：规划器用了吗？为什么？（提示：8061 行 / 10000 行）
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX idx_win_count ON game.player_stats (win_count);
+EXPLAIN (costs off) SELECT count(*) FROM game.player_stats WHERE win_count > 100;
+</pre></div>
+<div class="code out"><pre>
+ Aggregate
+   ->  Index Only Scan using idx_win_count on player_stats
+         Index Cond: (win_count > 100)
+</pre></div>
+<p>
+  实测<strong>用了</strong>，这可能和直觉相反：8061 / 10000 行都满足条件，按“选择性太差”应该全表扫描。原因是 <code>count(*)</code> 不需要表里的任何列，
+  只读这个很小的索引就能数出来（仅索引扫描，第 4 章“覆盖索引”一节），比读整张表还省。换成要取其他列的查询，结论就符合提示了：
+</p>
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (costs off) SELECT username, win_count FROM game.player_stats WHERE win_count > 100;
+--  Seq Scan on player_stats          ← 80% 的行都要回表，不如直接全表扫描
+--    Filter: (win_count > 100)
+EXPLAIN (costs off) SELECT username, win_count FROM game.player_stats WHERE win_count > 800;
+--  Index Scan using idx_win_count    ← 条件足够苛刻时才走索引
+</pre></div>
+      </details>
+    </li>
+    <li>把 <code>idx_champion_title</code> 换成 B-tree 索引，比较执行计划和 <code>pg_relation_size('game.idx_champion_title')</code> 的大小差异。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT pg_size_pretty(pg_relation_size('game.idx_champion_title'));   -- 哈希索引：272 kB
+
+DROP INDEX game.idx_champion_title;
+CREATE INDEX idx_champion_title ON game.player_stats (champion_title);
+SELECT pg_size_pretty(pg_relation_size('game.idx_champion_title'));   -- B-tree：88 kB
+
+EXPLAIN (costs off) SELECT * FROM game.player_stats WHERE champion_title = 'Dragon Slayer';
+--  Index Scan using idx_champion_title on player_stats     两种索引的计划一样
+--    Index Cond: (champion_title = 'Dragon Slayer'::text)
+</pre></div>
+<p>
+  这里 B-tree 反而更小：表里只有 5 行有 champion_title（其余是 NULL），B-tree 只存这 5 个值；哈希索引则会预先分配一批桶页面，表很小时这部分开销占了大头。
+  哈希索引的优势要在数据量大、值很长、只做等值查询时才体现出来。
+</p>
+      </details>
+    </li>
+    <li>建一个 <code>lower(username)</code> 的表达式索引，然后分别用 <code>WHERE lower(username) = 'kfowler'</code> 和 <code>WHERE username ILIKE 'kfowler'</code> 查询，看哪个用上了索引。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX idx_lower_username ON game.player_stats (lower(username));
+
+EXPLAIN (costs off) SELECT * FROM game.player_stats WHERE lower(username) = 'kfowler';
+--  Bitmap Heap Scan on player_stats
+--    ->  Bitmap Index Scan on idx_lower_username        ✓ 用上了
+
+EXPLAIN (costs off) SELECT * FROM game.player_stats WHERE username ILIKE 'kfowler';
+--  Seq Scan on player_stats
+--    Filter: (username ~~* 'kfowler'::text)              ✗ 用不上
+</pre></div>
+<p>表达式索引只认<strong>完全相同的表达式</strong>。ILIKE 虽然也是“不区分大小写”，但规划器不知道它等价于 <code>lower(username) = …</code>。</p>
+      </details>
+    </li>
+    <li>为“每个地区按胜场排名”的清单 4.9 建一个合适的复合索引，确认 Sort 步骤消失了。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+-- 建索引前
+--  Unique
+--    ->  Sort
+--          Sort Key: region, win_count DESC, score DESC
+--          ->  Seq Scan on player_stats
+
+CREATE INDEX idx_region_win_score
+ON game.player_stats (region, win_count DESC, score DESC);
+
+EXPLAIN (costs off)
+SELECT DISTINCT ON (region) username, region, score, win_count
+FROM game.player_stats
+ORDER BY region, win_count DESC, score DESC;
+</pre></div>
+<div class="code out"><pre>
+ Result
+   ->  Unique
+         ->  Index Scan using idx_region_win_score on player_stats
+</pre></div>
+<p>索引的列顺序和排序方向与 ORDER BY 完全一致，按索引顺序读出来的行本身就是排好序的，Sort 步骤就消失了。</p>
+      </details>
+    </li>
+    <li>用 <code>EXPLAIN (analyze, buffers on)</code> 跑一次全表扫描，观察 <code>shared hit</code> 和 <code>read</code> 的数字；重启容器后再跑一次，看看有什么变化。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+EXPLAIN (analyze, buffers on, costs off, timing off) SELECT * FROM game.player_stats;
+--  Seq Scan on player_stats (actual rows=10000 loops=1)
+--    Buffers: shared hit=137             所有页都已在共享缓冲区里
+</pre></div>
+<div class="code" data-lang="bash"><pre>
+docker restart postgres
+</pre></div>
+<div class="code out"><pre>
+-- 重启后第一次
+   Buffers: shared read=137     137 个页都要从磁盘（或操作系统缓存）读进来
+-- 再执行一次
+   Buffers: shared hit=137      又全部命中缓存了
+</pre></div>
+<p>重启清空了 Postgres 的共享缓冲区。“read” 不一定真的读了磁盘，也可能命中操作系统的文件缓存，所以耗时只多了一点（实测 0.57 ms → 1.05 ms）。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

@@ -1203,11 +1203,119 @@ DROP INDEX omdb.idx_movie_lexemes_gin;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>用 <code>ts_debug</code> 分析一句含邮箱和网址的话，比如 <code>'Contact me at a@b.com or https://postgresql.org'</code>，看看分别被识别成什么类型。</li>
-    <li>对比 <code>plainto_tsquery</code>、<code>phraseto_tsquery</code>、<code>websearch_to_tsquery</code> 处理 <code>'the lion king'</code> 和 <code>'"lion king" -witch'</code> 的结果。</li>
-    <li>把清单 6.11 里的 <code>ts_rank</code> 换成 <code>ts_rank_cd</code>，用 <code>'space &amp; station'</code> 搜索，观察排序有什么变化。</li>
-    <li>给 <code>ts_rank</code> 传入自定义权重 <code>'{0.1, 0.2, 0.1, 1.0}'</code>（降低简介 B 的权重），再搜一次 ghosts。</li>
-    <li>分别建 GIN 和 GiST 索引，用 <code>pg_relation_size</code> 比较两者大小。</li>
+    <li>用 <code>ts_debug</code> 分析一句含邮箱和网址的话，比如 <code>'Contact me at a@b.com or https://postgresql.org'</code>，看看分别被识别成什么类型。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT alias, token, lexemes
+FROM ts_debug('Contact me at a@b.com or https://postgresql.org')
+WHERE alias &lt;&gt; 'blank';
+</pre></div>
+<div class="code out"><pre>
+   alias   |     token      |     lexemes
+-----------+----------------+------------------
+ asciiword | Contact        | {contact}
+ asciiword | me             | {}
+ asciiword | at             | {}
+ email     | a@b.com        | {a@b.com}
+ asciiword | or             | {}
+ protocol  | https://       |
+ host      | postgresql.org | {postgresql.org}
+(7 rows)
+</pre></div>
+<p>解析器认出了 email 和 host 两种特殊词元，整体保留为一个词素，不会被拆开或词干化；“me”“at”“or”是停用词，词素为空；<code>https://</code> 被识别为 protocol，english 配置没有为它映射词典，所以直接丢弃（lexemes 为 NULL）。</p>
+      </details>
+    </li>
+    <li>对比 <code>plainto_tsquery</code>、<code>phraseto_tsquery</code>、<code>websearch_to_tsquery</code> 处理 <code>'the lion king'</code> 和 <code>'"lion king" -witch'</code> 的结果。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT plainto_tsquery('the lion king'), phraseto_tsquery('the lion king'), websearch_to_tsquery('the lion king');
+SELECT plainto_tsquery('"lion king" -witch'), phraseto_tsquery('"lion king" -witch'), websearch_to_tsquery('"lion king" -witch');
+</pre></div>
+<div class="code out"><pre>
+      plain      |      phrase       |       web
+-----------------+-------------------+-----------------
+ 'lion' & 'king' | 'lion' &lt;-&gt; 'king' | 'lion' & 'king'
+
+           plain           |            phrase             |             web
+---------------------------+-------------------------------+------------------------------
+ 'lion' & 'king' & 'witch' | 'lion' &lt;-&gt; 'king' &lt;-&gt; 'witch' | 'lion' &lt;-&gt; 'king' & !'witch'
+</pre></div>
+<p>只有 websearch_to_tsquery 理解“搜索框语法”：引号表示短语、减号表示排除。另外两个函数把引号和减号都当成普通标点忽略了，<code>-witch</code> 反而变成了“必须包含 witch”。</p>
+      </details>
+    </li>
+    <li>把清单 6.11 里的 <code>ts_rank</code> 换成 <code>ts_rank_cd</code>，用 <code>'space &amp; station'</code> 搜索，观察排序有什么变化。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT name,
+       ts_rank(lexemes, q)    AS rank,
+       ts_rank_cd(lexemes, q) AS rank_cd
+FROM omdb.movies, to_tsquery('space & station') q
+WHERE lexemes @@ q
+ORDER BY rank DESC;
+</pre></div>
+<div class="code out"><pre>
+         name          |  rank  | rank_cd
+-----------------------+--------+---------
+ 2001: A Space Odyssey | 0.6176 |  0.4000
+ Spiders               | 0.5803 |  0.4000
+ Kanojo No Omoide      | 0.3964 |  0.4000
+ Solaris               | 0.3964 |  0.4000
+(4 rows)
+</pre></div>
+<p>
+  ts_rank_cd（cover density）只看匹配词<strong>挨得多近</strong>，不管出现了几次。这 4 部电影的简介里 space 和 station 都是紧挨着的（“space station”），而且都在权重 B（0.4）的简介里，所以 ts_rank_cd 全是 0.4，排序变成了并列。
+  ts_rank 则会因为 space 在片名（权重 A）里出现而给《2001 太空漫游》更高的分。
+</p>
+      </details>
+    </li>
+    <li>给 <code>ts_rank</code> 传入自定义权重 <code>'{0.1, 0.2, 0.1, 1.0}'</code>（降低简介 B 的权重），再搜一次 ghosts。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+-- 权重数组的顺序是 {D, C, B, A}：这里把 B 从默认的 0.4 降到 0.1
+SELECT id, name,
+       ts_rank(lexemes, to_tsquery('ghosts'))                         AS default_rank,
+       ts_rank('{0.1, 0.2, 0.1, 1.0}', lexemes, to_tsquery('ghosts')) AS custom_rank
+FROM omdb.movies
+WHERE lexemes @@ to_tsquery('ghosts')
+ORDER BY custom_rank DESC, vote_average DESC NULLS LAST
+LIMIT 6;
+</pre></div>
+<div class="code out"><pre>
+   id   |         name          | default_rank | custom_rank
+--------+-----------------------+--------------+-------------
+    251 | Ghost                 |       0.6957 |      0.6299
+ 210675 | A Most Annoying Ghost |       0.6957 |      0.6299
+   1548 | Ghost World           |       0.6687 |      0.6231
+  12175 | Ghosts of Goldfield   |       0.6687 |      0.6231
+ 166008 | Ghosts                |       0.6687 |      0.6231
+  11439 | The Ghost Writer      |       0.6079 |      0.6079
+(6 rows)
+</pre></div>
+<p>
+  片名和简介里都有 ghost 的电影分数下降了；<em>The Ghost Writer</em> 的分数不变，因为它的简介里只有 ghostwrite 一词，词素是 ghostwrit，和 ghost 不匹配，只有片名命中。两类之间的差距被缩小了。
+  这几部的片名都命中了，权重 A 的贡献占主导，所以前 6 名的顺序没变；简介权重越低，排序就越接近“只看片名”。
+</p>
+      </details>
+    </li>
+    <li>分别建 GIN 和 GiST 索引，用 <code>pg_relation_size</code> 比较两者大小。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX idx_movie_lexemes_gin  ON omdb.movies USING GIN  (lexemes);
+CREATE INDEX idx_movie_lexemes_gist ON omdb.movies USING GIST (lexemes);
+
+SELECT relname, pg_size_pretty(pg_relation_size(oid))
+FROM pg_class WHERE relname LIKE 'idx_movie_lexemes%';
+</pre></div>
+<div class="code out"><pre>
+        relname         | pg_size_pretty
+------------------------+----------------
+ idx_movie_lexemes_gin  | 1360 kB
+ idx_movie_lexemes_gist | 584 kB
+(2 rows)
+</pre></div>
+<p>GiST 只存每行词素的“签名”（有损的位图），所以更小，但查询时要回表复核，通常更慢；GIN 为每个词素记录完整的行列表，更大、查得更快，是全文搜索的首选。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

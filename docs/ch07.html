@@ -610,10 +610,79 @@ SELECT js_upper('just use postgres');   -- JUST USE POSTGRES
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>列出你的容器里全部 45 个可用扩展，挑三个你没听说过的，看看 comment 写的是做什么的。</li>
-    <li>在第 2 章的 coffee_chain 数据库里启用 pgcrypto，用 <code>crypt</code> + <code>gen_salt('bf')</code> 改造 <code>customers.accounts</code> 的 <code>passwd_hash</code>（原来存的是不安全的 MD5）。</li>
-    <li>用 <code>gen_random_bytes(16)</code> 和 <code>encode(…, 'hex')</code> 生成一个随机 API 密钥。</li>
-    <li>启用随发行版自带的 <code>pg_stat_statements</code>（提示：需要先在 <code>shared_preload_libraries</code> 里配置并重启），跑几条查询后查看 <code>pg_stat_statements</code> 视图。</li>
+    <li>列出你的容器里全部 45 个可用扩展，挑三个你没听说过的，看看 comment 写的是做什么的。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT name, default_version, comment
+FROM pg_available_extensions
+ORDER BY name;
+-- 想只看数量：SELECT count(*) FROM pg_available_extensions;   -- 45
+</pre></div>
+<p>在 psql 里先执行 <code>\x</code> 打开竖排显示，comment 比较长时更好读。比如 <code>tablefunc</code>（交叉表 crosstab）、<code>fuzzystrmatch</code>（Soundex、Levenshtein 编辑距离）、<code>earthdistance</code>（地球表面距离）都值得一看。</p>
+      </details>
+    </li>
+    <li>在第 2 章的 coffee_chain 数据库里启用 pgcrypto，用 <code>crypt</code> + <code>gen_salt('bf')</code> 改造 <code>customers.accounts</code> 的 <code>passwd_hash</code>（原来存的是不安全的 MD5）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+\c coffee_chain
+CREATE EXTENSION pgcrypto;
+
+-- MD5 无法还原成明文，所以只能把“MD5 值”再用 bcrypt 包一层
+UPDATE customers.accounts SET passwd_hash = crypt(passwd_hash, gen_salt('bf'));
+
+SELECT id, passwd_hash FROM customers.accounts ORDER BY id;
+--  1 | $2a$06$broTnedEduPvqiCsQ0qGKuZ.r3Dw0nKU4CFFrw.8KBuXGpw/ADNay
+--  …     每一行都不同，即使 Alice 和 Charlie 原来的 MD5 一样（盐是随机的）
+
+-- 登录时校验：先对用户输入做 md5，再用存储的哈希（里面带着盐）重新计算并比较
+SELECT id, passwd_hash = crypt(md5('password'), passwd_hash) AS password_ok
+FROM customers.accounts ORDER BY id;
+--  1 | t      Alice 的密码是 password
+--  2 | f      Bob 的不是
+--  3 | t
+</pre></div>
+<p>
+  更彻底的做法是在用户下次登录、拿到明文密码时，直接改存 <code>crypt(明文, gen_salt('bf', 10))</code>，逐步淘汰 MD5 那一层。
+  <code>gen_salt('bf')</code> 默认的计算强度（cost）是 6，生产环境一般用 10 以上；它越大，暴力破解越慢，登录校验也越慢。
+</p>
+      </details>
+    </li>
+    <li>用 <code>gen_random_bytes(16)</code> 和 <code>encode(…, 'hex')</code> 生成一个随机 API 密钥。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT encode(gen_random_bytes(16), 'hex') AS api_key;
+--  3c5a73cfa2e616f10022d5c4db426ad4      32 个十六进制字符 = 128 位随机数
+</pre></div>
+<p>gen_random_bytes 使用密码学安全的随机数源，适合生成密钥和令牌；不要用 <code>random()</code>，它是可预测的。数据库里最好只保存 API 密钥的哈希。</p>
+      </details>
+    </li>
+    <li>启用随发行版自带的 <code>pg_stat_statements</code>（提示：需要先在 <code>shared_preload_libraries</code> 里配置并重启），跑几条查询后查看 <code>pg_stat_statements</code> 视图。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
+-- 写进了 postgresql.auto.conf，需要重启才生效
+</pre></div>
+<div class="code" data-lang="bash"><pre>
+docker restart postgres
+</pre></div>
+<div class="code" data-lang="sql"><pre>
+CREATE EXTENSION pg_stat_statements;
+SELECT count(*) FROM customers.accounts WHERE id = 1;
+SELECT count(*) FROM customers.accounts WHERE id = 2;
+
+SELECT calls, round(total_exec_time::numeric, 3) AS total_ms, query
+FROM pg_stat_statements
+WHERE query LIKE '%customers.accounts%'
+ORDER BY calls DESC;
+</pre></div>
+<div class="code out"><pre>
+ calls | total_ms |                         query
+-------+----------+-------------------------------------------------------
+     2 |    0.042 | SELECT count(*) FROM customers.accounts WHERE id = $1
+</pre></div>
+<p>常量被替换成了 <code>$1</code>：只是参数不同的查询会被合并统计。按 <code>total_exec_time</code> 排序，就能找出最耗数据库时间的查询，这是排查性能问题的第一步。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

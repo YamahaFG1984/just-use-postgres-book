@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>速查表 — Just Use Postgres 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="21">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">工具 · 随手翻</span>
+<h1>速查表</h1>
+<p class="lede">
+  把全书和补充专题里最常用的命令、语法和查询收在一页里。每一节末尾都标了出处，忘了原理时点过去复习。
+  也可以按 <kbd>/</kbd> 用站内搜索，或者打开 <a href="playground.html">SQL 练习场</a> 直接试。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 都试过</div>
+  <p>本页的 SQL 片段都在 Postgres 17.2 上执行通过。表名用的是一个假想的 <code>shop</code> 模式，套用到自己的表上即可。</p>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="psql">psql 命令</h2>
+
+<div class="tw"><table>
+<tr><th>命令</th><th>作用</th><th>命令</th><th>作用</th></tr>
+<tr><td><code>\l</code></td><td>列出所有数据库</td><td><code>\c 库名</code></td><td>切换到另一个数据库</td></tr>
+<tr><td><code>\dn</code></td><td>列出模式</td><td><code>\dt 模式.*</code></td><td>列出某个模式下的表</td></tr>
+<tr><td><code>\d 表名</code></td><td>看表结构、索引、约束、策略</td><td><code>\d+ 表名</code></td><td>更详细，含大小、存储方式</td></tr>
+<tr><td><code>\di</code> / <code>\dv</code> / <code>\df</code></td><td>列出索引 / 视图 / 函数</td><td><code>\dx</code></td><td>列出已安装的扩展</td></tr>
+<tr><td><code>\du</code></td><td>列出角色</td><td><code>\conninfo</code></td><td>当前连的是哪个库、哪个用户</td></tr>
+<tr><td><code>\x</code></td><td>切换“竖排”显示，宽行好读</td><td><code>\timing</code></td><td>显示每条语句的耗时</td></tr>
+<tr><td><code>\i 文件.sql</code></td><td>执行一个 SQL 文件</td><td><code>\copy … FROM '文件.csv' CSV HEADER</code></td><td>从客户端导入 CSV</td></tr>
+<tr><td><code>\h CREATE INDEX</code></td><td>某条 SQL 的语法帮助</td><td><code>\?</code> / <code>\q</code></td><td>psql 命令帮助 / 退出</td></tr>
+</table></div>
+
+<div class="code" data-lang="bash"><pre>
+docker exec -it postgres psql -U postgres            # 进入第 1 章的容器里的 psql
+psql "postgresql://postgres:password@localhost:5432/postgres"   # 从宿主机用连接串连接
+</pre></div>
+
+<p class="sm-src">出处：<a href="ch01.html#psql">第 1 章</a>，连接串见<a href="topic-app.html#dsn">专题 5</a></p>
+
+<h2 id="select">查询的骨架与执行顺序</h2>
+
+<div class="code" data-lang="sql"><pre>
+SELECT   category, count(*) AS n          -- 5. 选出要的列、算表达式
+FROM     shop.products p                  -- 1. 从哪些表
+JOIN     shop.orders o ON o.product_id = p.id
+WHERE    p.price > 10                     -- 2. 过滤行
+GROUP BY category                         -- 3. 分组
+HAVING   count(*) > 1                     -- 4. 过滤分组
+ORDER BY n DESC                           -- 6. 排序
+LIMIT    10;                              -- 7. 截取
+</pre></div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 150" role="img" aria-label="SQL 语句的逻辑执行顺序：FROM/JOIN、WHERE、GROUP BY、HAVING、SELECT、ORDER BY、LIMIT">
+  <rect class="bx-b" x="10" y="30" width="96" height="50" rx="8"/><text class="sm b" x="58" y="52" text-anchor="middle">① FROM</text><text class="sm" x="58" y="70" text-anchor="middle">JOIN</text>
+  <rect class="bx-b" x="118" y="30" width="96" height="50" rx="8"/><text class="sm b" x="166" y="52" text-anchor="middle">② WHERE</text><text class="sm" x="166" y="70" text-anchor="middle">过滤行</text>
+  <rect class="bx-p" x="226" y="30" width="96" height="50" rx="8"/><text class="sm b" x="274" y="52" text-anchor="middle">③ GROUP BY</text><text class="sm" x="274" y="70" text-anchor="middle">分组</text>
+  <rect class="bx-p" x="334" y="30" width="96" height="50" rx="8"/><text class="sm b" x="382" y="52" text-anchor="middle">④ HAVING</text><text class="sm" x="382" y="70" text-anchor="middle">过滤分组</text>
+  <rect class="bx-a" x="442" y="30" width="96" height="50" rx="8"/><text class="sm b" x="490" y="52" text-anchor="middle">⑤ SELECT</text><text class="sm" x="490" y="70" text-anchor="middle">窗口函数在这</text>
+  <rect class="bx-g" x="550" y="30" width="96" height="50" rx="8"/><text class="sm b" x="598" y="52" text-anchor="middle">⑥ ORDER BY</text><text class="sm" x="598" y="70" text-anchor="middle">排序</text>
+  <rect class="bx-g" x="658" y="30" width="92" height="50" rx="8"/><text class="sm b" x="704" y="52" text-anchor="middle">⑦ LIMIT</text><text class="sm" x="704" y="70" text-anchor="middle">截取</text>
+  <path class="ln" d="M106 55 H116 M214 55 H224 M322 55 H332 M430 55 H440 M538 55 H548 M646 55 H656"/>
+  <text class="sm" x="380" y="110" text-anchor="middle">所以 WHERE 里不能用 SELECT 起的别名、也不能用聚合函数（聚合条件写在 HAVING）；</text>
+  <text class="sm" x="380" y="130" text-anchor="middle">ORDER BY 在 SELECT 之后，可以用别名。这是逻辑顺序，实际执行计划由规划器决定（EXPLAIN 查看）。</text>
+</svg>
+<figcaption>图 T-2　一条 SELECT 的逻辑执行顺序</figcaption>
+</figure>
+
+<h3>连接、子查询、CTE、窗口函数</h3>
+
+<div class="code" data-lang="sql"><pre>
+-- 内连接：两边都匹配的行
+SELECT p.name, o.qty FROM shop.products p JOIN shop.orders o ON o.product_id = p.id;
+-- 左连接：左表全部保留，右边没有匹配就是 NULL
+SELECT p.name, o.qty FROM shop.products p LEFT JOIN shop.orders o ON o.product_id = p.id;
+-- 反连接：从没被下过单的商品
+SELECT p.name FROM shop.products p
+WHERE NOT EXISTS (SELECT 1 FROM shop.orders o WHERE o.product_id = p.id);
+
+-- CTE：给中间结果起个名字
+WITH t AS (SELECT product_id, sum(qty) AS n FROM shop.orders GROUP BY product_id)
+SELECT * FROM t WHERE n > 1;
+
+-- 递归 CTE：生成 1..5（层级、树、图都用这个模式）
+WITH RECURSIVE nums(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM nums WHERE n < 5
+)
+SELECT n FROM nums;
+
+-- 窗口函数：不合并行，在“窗口”里计算
+SELECT name, price,
+       rank() OVER (ORDER BY price DESC),                                  -- 排名
+       sum(price) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),  -- 累计
+       lag(price) OVER (ORDER BY id)                                        -- 上一行的值
+FROM shop.products;
+
+-- 条件聚合
+SELECT count(*) FILTER (WHERE price > 1) FROM shop.products;
+</pre></div>
+
+<p class="sm-src">出处：<a href="ch02.html">第 2 章</a>、<a href="ch03.html">第 3 章</a></p>
+
+<h2 id="ddl">建表、改表、写数据</h2>
+
+<div class="code" data-lang="sql"><pre>
+CREATE SCHEMA shop;
+CREATE TABLE shop.products (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,   -- 自增主键（推荐写法）
+  sku         text NOT NULL UNIQUE,
+  name        text NOT NULL,
+  price       numeric(10,2) NOT NULL CHECK (price > 0),
+  attrs       jsonb NOT NULL DEFAULT '{}',
+  tags        text[] NOT NULL DEFAULT '{}',
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE shop.orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  product_id  bigint NOT NULL REFERENCES shop.products ON DELETE CASCADE,  -- 外键
+  qty         int NOT NULL CHECK (qty > 0)
+);
+
+ALTER TABLE shop.products ADD COLUMN stock int NOT NULL DEFAULT 0;
+ALTER TABLE shop.products ADD CONSTRAINT stock_nonneg CHECK (stock >= 0);
+ALTER TABLE shop.products ALTER COLUMN name SET DATA TYPE varchar(200);
+ALTER TABLE shop.products RENAME COLUMN stock TO stock_qty;
+ALTER TABLE shop.products DROP CONSTRAINT stock_nonneg;
+
+INSERT INTO shop.products (sku, name, price) VALUES ('A1', 'Latte', 4.5) RETURNING id;
+UPDATE shop.products SET price = price * 1.1 WHERE sku = 'A1' RETURNING price;
+INSERT INTO shop.products (sku, name, price) VALUES ('A1', 'Latte', 5)
+  ON CONFLICT (sku) DO UPDATE SET price = EXCLUDED.price;                -- UPSERT
+TRUNCATE shop.orders;                                                    -- 清空整表（很快，不可按条件）
+
+CREATE VIEW shop.v AS SELECT name FROM shop.products;
+CREATE MATERIALIZED VIEW shop.mv AS SELECT count(*) FROM shop.products;
+REFRESH MATERIALIZED VIEW shop.mv;
+</pre></div>
+
+<div class="tw"><table>
+<tr><th>常用类型</th><th>说明</th></tr>
+<tr><td><code>int</code> / <code>bigint</code></td><td>整数；主键用 bigint 不怕不够用</td></tr>
+<tr><td><code>numeric(p,s)</code></td><td>精确小数，金额必用；不要用 float</td></tr>
+<tr><td><code>text</code> / <code>varchar(n)</code></td><td>字符串；Postgres 里两者性能一样，text 最常用</td></tr>
+<tr><td><code>timestamptz</code></td><td>带时区的时间戳，几乎总是选它而不是 timestamp</td></tr>
+<tr><td><code>date</code> / <code>interval</code></td><td>日期 / 时间间隔，如 <code>interval '7 days'</code></td></tr>
+<tr><td><code>boolean</code> / <code>uuid</code></td><td>布尔 / UUID（<code>gen_random_uuid()</code> 生成）</td></tr>
+<tr><td><code>jsonb</code></td><td>二进制 JSON，可建 GIN 索引（第 5 章）</td></tr>
+<tr><td><code>text[]</code>、<code>tstzrange</code>、<code>ENUM</code></td><td>数组、范围、枚举（专题 2）</td></tr>
+<tr><td><code>tsvector</code> / <code>vector(n)</code> / <code>geometry</code></td><td>全文搜索 / pgvector 向量 / PostGIS 几何（第 6、8、10 章）</td></tr>
+</table></div>
+
+<p class="sm-src">出处：<a href="ch02.html">第 2 章</a>、<a href="topic-sql.html">专题 2</a></p>
+
+<h2 id="func">常用函数</h2>
+
+<div class="code" data-lang="sql"><pre>
+-- 时间
+SELECT now(), current_date, now() - interval '7 days',
+       date_trunc('month', now()), extract(year FROM now()), to_char(now(), 'YYYY-MM-DD');
+-- 空值与比较
+SELECT coalesce(NULL, 'x'), nullif('a', 'a'), greatest(1, 5);
+-- 字符串与数字
+SELECT round(3.14159, 2), concat_ws('-', 'a', 'b'), left('abcdef', 3), length('abc'), split_part('a,b', ',', 2);
+-- 聚合成字符串、生成序列、条件、类型转换
+SELECT string_agg(name, ', ') FROM shop.products;
+SELECT generate_series(1, 3);
+SELECT CASE WHEN price > 5 THEN 'high' ELSE 'low' END FROM shop.products;
+SELECT '1'::int, CAST('2025-01-01' AS date);
+</pre></div>
+
+<h2 id="index">索引</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="选择索引类型的决策树">
+  <rect class="bx-a" x="270" y="12" width="220" height="40" rx="8"/><text class="ttl on-a" x="380" y="37" text-anchor="middle">要加速什么样的查询？</text>
+  <path class="ln" d="M300 54 L90 98 M340 54 L250 98 M380 54 V98 M420 54 L510 98 M460 54 L670 98"/>
+  <rect class="bx-b" x="14" y="100" width="150" height="74" rx="8"/><text class="sm b" x="89" y="122" text-anchor="middle">= &lt; &gt; BETWEEN</text><text class="sm" x="89" y="140" text-anchor="middle">排序、范围、前缀 LIKE</text><text class="ttl on-b" x="89" y="162" text-anchor="middle">B-tree（默认）</text>
+  <rect class="bx-p" x="176" y="100" width="150" height="74" rx="8"/><text class="sm b" x="251" y="122" text-anchor="middle">jsonb @&gt; ?、数组 @&gt; &amp;&amp;</text><text class="sm" x="251" y="140" text-anchor="middle">全文 @@、trgm LIKE '%x%'</text><text class="ttl on-p" x="251" y="162" text-anchor="middle">GIN</text>
+  <rect class="bx-g" x="338" y="100" width="84" height="74" rx="8"/><text class="sm b" x="380" y="122" text-anchor="middle">几何、范围</text><text class="sm" x="380" y="140" text-anchor="middle">&amp;&amp; 最近邻</text><text class="ttl on-g" x="380" y="162" text-anchor="middle">GiST</text>
+  <rect class="bx-a" x="434" y="100" width="150" height="74" rx="8"/><text class="sm b" x="509" y="122" text-anchor="middle">超大表，按时间</text><text class="sm" x="509" y="140" text-anchor="middle">顺序写入、范围查询</text><text class="ttl on-a" x="509" y="162" text-anchor="middle">BRIN</text>
+  <rect class="bx-r" x="596" y="100" width="150" height="74" rx="8"/><text class="sm b" x="671" y="122" text-anchor="middle">向量相似度</text><text class="sm" x="671" y="140" text-anchor="middle">&lt;=&gt; &lt;-&gt; &lt;#&gt;</text><text class="ttl on-r" x="671" y="162" text-anchor="middle">HNSW / IVFFlat</text>
+  <rect class="bx" x="14" y="196" width="732" height="92" rx="10"/>
+  <text class="sm b" x="30" y="218">B-tree 的变化形式</text>
+  <text class="sm" x="30" y="240">多列 (a, b)：遵守“最左前缀”　　部分索引 WHERE …：只索引一部分行　　表达式 (lower(name))：查询里要写同样的表达式</text>
+  <text class="sm" x="30" y="262">覆盖 INCLUDE (…)：争取 Index Only Scan　　HASH：只支持 =，一般 B-tree 就够了</text>
+  <text class="sm" x="30" y="282">在生产库上建索引用 CREATE INDEX CONCURRENTLY，不会阻塞写入（但不能放在事务里）</text>
+</svg>
+<figcaption>图 T-3　选哪种索引</figcaption>
+</figure>
+
+<div class="code" data-lang="sql"><pre>
+CREATE INDEX ON shop.orders (product_id);                       -- 外键列记得建索引
+CREATE INDEX CONCURRENTLY idx_price ON shop.products (price);   -- 不阻塞写入
+CREATE INDEX ON shop.products (lower(name));                    -- 表达式索引
+CREATE INDEX ON shop.products (price) WHERE stock_qty > 0;      -- 部分索引
+CREATE INDEX ON shop.products (sku) INCLUDE (price);            -- 覆盖索引
+CREATE INDEX ON shop.products USING GIN (attrs jsonb_path_ops); -- JSONB（只支持 @> 等，更小更快）
+CREATE INDEX ON shop.products USING GIN (tags);                 -- 数组
+CREATE INDEX ON shop.products USING BRIN (created_at);          -- BRIN
+DROP INDEX CONCURRENTLY shop.idx_price;
+REINDEX TABLE shop.products;
+
+EXPLAIN SELECT …;                      -- 只看计划
+EXPLAIN (ANALYZE, BUFFERS) SELECT …;   -- 真的执行，看实际耗时和读了多少页
+</pre></div>
+
+<p class="sm-src">出处：<a href="ch04.html">第 4 章</a>、<a href="appendix-a.html#explain">附录 A.1</a></p>
+
+<h2 id="jsonb">JSONB 与数组</h2>
+
+<div class="tw"><table>
+<tr><th>写法</th><th>结果</th><th>写法</th><th>结果</th></tr>
+<tr><td><code>attrs -&gt; 'milk'</code></td><td>取字段，返回 jsonb</td><td><code>attrs -&gt;&gt; 'size'</code></td><td>取字段，返回 text</td></tr>
+<tr><td><code>attrs #&gt; '{milk,type}'</code></td><td>按路径取，返回 jsonb</td><td><code>attrs #&gt;&gt; '{milk,type}'</code></td><td>按路径取，返回 text</td></tr>
+<tr><td><code>attrs @&gt; '{"size":"L"}'</code></td><td>包含（可走 GIN）</td><td><code>attrs ? 'size'</code></td><td>有这个键</td></tr>
+<tr><td><code>attrs ?| ARRAY['a','b']</code></td><td>有任意一个键</td><td><code>attrs ?&amp; ARRAY['a','b']</code></td><td>所有键都有</td></tr>
+<tr><td><code>attrs || '{"hot":true}'</code></td><td>合并（覆盖同名键）</td><td><code>attrs - 'size'</code></td><td>删掉一个键</td></tr>
+<tr><td><code>jsonb_set(attrs, '{milk,type}', '"whole"')</code></td><td>改某个路径的值</td><td><code>jsonb_path_query(attrs, '$.sizes[*]')</code></td><td>JSONPath 查询</td></tr>
+<tr><td><code>jsonb_array_elements_text(attrs-&gt;'sizes')</code></td><td>数组展开成行</td><td><code>jsonb_build_object('a', 1)</code> / <code>jsonb_agg(x)</code></td><td>构造 / 聚合成 JSON</td></tr>
+<tr><td><code>'hot' = ANY(tags)</code></td><td>数组含某元素（走不了 GIN）</td><td><code>tags @&gt; ARRAY['hot']</code></td><td>同上，可走 GIN</td></tr>
+<tr><td><code>tags &amp;&amp; ARRAY['x','y']</code></td><td>有交集</td><td><code>unnest(tags)</code></td><td>数组展开成行</td></tr>
+</table></div>
+
+<p class="sm-src">出处：<a href="ch05.html">第 5 章</a>、<a href="topic-sql.html#types">专题 2</a></p>
+
+<h2 id="fts">全文搜索</h2>
+
+<div class="code" data-lang="sql"><pre>
+SELECT to_tsvector('english', 'The quick brown foxes') @@ to_tsquery('english', 'fox &amp; quick');  -- t
+SELECT plainto_tsquery('english', 'quick foxes');                  -- 'quick' &amp; 'fox'
+SELECT phraseto_tsquery('english', 'brown fox');                   -- 'brown' &lt;-&gt; 'fox'（相邻）
+SELECT websearch_to_tsquery('english', '"brown fox" -dog or cat'); -- 搜索框语法
+SELECT ts_rank(to_tsvector('english', 'quick fox'), to_tsquery('fox'));        -- 相关度
+SELECT ts_headline('english', 'The quick brown fox', to_tsquery('fox'));       -- 高亮 &lt;b&gt;fox&lt;/b&gt;
+SELECT setweight(to_tsvector('english', 'Title'), 'A') ||
+       setweight(to_tsvector('english', 'body text'), 'B');                    -- 标题权重更高
+</pre></div>
+
+<p class="sm-src">出处：<a href="ch06.html">第 6 章</a>；中文见<a href="topic-chinese-fts.html">专题 1</a></p>
+
+<h2 id="ext">扩展速记</h2>
+
+<div class="tw"><table>
+<tr><th>扩展</th><th>最常用的写法</th><th>出处</th></tr>
+<tr><td>pgvector</td><td><code>embedding &lt;=&gt; $1</code> 余弦距离、<code>&lt;-&gt;</code> 欧氏距离、<code>&lt;#&gt;</code> 负内积；<code>CREATE INDEX … USING hnsw (embedding vector_cosine_ops)</code></td><td><a href="ch08.html">第 8 章</a></td></tr>
+<tr><td>TimescaleDB</td><td><code>create_hypertable(…)</code>、<code>time_bucket('1 hour', ts)</code>、<code>time_bucket_gapfill</code>、连续聚合 <code>WITH (timescaledb.continuous)</code>、<code>add_retention_policy</code></td><td><a href="ch09.html">第 9 章</a></td></tr>
+<tr><td>PostGIS</td><td><code>ST_MakePoint(lon, lat)</code>、<code>ST_SetSRID</code>、<code>ST_Distance</code>、<code>ST_DWithin</code>（配合 GiST 索引）、<code>ST_Within</code>、<code>ST_Intersects</code>、<code>ST_Transform</code></td><td><a href="ch10.html">第 10 章</a></td></tr>
+<tr><td>pg_trgm</td><td><code>name % 'latte'</code> 相似、<code>similarity(a, b)</code>；<code>USING GIN (name gin_trgm_ops)</code> 加速 <code>LIKE '%x%'</code></td><td><a href="topic-chinese-fts.html">专题 1</a></td></tr>
+<tr><td>pgmq</td><td><code>pgmq.create</code>、<code>pgmq.send</code>、<code>pgmq.read</code>、<code>pgmq.pop</code>、<code>pgmq.delete</code> / <code>pgmq.archive</code></td><td><a href="ch11.html">第 11 章</a></td></tr>
+</table></div>
+
+<div class="code" data-lang="sql"><pre>
+SELECT * FROM pg_available_extensions WHERE name = 'pg_trgm';   -- 能不能装
+CREATE EXTENSION IF NOT EXISTS pg_trgm;                          -- 装到当前库
+SELECT extname, extversion FROM pg_extension;                    -- 已装了哪些
+</pre></div>
+
+<p class="sm-src">出处：<a href="ch07.html">第 7 章</a></p>
+
+<h2 id="tx">事务与锁</h2>
+
+<div class="code" data-lang="sql"><pre>
+BEGIN;
+SAVEPOINT s1;
+UPDATE shop.products SET price = 1;
+ROLLBACK TO SAVEPOINT s1;       -- 只撤销 s1 之后的修改
+COMMIT;
+
+BEGIN ISOLATION LEVEL SERIALIZABLE;   -- 失败时 SQLSTATE 40001，要整个事务重试
+…
+COMMIT;
+
+SELECT * FROM shop.products WHERE id = 1 FOR UPDATE;              -- 锁住，别人要等
+SELECT * FROM shop.products WHERE id = 1 FOR UPDATE NOWAIT;       -- 锁不到立刻报错
+SELECT * FROM shop.products WHERE id = 1 FOR UPDATE SKIP LOCKED;  -- 跳过被锁的行（任务队列）
+SET lock_timeout = '2s';
+</pre></div>
+
+<p class="sm-src">出处：<a href="ch02.html">第 2 章</a>、<a href="topic-sql.html#locks">专题 2</a>、<a href="ch11.html">第 11 章</a></p>
+
+<h2 id="admin">运维与排查</h2>
+
+<div class="code" data-lang="sql"><pre>
+-- 有多大
+SELECT pg_size_pretty(pg_database_size(current_database()));
+SELECT pg_size_pretty(pg_total_relation_size('shop.products')) AS 总计,   -- 含索引和 TOAST
+       pg_size_pretty(pg_relation_size('shop.products'))       AS 表,
+       pg_size_pretty(pg_indexes_size('shop.products'))        AS 索引;
+
+-- 谁在跑什么、跑了多久
+SELECT pid, usename, state, now() - query_start AS running_for, left(query, 60)
+FROM pg_stat_activity WHERE state &lt;&gt; 'idle';
+SELECT pg_cancel_backend(12345);      -- 取消这个进程当前的查询
+SELECT pg_terminate_backend(12345);   -- 直接断开这个连接
+
+-- 死元组、上次清理时间；从没被用过的索引
+SELECT relname, n_live_tup, n_dead_tup, last_autovacuum FROM pg_stat_user_tables;
+SELECT indexrelname, idx_scan FROM pg_stat_user_indexes ORDER BY idx_scan;
+
+-- 配置
+SHOW work_mem;  SET work_mem = '64MB';  RESET work_mem;
+SELECT name, setting, unit FROM pg_settings WHERE name = 'shared_buffers';
+
+-- 权限：只读账号
+CREATE ROLE reader LOGIN PASSWORD '…';
+GRANT USAGE ON SCHEMA shop TO reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA shop TO reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA shop GRANT SELECT ON TABLES TO reader;   -- 以后新建的表也给
+
+-- 导出 CSV
+COPY (SELECT name, price FROM shop.products) TO STDOUT WITH (FORMAT csv, HEADER);
+</pre></div>
+
+<div class="code" data-lang="bash"><pre>
+pg_dump -U postgres -Fc -f shop.dump shop                 # 备份一个库
+pg_dumpall -U postgres --globals-only -f globals.sql      # 备份角色
+pg_restore -U postgres -d shop_copy --single-transaction --exit-on-error shop.dump
+</pre></div>
+
+<p class="sm-src">出处：<a href="topic-vacuum.html#monitor">专题 4</a>、<a href="topic-backup.html">专题 6</a>、<a href="ch02.html">第 2 章</a></p>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

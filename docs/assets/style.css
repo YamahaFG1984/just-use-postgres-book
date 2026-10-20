@@ -308,7 +308,7 @@ td code { font-size: .86em; }
 /* ---------------- 图示 ---------------- */
 
 figure { margin: 26px 0; }
-figure svg { display: block; width: 100%; height: auto; }
+figure svg.dgm, figure > svg { display: block; width: 100%; height: auto; }
 figcaption {
   margin-top: 8px; font-size: 13px; color: var(--fg-faint); text-align: center;
 }
@@ -516,3 +516,83 @@ kbd {
 }
 .pg-out pre { min-height: 80px; max-height: 520px; overflow: auto; white-space: pre; }
 @media (max-width: 640px) { .pg-btn .kbd { display: none; } }
+
+/* ---------------- 站内搜索 ---------------- */
+#sidebar .search-btn {
+  display: flex; align-items: center; justify-content: space-between; width: 100%;
+  margin: 0 0 14px; padding: 7px 10px; box-sizing: border-box;
+  border: 1px solid var(--line-2); border-radius: 8px; background: var(--panel);
+  color: var(--fg-faint); font-size: 13.5px; font-family: var(--sans); cursor: pointer;
+}
+#sidebar .search-btn:hover { border-color: var(--accent); color: var(--fg); }
+#search-modal {
+  display: none; position: fixed; inset: 0; z-index: 100;
+  background: rgba(20, 14, 8, .45); padding: 9vh 16px 16px;
+}
+#search-modal.open { display: block; }
+#search-modal .sm-box {
+  max-width: 680px; margin: 0 auto; background: var(--bg);
+  border: 1px solid var(--line-2); border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.3); overflow: hidden;
+  display: flex; flex-direction: column; max-height: 78vh;
+}
+#search-modal input {
+  border: 0; border-bottom: 1px solid var(--line); outline: none;
+  padding: 15px 18px; font-size: 17px; background: transparent; color: var(--fg);
+  font-family: var(--sans);
+}
+#search-modal .sm-hint { padding: 8px 18px; font-size: 12.5px; color: var(--fg-faint); }
+#search-modal .sm-list { list-style: none; margin: 0; padding: 0 8px 10px; overflow-y: auto; }
+#search-modal .sm-list a {
+  display: block; padding: 9px 12px; border-radius: 8px; text-decoration: none; color: var(--fg);
+}
+#search-modal .sm-list a.sel, #search-modal .sm-list a:hover { background: var(--accent-bg); }
+#search-modal .sr-where { display: block; font-size: 11.5px; color: var(--accent); font-weight: 600; }
+#search-modal .sr-title { display: block; font-weight: 600; font-size: 14.5px; margin: 1px 0 2px; }
+#search-modal .sr-snip { display: block; font-size: 13px; color: var(--fg-soft); line-height: 1.55; }
+#search-modal mark { background: rgba(232, 160, 60, .35); color: inherit; border-radius: 2px; padding: 0 1px; }
+body.search-open { overflow: hidden; }
+
+/* 速查表：每节末尾的出处 */
+.sm-src { font-size: 13px; color: var(--fg-faint); margin-top: -6px; }
+
+/* 术语表 */
+.g-filter {
+  width: 100%; box-sizing: border-box; padding: 10px 14px; font-size: 15px;
+  border: 1px solid var(--line-2); border-radius: 8px; background: var(--panel); color: var(--fg);
+  font-family: var(--sans); margin-top: 4px;
+}
+.g-filter:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.g-count { font-size: 13px; color: var(--fg-faint); margin: 6px 0 0; }
+.gloss { margin: 10px 0 24px; }
+.gloss > div { padding: 11px 0; border-bottom: 1px solid var(--line); scroll-margin-top: 16px; }
+.gloss > div:target { background: var(--accent-bg); border-radius: 6px; padding-left: 10px; }
+.gloss dt { font-weight: 700; font-size: 15.5px; color: var(--fg); }
+.gloss dt .en { font-weight: 500; font-size: 13px; color: var(--fg-faint); margin-left: 6px; font-family: var(--mono); }
+.gloss dd { margin: 4px 0 0; color: var(--fg-soft); font-size: 14.5px; line-height: 1.7; }
+.gloss dd a { margin-left: 4px; font-size: 13px; white-space: nowrap; }
+.g-empty { color: var(--fg-faint); }
+
+/* 交互地图（Leaflet） */
+.leaflet-map {
+  height: 420px; border: 1px solid var(--line-2); border-radius: var(--radius);
+  background: var(--panel-2); color: var(--fg-faint); font-size: 14px;
+  display: flex; align-items: center; justify-content: center; z-index: 0;
+}
+.leaflet-map.leaflet-container { display: block; }
+@media (max-width: 640px) { .leaflet-map { height: 320px; } }
+
+/* 练习的参考答案（折叠） */
+.exercise details.answer { margin: 8px 0 14px; }
+.exercise details.answer > summary {
+  cursor: pointer; display: inline-block; font-size: 13px; font-weight: 600;
+  color: var(--accent); border: 1px solid var(--line-2); border-radius: 14px; padding: 2px 11px;
+  list-style: none; user-select: none;
+}
+.exercise details.answer > summary::-webkit-details-marker { display: none; }
+.exercise details.answer > summary::before { content: '▸ '; }
+.exercise details.answer[open] > summary::before { content: '▾ '; }
+.exercise details.answer > summary:hover { border-color: var(--accent); }
+.exercise details.answer[open] > summary { margin-bottom: 4px; }
+.exercise details.answer .code { margin: 8px 0; }
+.exercise details.answer p { margin: 6px 0; font-size: 14.5px; }

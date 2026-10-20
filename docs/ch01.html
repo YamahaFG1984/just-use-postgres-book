@@ -786,11 +786,74 @@ LIMIT 3;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>写一条查询，算出每只股票的<strong>平均出价</strong>（提示：<code>avg(bid_price)</code>），并保留两位小数（<code>round(…, 2)</code>）。</li>
-    <li>找出<strong>每只股票的最高出价</strong>（<code>max</code>）以及最低出价（<code>min</code>）。</li>
-    <li>用 <code>generate_series</code> 的第三个参数生成 0 到 100 之间所有 5 的倍数。</li>
-    <li>改造清单 1.7：让 <code>order_time</code> 分布在过去 30 天内（提示：<code>now() - random(0,30) * interval '1 day'</code>），然后统计每天的成交笔数。</li>
-    <li>退出 psql（<code>\q</code>），执行 <code>docker stop postgres</code> 和 <code>docker start postgres</code>，重新连接后确认 1000 行数据还在 —— 这就是数据卷的作用。</li>
+    <li>写一条查询，算出每只股票的<strong>平均出价</strong>（提示：<code>avg(bid_price)</code>），并保留两位小数（<code>round(…, 2)</code>）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT symbol, round(avg(bid_price), 2) AS avg_bid
+FROM trades
+GROUP BY symbol
+ORDER BY symbol;
+</pre></div>
+<p>数据是随机生成的，具体数字每个人都不一样。出价在 10～20 之间均匀分布，所以平均值都会接近 15。</p>
+      </details>
+    </li>
+    <li>找出<strong>每只股票的最高出价</strong>（<code>max</code>）以及最低出价（<code>min</code>）。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT symbol, max(bid_price) AS max_bid, min(bid_price) AS min_bid
+FROM trades
+GROUP BY symbol
+ORDER BY symbol;
+</pre></div>
+<p>一条查询里可以同时用多个聚合函数，它们都按 <code>GROUP BY</code> 的分组分别计算。</p>
+      </details>
+    </li>
+    <li>用 <code>generate_series</code> 的第三个参数生成 0 到 100 之间所有 5 的倍数。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SELECT n FROM generate_series(0, 100, 5) AS n;
+-- 或者聚合成一行看得更清楚：
+SELECT array_agg(n) FROM generate_series(0, 100, 5) AS n;
+-- {0,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100}
+</pre></div>
+<p>第三个参数是步长，起点和终点都包含在内，一共 21 个数。</p>
+      </details>
+    </li>
+    <li>改造清单 1.7：让 <code>order_time</code> 分布在过去 30 天内（提示：<code>now() - random(0,30) * interval '1 day'</code>），然后统计每天的成交笔数。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+TRUNCATE trades;   -- 先清空，避免和之前的 1000 行混在一起
+
+INSERT INTO trades (id, buyer_id, symbol, order_quantity, bid_price, order_time)
+SELECT id,
+       random(1,10),
+       (array['AAPL','F','DASH'])[random(1,3)],
+       random(1,20),
+       round(random(10.00,20.00), 2),
+       now() - random(0,30) * interval '1 day'
+FROM generate_series(1,1000) AS id;
+
+SELECT order_time::date AS day, count(*) AS trades
+FROM trades
+GROUP BY day
+ORDER BY day;
+</pre></div>
+<p><code>random(0,30)</code> 两端都包含，所以数据会分布在 <strong>31 天</strong>里，平均每天三十多笔。<code>::date</code> 把时间戳截成日期，才能按天分组。</p>
+      </details>
+    </li>
+    <li>退出 psql（<code>\q</code>），执行 <code>docker stop postgres</code> 和 <code>docker start postgres</code>，重新连接后确认 1000 行数据还在 —— 这就是数据卷的作用。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="bash"><pre>
+docker stop postgres
+docker start postgres
+docker exec -it postgres psql -U postgres -c "SELECT count(*) FROM trades"
+#  count
+# -------
+#   1000
+</pre></div>
+<p>容器停止再启动，数据还在，因为它们写在数据卷 <code>postgres-volume</code> 里。即使 <code>docker rm</code> 删掉容器、再用同一个卷新建，数据也不会丢；只有删除卷（<code>docker volume rm</code>）才会真的删掉数据。</p>
+      </details>
+    </li>
   </ol>
 </div>
 

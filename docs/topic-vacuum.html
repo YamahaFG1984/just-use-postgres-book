@@ -515,11 +515,106 @@ FROM pg_stat_user_tables WHERE n_tup_upd > 1000 ORDER BY hot_pct;
 <div class="exercise">
   <h3>动手练习</h3>
   <ol>
-    <li>建一张表插入 10 万行，执行 <code>DELETE FROM … WHERE id % 2 = 0</code>，分别在 VACUUM 前后、VACUUM FULL 后查看 <code>pg_relation_size</code> 和 <code>pgstattuple</code>。</li>
-    <li>用 pageinspect 观察同一行连续更新 3 次后，数据页里有几个版本、t_ctid 是怎么串起来的。</li>
-    <li>复现“长事务挡住 VACUUM”：会话 A 开事务不提交，会话 B 更新并 VACUUM VERBOSE，然后在会话 B 里用 <code>pg_terminate_backend</code> 结束会话 A。</li>
-    <li>把 <code>idle_in_transaction_session_timeout</code> 设为 <code>'5s'</code>，开一个事务后等 6 秒再执行查询，观察报错。</li>
-    <li>对第 2 章的 <code>sales.products</code> 表，查一下 <code>n_tup_hot_upd</code>。哪些索引会让更新库存数量失去 HOT？</li>
+    <li>建一张表插入 10 万行，执行 <code>DELETE FROM … WHERE id % 2 = 0</code>，分别在 VACUUM 前后、VACUUM FULL 后查看 <code>pg_relation_size</code> 和 <code>pgstattuple</code>。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE half (id int PRIMARY KEY, note text) WITH (autovacuum_enabled = false);
+INSERT INTO half SELECT g, repeat('x', 100) FROM generate_series(1, 100000) g;
+DELETE FROM half WHERE id % 2 = 0;
+
+SELECT pg_size_pretty(pg_relation_size('half')) AS size,
+       tuple_count, dead_tuple_count, round(dead_tuple_percent) AS dead_pct, round(free_percent) AS free_pct
+FROM pgstattuple('half');
+</pre></div>
+<div class="code out"><pre>
+                 size    | tuple_count | dead_tuple_count | dead_pct | free_pct
+DELETE 之后     13 MB    |       50000 |            50000 |       46 |        1
+VACUUM 之后     13 MB    |       50000 |                0 |        0 |       49
+VACUUM FULL 后  6904 kB  |       50000 |                0 |        0 |        1
+</pre></div>
+<p>DELETE 和 UPDATE 一样只是把行标记为过期；VACUUM 把这一半空间变成可复用的空闲空间，文件不变；VACUUM FULL 重写整张表，文件才缩小到一半左右。</p>
+      </details>
+    </li>
+    <li>用 pageinspect 观察同一行连续更新 3 次后，数据页里有几个版本、t_ctid 是怎么串起来的。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+CREATE TABLE chain (id int PRIMARY KEY, v int) WITH (autovacuum_enabled = false);
+INSERT INTO chain VALUES (1, 0);
+UPDATE chain SET v = 1;  UPDATE chain SET v = 2;  UPDATE chain SET v = 3;
+
+SELECT lp, t_xmin, t_xmax, t_ctid,
+       (t_infomask2 &amp; 16384) &gt; 0 AS hot_updated,     -- 这个版本被 HOT 更新过
+       (t_infomask2 &amp; 32768) &gt; 0 AS heap_only        -- 这个版本是 HOT 产生的（索引里没有它）
+FROM heap_page_items(get_raw_page('chain', 0));
+</pre></div>
+<div class="code out"><pre>
+ lp | t_xmin | t_xmax | t_ctid | hot_updated | heap_only
+----+--------+--------+--------+-------------+-----------
+  1 |   3761 |   3762 | (0,2)  | t           | f
+  2 |   3762 |   3763 | (0,3)  | t           | t
+  3 |   3763 |   3764 | (0,4)  | t           | t
+  4 |   3764 |      0 | (0,4)  | f           | t
+(4 rows)
+</pre></div>
+<p>4 个版本都在第 0 页上，每个旧版本的 t_ctid 指向下一个版本，形成 (0,1) → (0,2) → (0,3) → (0,4) 的链；最新版本的 t_ctid 指向自己、xmax 为 0。更新的 v 列没有索引，所以都是 HOT 更新：主键索引里始终只有指向 (0,1) 的那一条，查询时顺着链找到最新版本。</p>
+      </details>
+    </li>
+    <li>复现“长事务挡住 VACUUM”：会话 A 开事务不提交，会话 B 更新并 VACUUM VERBOSE，然后在会话 B 里用 <code>pg_terminate_backend</code> 结束会话 A。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+-- 会话 A
+SET application_name = 'session_a';
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM items;
+-- ……不提交
+
+-- 会话 B
+UPDATE items SET qty = qty + 1 WHERE id &lt;= 1000;
+VACUUM (VERBOSE) items;
+--  tuples: 0 removed, 101000 remain, 1000 are dead but not yet removable
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'session_a';
+--  t
+VACUUM (VERBOSE) items;
+--  tuples: 1000 removed, 100000 remain, 0 are dead but not yet removable
+</pre></div>
+<div class="code out"><pre>
+会话 A 这边：FATAL:  terminating connection due to administrator command
+</pre></div>
+<p>结束长事务之后，被它“护着”的死元组立刻就能清理了。给连接设置 application_name，排查时一眼就能认出是谁。</p>
+      </details>
+    </li>
+    <li>把 <code>idle_in_transaction_session_timeout</code> 设为 <code>'5s'</code>，开一个事务后等 6 秒再执行查询，观察报错。
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+SET idle_in_transaction_session_timeout = '5s';
+BEGIN;
+SELECT 1;
+-- 什么都不做，等 6 秒（psql 里可以用 \! sleep 6）
+SELECT 2;
+</pre></div>
+<div class="code out"><pre>
+FATAL:  terminating connection due to idle-in-transaction timeout
+server closed the connection unexpectedly
+</pre></div>
+<p>超时后服务器直接断开连接，事务自动回滚。注意计时的是“在事务里空闲”的时间，长时间执行中的查询不受它限制（那是 statement_timeout 的事）。</p>
+      </details>
+    </li>
+    <li>对第 2 章的 <code>products.catalog</code> 表，查一下 <code>n_tup_hot_upd</code>。哪些索引会让更新库存数量失去 HOT？
+      <details class="answer"><summary>参考答案</summary>
+<div class="code" data-lang="sql"><pre>
+\c coffee_chain
+SELECT pg_stat_reset_single_table_counters('products.catalog'::regclass);
+UPDATE products.catalog SET stock_quantity = stock_quantity - 1 WHERE id = 1;   -- 再对 id 3、4 各做一次
+SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables WHERE relid = 'products.catalog'::regclass;
+--  3 | 3        全部是 HOT：表上只有主键索引，stock_quantity 没有索引
+
+CREATE INDEX catalog_stock_idx ON products.catalog (stock_quantity);
+-- 重置计数后：两次改库存 + 一次改价格
+--  3 | 1        改库存不再是 HOT，只有改价格那次还是
+</pre></div>
+<p>任何包含 stock_quantity 的索引（单列、复合、表达式、部分索引的 WHERE 条件里用到它都算）都会让改库存失去 HOT。像库存这种频繁更新的列，建索引前要掂量一下：多一个索引，每次更新都要多写一份索引、表也更容易膨胀。</p>
+      </details>
+    </li>
   </ol>
 </div>
 
